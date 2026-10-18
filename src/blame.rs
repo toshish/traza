@@ -27,30 +27,50 @@
 //! - any string in the arguments holding a Codex patch (`*** Begin Patch`):
 //!   `+` lines count as added and `-` lines as removed, per file, under
 //!   `*** Add File:` / `*** Update File:` (and `*** Move to:`). Relative patch
-//!   paths are joined with the span's `code.cwd` (which the Codex importer
-//!   records) or the arguments' `workdir`.
+//!   paths are joined with the arguments' own `workdir` when the call names
+//!   one (itself joined with the span's `code.cwd` when relative), else with
+//!   the span's `code.cwd` (which the Codex importer records).
 //!
-//! The file matches when the query path is a suffix of the recorded path at a
-//! path-component boundary (`src/lib.rs` matches `/repo/src/lib.rs`, not
-//! `/repo/src/glib.rs`; a leading `/` is not an anchor), or — for a recorded
-//! path that is still relative — the other way round. The CLI sends the path
-//! relative to the repository root, so a line written in another checkout of
-//! the same repository (a worktree) is still found.
+//! # Which file: path and project
+//!
+//! Without a project, the file matches when the query path is a suffix of the
+//! recorded path at a path-component boundary (`src/lib.rs` matches
+//! `/repo/src/lib.rs`, not `/repo/src/glib.rs`; a leading `/` is not an
+//! anchor), or — for a recorded path that is still relative — the other way
+//! round. That is a search across every project the store holds: a common
+//! line in a common path (`}` in `src/main.rs`) can be answered from an
+//! unrelated repository.
+//!
+//! A [`BlameScope`] with projects (absolute repository roots: a checkout and
+//! its worktrees) anchors a relative query path at each root — the recorded
+//! file must be exactly `<root>/<path>` — and requires an absolute one to lie
+//! under a root. A project written `<dir>/*` stands for every checkout
+//! directly under `<dir>`: worktrees are routinely removed once their work
+//! merges, and git then no longer lists them, but their sessions' edits name
+//! paths like `<repo>/.claude/worktrees/<name>/src/lib.rs`. A recorded path
+//! that stayed relative is placed with the span's `code.project`. The CLI
+//! sends the repository's root, every worktree git lists for it, and the
+//! directories of checkouts nested inside it (`<repo>/.claude/worktrees/*`,
+//! Claude Code's, and the parent of any listed worktree inside the
+//! repository), so a line written in a worktree of the same repository —
+//! even one deleted since — is found, and one written in another repository
+//! is not.
 //!
 //! # How it is found, and what bounds it
 //!
 //! Candidates are the tool steps of the editing tools in [`EDIT_TOOLS`],
 //! found through the exact attribute index on `gen_ai.tool.name` and
-//! `tool.name`, so the search decodes edit calls and nothing else. The
-//! content index cannot serve here: a store of agent transcripts is mostly
-//! model calls carrying whole conversations, whose word filters admit nearly
-//! every block for ordinary code words, and a content-driven search ends up
-//! tokenising the store (measured on a real import: past a 30 s budget). Every
-//! candidate is verified by parsing its edit. The whole search — one indexed
-//! fold per tool name and key, then reading each match's run — spends one
-//! query deadline; at most [`MAX_BLAME_CANDIDATES`] candidates are verified
-//! (`truncated` says when more existed) and the earliest [`MAX_BLAME_LIMIT`]
-//! matches are kept.
+//! `tool.name`, plus the steps carrying [`EDIT_MARKER`], so the search
+//! decodes edit calls and nothing else. The content index cannot serve here:
+//! a store of agent transcripts is mostly model calls carrying whole
+//! conversations, whose word filters admit nearly every block for ordinary
+//! code words, and a content-driven search ends up tokenising the store
+//! (measured on a real import: past a 30 s budget). Every candidate is
+//! verified by parsing its edit. The whole search — one indexed fold per tool
+//! name and key, then reading each match's run — spends one query deadline;
+//! at most [`MAX_BLAME_CANDIDATES`] candidates are verified, the fold stops
+//! decoding the moment the cap is passed (`truncated` says so), and the
+//! earliest [`MAX_BLAME_LIMIT`] matches are kept.
 //!
 //! **Limits, honestly:** a line written by a shell command (`sed -i`, a
 //! heredoc, a code generator) is not an edit Traza can read and is not found,
@@ -69,19 +89,21 @@ use crate::semconv::{self, StepKind};
 use crate::{Error, Result, Span, SpanFilter, Store};
 
 /// The editing tools blame searches, by exact name: Claude Code's, Codex's
-/// (`apply_patch` for its patch tool and file-change items; `shell` and
-/// `local_shell` for older builds that applied patches through the shell),
-/// Anthropic's text-editor tool under its published names, and common generic
-/// names. A tool step is a candidate when `gen_ai.tool.name` or `tool.name`
-/// is one of these.
+/// (`apply_patch` for its patch tool and file-change items), Anthropic's
+/// text-editor tool under its published names, and common generic names. A
+/// tool step is a candidate when `gen_ai.tool.name` or `tool.name` is one of
+/// these, or when it carries [`EDIT_MARKER`].
+///
+/// General-purpose shells are deliberately absent: older Codex builds applied
+/// patches through `shell`, and naming it here made every command of a
+/// Codex-heavy store a candidate. The importer marks the shell calls that
+/// carry a patch instead.
 pub const EDIT_TOOLS: &[&str] = &[
     "Edit",
     "MultiEdit",
     "Write",
     "NotebookEdit",
     "apply_patch",
-    "shell",
-    "local_shell",
     "str_replace_based_edit_tool",
     "str_replace_editor",
     "text_editor",
@@ -90,8 +112,17 @@ pub const EDIT_TOOLS: &[&str] = &[
     "create_file",
 ];
 
+/// The attribute (value `true`) that makes a tool step a blame candidate
+/// whatever its tool is called: the importer sets it on a call whose
+/// arguments carry a Codex patch through a tool not in [`EDIT_TOOLS`] (an
+/// older Codex build's `shell ["apply_patch", …]`).
+pub const EDIT_MARKER: &str = "traza.edit";
+
 /// The attribute keys a tool name is indexed under.
 const TOOL_NAME_KEYS: [&str; 2] = ["gen_ai.tool.name", "tool.name"];
+
+/// Repository roots one blame may be scoped to, at most.
+pub const MAX_BLAME_PROJECTS: usize = 64;
 
 /// Matches returned when the caller names no limit.
 pub const DEFAULT_BLAME_LIMIT: usize = 5;
@@ -170,6 +201,11 @@ pub struct BlameMatch {
     pub agent: Option<String>,
     /// The emitting service (`claude-code`, `codex`, …).
     pub service: String,
+    /// The project the session worked in (its `code.project`, the working
+    /// directory the importer recorded), when known — which repository the
+    /// edit was made in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 /// A blame answer.
@@ -177,7 +213,7 @@ pub struct BlameMatch {
 pub struct Blame {
     /// The steps that introduced the line, earliest first.
     pub matches: Vec<BlameMatch>,
-    /// Candidate spans the content index admitted and the search verified.
+    /// Candidate edit calls the search verified.
     pub searched_spans: usize,
     /// Whether more than [`MAX_BLAME_CANDIDATES`] candidates existed, so an
     /// earlier introduction may have been missed.
@@ -186,6 +222,117 @@ pub struct Blame {
     pub line: String,
     /// The path as compared.
     pub path: String,
+    /// The repository roots the search was scoped to (empty: every
+    /// project).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<String>,
+}
+
+/// Where a blame looks: which file, and in which repositories.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlameScope {
+    /// The file's path, or a suffix of it (normalised).
+    pub path: String,
+    /// Absolute repository roots (a checkout and its worktrees), or
+    /// directories of checkouts written `<dir>/*` (any one directory
+    /// directly under `<dir>` is a root — where worktrees that no longer
+    /// exist used to live). Empty: any project, `path` matched as a component
+    /// suffix. Otherwise a relative `path` is anchored at each root — the
+    /// recorded file must be exactly `<root>/<path>` — and an absolute one
+    /// must lie under a root.
+    pub projects: Vec<String>,
+}
+
+impl BlameScope {
+    /// A scope over `path`, in `projects` (each must be absolute, `*` only
+    /// as a final component; at most [`MAX_BLAME_PROJECTS`]).
+    pub fn new(path: &str, projects: &[String]) -> Result<Self> {
+        let path = normalize_path(path);
+        if path.trim_start_matches('/').is_empty() {
+            return Err(Error::Invalid(
+                "path is empty; pass the file's path or a suffix of it".to_owned(),
+            ));
+        }
+        if projects.len() > MAX_BLAME_PROJECTS {
+            return Err(Error::Invalid(format!(
+                "at most {MAX_BLAME_PROJECTS} projects may scope one blame"
+            )));
+        }
+        let mut roots = Vec::with_capacity(projects.len());
+        for project in projects {
+            let root = normalize_path(project);
+            let base = root.strip_suffix("/*").unwrap_or(&root);
+            if !base.starts_with('/') || base == "/" || base.split('/').any(|part| part == "*") {
+                return Err(Error::Invalid(format!(
+                    "project {project:?} is not an absolute directory; pass a repository root \
+                     (or <dir>/* for every checkout directly under <dir>)"
+                )));
+            }
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        Ok(Self {
+            path,
+            projects: roots,
+        })
+    }
+
+    /// Whether resolved absolute `file` is this scope's path under `root`
+    /// (a repository root).
+    fn under_root(&self, file: &str, root: &str) -> bool {
+        if self.path.starts_with('/') {
+            under(file, root) && path_matches(file, &self.path)
+        } else {
+            file.len() == root.len() + 1 + self.path.len()
+                && file.starts_with(root)
+                && file.as_bytes()[root.len()] == b'/'
+                && file.ends_with(self.path.as_str())
+        }
+    }
+
+    /// Whether `recorded` (as an edit recorded it) is the file this scope
+    /// names. `project` is the span's own working directory, used to place a
+    /// recorded path that stayed relative.
+    pub fn matches(&self, recorded: &str, project: Option<&str>) -> bool {
+        if self.projects.is_empty() {
+            return path_matches(recorded, &self.path);
+        }
+        let recorded = normalize_path(recorded);
+        let resolved = if recorded.starts_with('/') {
+            recorded
+        } else {
+            match project.filter(|dir| dir.starts_with('/')) {
+                Some(dir) => join(Some(dir), &recorded),
+                // A relative path with no directory to place it in cannot be
+                // said to be in this repository.
+                None => return false,
+            }
+        };
+        self.projects.iter().any(|project| {
+            match project.strip_suffix("/*") {
+                // A directory of checkouts: the root is `<dir>/<one name>`.
+                Some(dir) => {
+                    if !under(&resolved, dir) {
+                        return false;
+                    }
+                    let rest = &resolved[dir.len() + 1..];
+                    match rest.find('/') {
+                        Some(name) if name > 0 => {
+                            self.under_root(&resolved, &resolved[..dir.len() + 1 + name])
+                        }
+                        _ => false,
+                    }
+                }
+                None => self.under_root(&resolved, project),
+            }
+        })
+    }
+}
+
+/// Whether normalised absolute `path` lies under directory `root`.
+fn under(path: &str, root: &str) -> bool {
+    path.len() > root.len() && path.starts_with(root) && path.as_bytes()[root.len()] == b'/'
 }
 
 /// Runs and traces read while enriching one answer, by `(tenant, id)`.
@@ -204,18 +351,30 @@ struct Found {
 
 impl Store {
     /// The earliest tool steps (at most `limit`, itself at most
-    /// [`MAX_BLAME_LIMIT`]) whose edit introduced `line` into a file matching
-    /// `path`, under `tenant` (`None` is the operator view across tenants).
+    /// [`MAX_BLAME_LIMIT`]) whose edit introduced `line` into the file
+    /// `scope` names, under `tenant` (`None` is the operator view across
+    /// tenants).
     ///
-    /// An empty line or path is [`Error::Invalid`]. Budgeted by the query
-    /// deadline, anchored here, across the search and every match's
-    /// enrichment.
+    /// An empty line is [`Error::Invalid`]. Budgeted by the query deadline,
+    /// anchored here, across the search and every match's enrichment.
     pub fn blame(
         &self,
         tenant: Option<&str>,
-        path: &str,
+        scope: &BlameScope,
         line: &str,
         limit: usize,
+    ) -> Result<Blame> {
+        self.blame_capped(tenant, scope, line, limit, MAX_BLAME_CANDIDATES)
+    }
+
+    /// [`Self::blame`] verifying at most `cap` candidates.
+    fn blame_capped(
+        &self,
+        tenant: Option<&str>,
+        scope: &BlameScope,
+        line: &str,
+        limit: usize,
+        cap: usize,
     ) -> Result<Blame> {
         let normalized = normalize_line(line);
         if normalized.is_empty() {
@@ -223,8 +382,7 @@ impl Store {
                 "line is empty; pass the exact text of the line to blame".to_owned(),
             ));
         }
-        let query_path = normalize_path(path);
-        if query_path.trim_start_matches('/').is_empty() {
+        if scope.path.trim_start_matches('/').is_empty() {
             return Err(Error::Invalid(
                 "path is empty; pass the file's path or a suffix of it".to_owned(),
             ));
@@ -234,22 +392,35 @@ impl Store {
         let mut kept: Vec<Found> = Vec::new();
         let mut searched = 0usize;
         let mut truncated = false;
-        for key in TOOL_NAME_KEYS {
-            for tool in EDIT_TOOLS {
-                let filter = SpanFilter {
-                    attributes: vec![(key.to_owned(), Value::String((*tool).to_owned()))],
-                    tenant: tenant.map(str::to_owned),
-                    ..SpanFilter::default()
-                };
-                self.fold_spans_under(&filter, deadline, |span| {
-                    if searched >= MAX_BLAME_CANDIDATES {
-                        truncated = true;
-                        return;
-                    }
-                    searched += 1;
-                    consider(span, &normalized, &query_path, limit, &mut kept);
-                })?;
+        let mut probes: Vec<(&str, Value)> = TOOL_NAME_KEYS
+            .iter()
+            .flat_map(|key| {
+                EDIT_TOOLS
+                    .iter()
+                    .map(move |tool| (*key, Value::String((*tool).to_owned())))
+            })
+            .collect();
+        probes.push((EDIT_MARKER, Value::Bool(true)));
+        for (key, value) in probes {
+            if truncated {
+                break;
             }
+            let filter = SpanFilter {
+                attributes: vec![(key.to_owned(), value)],
+                tenant: tenant.map(str::to_owned),
+                ..SpanFilter::default()
+            };
+            // Stops decoding the moment the cap is passed: a truncated
+            // answer costs the cap, not the rest of the store.
+            self.fold_spans_while(&filter, deadline, |span| {
+                if searched >= cap {
+                    truncated = true;
+                    return false;
+                }
+                searched += 1;
+                consider(span, &normalized, scope, limit, &mut kept);
+                true
+            })?;
         }
         let mut matches = Vec::with_capacity(kept.len());
         let mut reads = Reads::default();
@@ -261,7 +432,8 @@ impl Store {
             searched_spans: searched,
             truncated,
             line: normalized,
-            path: query_path,
+            path: scope.path.clone(),
+            projects: scope.projects.clone(),
         })
     }
 
@@ -358,17 +530,34 @@ impl Store {
             step_index,
             agent,
             service: span.service.clone(),
+            project: project_of(span).map(str::to_owned),
         })
     }
 }
 
+/// The directory a span's session worked in: `code.project` (both
+/// importers record it), else `code.cwd`.
+fn project_of(span: &Span) -> Option<&str> {
+    ["code.project", "code.cwd"]
+        .iter()
+        .find_map(|key| span.attributes.get(*key).and_then(Value::as_str))
+}
+
 /// Keeps `span` among the earliest `limit` candidates when one of its edits
-/// introduced `normalized` into a file matching `query_path`. A span seen
-/// twice (indexed under both tool-name keys) is kept once.
-fn consider(span: &Span, normalized: &str, query_path: &str, limit: usize, kept: &mut Vec<Found>) {
+/// introduced `normalized` into the file `scope` names. A span seen twice
+/// (indexed under both tool-name keys, or under a name and the edit marker)
+/// is kept once.
+fn consider(
+    span: &Span,
+    normalized: &str,
+    scope: &BlameScope,
+    limit: usize,
+    kept: &mut Vec<Found>,
+) {
+    let project = project_of(span);
     let Some(edit) = edits(span)
         .into_iter()
-        .find(|edit| edit.introduces(normalized) && path_matches(&edit.file, query_path))
+        .find(|edit| edit.introduces(normalized) && scope.matches(&edit.file, project))
     else {
         return;
     };
@@ -465,12 +654,15 @@ pub fn edits(span: &Span) -> Vec<Edit> {
         },
         other => other.clone(),
     };
-    let cwd = span
-        .attributes
-        .get("code.cwd")
-        .and_then(Value::as_str)
-        .or_else(|| arguments.get("workdir").and_then(Value::as_str))
-        .map(str::to_owned);
+    // Relative paths resolve against the call's own working directory when
+    // it names one (Codex's `shell` applies a patch relative to `workdir`),
+    // itself relative to the session's when it is relative; else against the
+    // session's.
+    let session_cwd = span.attributes.get("code.cwd").and_then(Value::as_str);
+    let cwd = match arguments.get("workdir").and_then(Value::as_str) {
+        Some(workdir) if !workdir.is_empty() => Some(join(session_cwd, workdir)),
+        _ => session_cwd.map(str::to_owned),
+    };
     let mut out = Vec::new();
     if let Value::Object(map) = &arguments {
         let file = ["file_path", "path", "filePath", "notebook_path"]
@@ -647,21 +839,88 @@ pub fn parse_patch(text: &str) -> Vec<Edit> {
     out
 }
 
-/// The added and removed lines of a unified diff's hunks (`+`/`-` lines,
-/// not the `+++`/`---` file headers).
+/// Where [`parse_unified_diff`] is.
+enum Hunk {
+    /// Between hunks: `---`/`+++` lines are file headers.
+    Outside,
+    /// Inside a hunk whose header said how many old and new lines remain.
+    Counted { old: u64, new: u64 },
+    /// Inside a hunk whose header gave no counts: until a `diff` line.
+    Open,
+}
+
+/// The added and removed lines of a unified diff's hunks. `---`/`+++` are
+/// file headers only outside a hunk; inside one — whose extent its `@@ -a,b
+/// +c,d @@` header gives — the first character is the marker, so an added
+/// `++i;` or a removed `-- comment` is a line like any other.
 pub fn parse_unified_diff(diff: &str) -> (Vec<String>, Vec<String>) {
     let (mut added, mut removed) = (Vec::new(), Vec::new());
+    let mut hunk = Hunk::Outside;
     for line in diff.lines() {
-        if line.starts_with("+++") || line.starts_with("---") {
+        if matches!(hunk, Hunk::Counted { old: 0, new: 0 }) {
+            hunk = Hunk::Outside;
+        }
+        // No hunk line starts with `@`, so a hunk header always opens one.
+        if line.starts_with("@@") {
+            hunk = hunk_counts(line).map_or(Hunk::Open, |(old, new)| Hunk::Counted { old, new });
             continue;
         }
-        if let Some(text) = line.strip_prefix('+') {
-            added.push(text.to_owned());
-        } else if let Some(text) = line.strip_prefix('-') {
-            removed.push(text.to_owned());
+        match &mut hunk {
+            Hunk::Outside => {
+                if line.starts_with("+++") || line.starts_with("---") {
+                    continue;
+                }
+                // A diff with no hunk headers at all: `+`/`-` still mark.
+                if let Some(text) = line.strip_prefix('+') {
+                    added.push(text.to_owned());
+                } else if let Some(text) = line.strip_prefix('-') {
+                    removed.push(text.to_owned());
+                }
+            }
+            Hunk::Open => {
+                if line.starts_with("diff ") {
+                    hunk = Hunk::Outside;
+                } else if let Some(text) = line.strip_prefix('+') {
+                    added.push(text.to_owned());
+                } else if let Some(text) = line.strip_prefix('-') {
+                    removed.push(text.to_owned());
+                }
+            }
+            Hunk::Counted { old, new } => {
+                if let Some(text) = line.strip_prefix('+') {
+                    added.push(text.to_owned());
+                    *new = new.saturating_sub(1);
+                } else if let Some(text) = line.strip_prefix('-') {
+                    removed.push(text.to_owned());
+                    *old = old.saturating_sub(1);
+                } else if !line.starts_with('\\') {
+                    // Context (an empty line is context whose space was
+                    // stripped); `\ No newline at end of file` is neither.
+                    *old = old.saturating_sub(1);
+                    *new = new.saturating_sub(1);
+                }
+            }
         }
     }
     (added, removed)
+}
+
+/// The old and new line counts of a hunk header `@@ -a[,b] +c[,d] @@`
+/// (a missing count is 1).
+fn hunk_counts(header: &str) -> Option<(u64, u64)> {
+    let mut parts = header.trim_start_matches('@').split_whitespace();
+    let count = |range: &str| -> Option<u64> {
+        match range.split_once(',') {
+            Some((start, count)) => {
+                start.parse::<u64>().ok()?;
+                count.parse().ok()
+            }
+            None => range.parse::<u64>().ok().map(|_| 1),
+        }
+    };
+    let old = count(parts.next()?.strip_prefix('-')?)?;
+    let new = count(parts.next()?.strip_prefix('+')?)?;
+    Some((old, new))
 }
 
 /// `file` joined onto `cwd` when it is relative and a directory is known.

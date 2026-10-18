@@ -2,8 +2,10 @@
 //! `traza-server import claude-code|codex` into a running server (over HTTP)
 //! and into a data directory, `--watch` following appends and new files and
 //! resuming from its state file, and `GET /v1/blame`, `traza-server blame`
-//! and the `blame_line` MCP tool finding the step that wrote a line — with
-//! tenant isolation for bound credentials throughout.
+//! and the `blame_line` MCP tool finding the step that wrote a line — scoped
+//! to the repository and its worktrees by default — with tenant isolation
+//! for bound credentials throughout, and each bound credential keeping its
+//! own progress in the state file.
 //!
 //! The transcripts are the synthetic fixtures in `tests/fixtures/import/`.
 
@@ -587,20 +589,47 @@ fn blame_finds_the_step_that_introduced_a_line_over_http_cli_and_mcp() {
     .expect("file");
     let target = format!("{}:4", repo.join("src/cart.rs").display());
     let url = server.url("");
-    let cli = run(&home, &["blame", &target, "--url", &url, "--json"]);
+    // By default the CLI searches this repository only; the fixture's edit
+    // was made in /tmp/demo-shop, another project.
+    let scoped = run(&home, &["blame", &target, "--url", &url, "--json"]);
+    assert_eq!(
+        scoped.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&scoped.stderr)
+    );
+    let answer: Value = serde_json::from_slice(&scoped.stdout).expect("json");
+    assert_eq!(
+        answer["path"],
+        json!("src/cart.rs"),
+        "sent relative to the repository"
+    );
+    assert_eq!(answer["matches"], json!([]));
+    assert!(
+        answer["projects"]
+            .as_array()
+            .is_some_and(|projects| !projects.is_empty()),
+        "scoped to the repository: {answer}"
+    );
+    let hint = run(&home, &["blame", &target, "--url", &url]);
+    assert!(
+        String::from_utf8_lossy(&hint.stdout).contains("--anywhere"),
+        "{}",
+        String::from_utf8_lossy(&hint.stdout)
+    );
+    let cli = run(
+        &home,
+        &["blame", &target, "--url", &url, "--json", "--anywhere"],
+    );
     assert!(
         cli.status.success(),
         "{}",
         String::from_utf8_lossy(&cli.stderr)
     );
     let answer: Value = serde_json::from_slice(&cli.stdout).expect("json");
-    assert_eq!(
-        answer["path"],
-        json!("src/cart.rs"),
-        "sent relative to the repository"
-    );
     assert_eq!(answer["matches"][0]["span_id"], first["span_id"]);
-    let human = run(&home, &["blame", &target, "--url", &url]);
+    assert_eq!(answer["matches"][0]["project"], json!("/tmp/demo-shop"));
+    let human = run(&home, &["blame", &target, "--url", &url, "--anywhere"]);
     let text = String::from_utf8_lossy(&human.stdout);
     assert!(
         text.contains("introduced") && text.contains("by Edit"),
@@ -610,6 +639,10 @@ fn blame_finds_the_step_that_introduced_a_line_over_http_cli_and_mcp() {
         text.contains("prompt: Add a total to the cart summary"),
         "{text}"
     );
+    assert!(
+        text.contains("project /tmp/demo-shop"),
+        "an unscoped answer names the repository: {text}"
+    );
     let nobody = run(
         &home,
         &[
@@ -617,6 +650,7 @@ fn blame_finds_the_step_that_introduced_a_line_over_http_cli_and_mcp() {
             &format!("{}:1", repo.join("src/cart.rs").display()),
             "--url",
             &url,
+            "--anywhere",
         ],
     );
     assert_eq!(nobody.status.code(), Some(1), "no agent wrote the header");
@@ -651,6 +685,275 @@ fn blame_finds_the_step_that_introduced_a_line_over_http_cli_and_mcp() {
         open < row && row < close,
         "stored text stays inside the block"
     );
+    // Scoped to a project, the MCP tool ignores other repositories too.
+    let (_, reply) = server.json(
+        "POST",
+        "/v1/mcp",
+        Some(
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "blame_line",
+            "arguments": {"path": "src/cart.rs", "line": CART_LINE, "project": "/elsewhere"}}}),
+        ),
+        &[("Accept", "application/json, text/event-stream")],
+    );
+    let text = reply["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text");
+    assert!(
+        text.contains("No recorded agent edit") && text.contains("/elsewhere"),
+        "{text}"
+    );
+    let (status, body) = server.json(
+        "GET",
+        &format!(
+            "/v1/blame?path=src/cart.rs&line={}&project=relative/dir",
+            encode(CART_LINE)
+        ),
+        None,
+        &[],
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("absolute")),
+        "{body}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A one-turn Claude Code session under `projects` whose Edit adds `line`
+/// to `file`, working in `cwd`, at second `second` of the hour.
+fn edit_session(projects: &Path, session: &str, cwd: &str, file: &str, line: &str, second: u32) {
+    let dir = projects.join("-scoped");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let at = |offset: u32| format!("2026-02-01T09:00:{:02}.000Z", second + offset);
+    let records = [
+        json!({"type": "user", "uuid": "p", "sessionId": session, "cwd": cwd,
+               "timestamp": at(0), "message": {"role": "user", "content": format!("write {line}")}}),
+        json!({"type": "assistant", "uuid": "a", "parentUuid": "p", "sessionId": session,
+               "cwd": cwd, "timestamp": at(1),
+               "message": {"id": format!("msg-{session}"), "role": "assistant",
+                   "model": "claude-sonnet-4-5-20250929", "stop_reason": "tool_use",
+                   "content": [{"type": "tool_use", "id": format!("toolu-{session}"),
+                       "name": "Edit", "input": {"file_path": file, "old_string": "",
+                           "new_string": line}}],
+                   "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+        json!({"type": "user", "uuid": "r", "parentUuid": "a", "sessionId": session,
+               "cwd": cwd, "timestamp": at(2),
+               "message": {"role": "user", "content": [{"type": "tool_result",
+                   "tool_use_id": format!("toolu-{session}"), "content": "ok"}]}}),
+    ];
+    let text: String = records.iter().map(|record| format!("{record}\n")).collect();
+    std::fs::write(dir.join(format!("{session}.jsonl")), text).expect("write");
+}
+
+#[test]
+fn the_blame_cli_searches_this_repository_and_its_worktrees_not_others() {
+    let home = temp_dir();
+    // Canonical paths: what the CLI resolves the file to.
+    std::fs::create_dir_all(home.join("repo")).expect("repo");
+    let repo = home.join("repo").canonicalize().expect("canonical");
+    let worktree = home.join("repo-feature");
+    std::fs::create_dir_all(&worktree).expect("worktree");
+    let worktree = worktree.canonicalize().expect("canonical");
+    let other = home.join("unrelated");
+    std::fs::create_dir_all(other.join("src")).expect("other");
+    let other = other.canonicalize().expect("canonical");
+    // A checkout with one linked worktree, as git lays them out.
+    std::fs::create_dir_all(repo.join(".git/worktrees/feature")).expect("git");
+    std::fs::write(
+        repo.join(".git/worktrees/feature/gitdir"),
+        format!("{}\n", worktree.join(".git").display()),
+    )
+    .expect("gitdir");
+    std::fs::write(
+        worktree.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            repo.join(".git/worktrees/feature").display()
+        ),
+    )
+    .expect("worktree .git");
+    std::fs::create_dir_all(repo.join("src")).expect("src");
+    std::fs::write(
+        repo.join("src/cart.rs"),
+        "fn shared() {}\nfn from_the_worktree() {}\nfn from_a_removed_worktree() {}\n",
+    )
+    .expect("file");
+    // An agent's worktree inside the repository that has since been removed:
+    // git no longer lists it, but its session's edits name its path.
+    let removed = repo.join(".claude/worktrees/agent-gone");
+
+    let projects = home.join("projects");
+    let path = |dir: &Path| dir.join("src/cart.rs").to_string_lossy().into_owned();
+    let text = |dir: &Path| dir.to_string_lossy().into_owned();
+    // Another repository wrote the same line first; this one later; its
+    // worktree wrote the second line.
+    edit_session(
+        &projects,
+        "aaaaaaaa-0000-4000-8000-000000000001",
+        &text(&other),
+        &path(&other),
+        "fn shared() {}",
+        0,
+    );
+    edit_session(
+        &projects,
+        "bbbbbbbb-0000-4000-8000-000000000002",
+        &text(&repo),
+        &path(&repo),
+        "fn shared() {}",
+        10,
+    );
+    edit_session(
+        &projects,
+        "cccccccc-0000-4000-8000-000000000003",
+        &text(&worktree),
+        &path(&worktree),
+        "fn from_the_worktree() {}",
+        20,
+    );
+    edit_session(
+        &projects,
+        "dddddddd-0000-4000-8000-000000000004",
+        &text(&removed),
+        &path(&removed),
+        "fn from_a_removed_worktree() {}",
+        30,
+    );
+    let server = Server::spawn(&[]);
+    import(&home, &server, "claude-code", &projects, &["--no-state"]);
+    let url = server.url("");
+    let blame_json = |line: u32, extra: &[&str]| -> Value {
+        let target = format!("{}:{line}", repo.join("src/cart.rs").display());
+        let mut args = vec!["blame", target.as_str(), "--url", url.as_str(), "--json"];
+        args.extend_from_slice(extra);
+        let output = run(&home, &args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("json")
+    };
+
+    let mine = blame_json(1, &[]);
+    assert_eq!(
+        mine["matches"][0]["run"],
+        json!("bbbbbbbb-0000-4000-8000-000000000002"),
+        "this repository's edit, not the earlier one elsewhere: {mine}"
+    );
+    assert_eq!(mine["matches"].as_array().map(Vec::len), Some(1));
+    let anywhere = blame_json(1, &["--anywhere"]);
+    assert_eq!(
+        anywhere["matches"][0]["run"],
+        json!("aaaaaaaa-0000-4000-8000-000000000001"),
+        "--anywhere answers across projects, earliest first"
+    );
+    assert_eq!(anywhere["matches"][0]["project"], json!(text(&other)));
+    let from_worktree = blame_json(2, &[]);
+    assert_eq!(
+        from_worktree["matches"][0]["run"],
+        json!("cccccccc-0000-4000-8000-000000000003"),
+        "a line written in a worktree of the same repository: {from_worktree}"
+    );
+    assert_eq!(from_worktree["matches"][0]["file"], json!(path(&worktree)));
+    let from_removed = blame_json(3, &[]);
+    assert_eq!(
+        from_removed["matches"][0]["run"],
+        json!("dddddddd-0000-4000-8000-000000000004"),
+        "a line written in a worktree since removed: {from_removed}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn each_bound_credential_keeps_its_own_progress_in_the_state_file() {
+    let home = temp_dir();
+    let server = Server::spawn_with_env(
+        &[],
+        &[(
+            "TRAZA_TOKENS",
+            "admin:root-token,rw@acme:acme-token,rw@beta:beta-token,ro@acme:acme-reader",
+        )],
+    );
+    let decoded = || -> u64 {
+        let (_, _, text) = server.request(
+            "GET",
+            "/v1/metrics",
+            None,
+            &[("Authorization", "Bearer root-token")],
+        );
+        text.lines()
+            .find_map(|line| line.strip_prefix("traza_http_decoded_spans_total "))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("metric")
+    };
+    let root = fixtures().join("claude-code");
+    // No --state and no --no-state: the default ~/.traza/import-state.json
+    // under this test's private HOME.
+    let acme = import(
+        &home,
+        &server,
+        "claude-code",
+        &root,
+        &["--token", "acme-token"],
+    );
+    assert_eq!(acme["spans_sent"], json!(21));
+    assert!(home.join(".traza/import-state.json").is_file());
+    let beta = import(
+        &home,
+        &server,
+        "claude-code",
+        &root,
+        &["--token", "beta-token"],
+    );
+    assert_eq!(
+        beta["spans_sent"],
+        json!(21),
+        "the same URL, another tenant: nothing was sent there yet"
+    );
+    let (status, _) = tape(&server, S1, &[("Authorization", "Bearer beta-token")]);
+    assert_eq!(status, 200, "beta holds the run too");
+    let again = import(
+        &home,
+        &server,
+        "claude-code",
+        &root,
+        &["--token", "acme-token"],
+    );
+    assert_eq!(again["spans_sent"], json!(0), "acme's progress was kept");
+    assert_eq!(again["files_unchanged"], json!(3));
+
+    // Refused before anything is read or sent: a --tenant the credential
+    // cannot write, and a read-only credential.
+    let before = decoded();
+    let url = server.url("");
+    let path = root.to_string_lossy().into_owned();
+    for (token, extra, needle) in [
+        ("acme-token", Some("beta"), "conflicts with the credential"),
+        ("acme-reader", None, "read-only"),
+    ] {
+        let mut args = vec![
+            "import",
+            "claude-code",
+            "--path",
+            &path,
+            "--url",
+            &url,
+            "--token",
+            token,
+        ];
+        if let Some(tenant) = extra {
+            args.extend_from_slice(&["--tenant", tenant]);
+        }
+        let output = run(&home, &args);
+        assert_eq!(output.status.code(), Some(2), "{token}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(needle), "{token}: {stderr}");
+    }
+    assert_eq!(decoded(), before, "not one span was sent");
     let _ = std::fs::remove_dir_all(&home);
 }
 

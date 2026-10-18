@@ -94,12 +94,19 @@ pub(crate) struct ClaudeCode {
     /// The last real model seen: a locally synthesized error reply names
     /// none, and the call it stands for was made with this one.
     last_model: Option<String>,
+    /// Agent mode: the sub-agent's `.meta.json`, while it has not been read
+    /// yet (Claude Code may write it after the transcript's first lines).
+    pending_meta: Option<PathBuf>,
 }
 
 impl ClaudeCode {
     /// A converter for the transcript at `path`, stamping `tenant`.
     pub(crate) fn new(path: &Path, tenant: &str) -> Self {
-        let (session, mode) = classify(path);
+        let (session, mode, meta_read) = classify(path);
+        let pending_meta = match (&mode, meta_read) {
+            (Mode::Agent { .. }, false) => Some(path.with_extension("meta.json")),
+            _ => None,
+        };
         let agent_name = match &mode {
             Mode::Main => SOURCE.as_str().to_owned(),
             Mode::Agent { agent_type, .. } => {
@@ -126,7 +133,83 @@ impl ClaudeCode {
             tools: HashMap::new(),
             times: HashMap::new(),
             last_model: None,
+            pending_meta,
         }
+    }
+
+    /// Reads a sub-agent's meta file that was missing when the converter was
+    /// built, and puts what it says onto the spans already built: the agent
+    /// span gets its parent (the tool call that spawned it) and description,
+    /// and every span its agent name. Touched at `end`, so they are sent
+    /// again.
+    fn read_pending_meta(&mut self, end: u64) {
+        let Some(path) = &self.pending_meta else {
+            return;
+        };
+        let Some(meta) = read_meta(path) else {
+            return;
+        };
+        self.pending_meta = None;
+        let Mode::Agent {
+            agent_type,
+            description,
+            tool_use_id,
+            ..
+        } = &mut self.mode
+        else {
+            return;
+        };
+        let text = |key: &str| str_field(&meta, key).map(str::to_owned);
+        if agent_type.is_none() {
+            *agent_type = text("agentType");
+        }
+        if description.is_none() {
+            *description = text("description");
+        }
+        if tool_use_id.is_none() {
+            *tool_use_id = text("toolUseId");
+        }
+        let (agent_type, description, tool_use_id) =
+            (agent_type.clone(), description.clone(), tool_use_id.clone());
+        let old_name = self.agent_name.clone();
+        if let Some(kind) = &agent_type {
+            self.agent_name.clone_from(kind);
+        }
+        let new_name = self.agent_name.clone();
+        let parent = tool_use_id.map(|tool| span_id(SOURCE, self.session(), "tool", &tool));
+        let agent_span = self.agent_span.clone();
+        self.spans.update_each(end, |span| {
+            let mut changed = false;
+            if Some(&span.span_id) == agent_span.as_ref() {
+                if span.parent_span_id.is_none() && parent.is_some() {
+                    span.parent_span_id.clone_from(&parent);
+                    changed = true;
+                }
+                if let Some(description) = &description {
+                    span.attributes
+                        .insert("gen_ai.agent.description".into(), json!(description));
+                    changed = true;
+                }
+                if let Some(kind) = &agent_type {
+                    span.attributes
+                        .insert("claude_code.agent_type".into(), json!(kind));
+                    span.name = format!("invoke_agent {new_name}");
+                    changed = true;
+                }
+            }
+            if new_name != old_name
+                && span
+                    .attributes
+                    .get("gen_ai.agent.name")
+                    .and_then(Value::as_str)
+                    == Some(old_name.as_str())
+            {
+                span.attributes
+                    .insert("gen_ai.agent.name".into(), json!(new_name));
+                changed = true;
+            }
+            changed
+        });
     }
 
     fn session(&self) -> &str {
@@ -712,12 +795,29 @@ impl Converter for ClaudeCode {
     fn run(&self) -> Option<String> {
         Some(self.base.session.clone())
     }
+
+    fn wants_refresh(&self) -> bool {
+        self.pending_meta.is_some()
+    }
+
+    fn refresh(&mut self, end: u64) {
+        self.read_pending_meta(end);
+    }
+}
+
+/// A sub-agent's `.meta.json`, when it exists and parses.
+fn read_meta(path: &Path) -> Option<Value> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(Value::is_object)
 }
 
 /// The session and mode a path implies: `<session>.jsonl` is a main
 /// transcript; `<session>/subagents/[workflows/<wf>/]agent-<id>.jsonl` a
-/// sub-agent's, with its `.meta.json` beside it.
-fn classify(path: &Path) -> (String, Mode) {
+/// sub-agent's, with its `.meta.json` beside it. The flag says whether a
+/// sub-agent's meta file was there to read.
+fn classify(path: &Path) -> (String, Mode, bool) {
     let stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -728,7 +828,7 @@ fn classify(path: &Path) -> (String, Mode) {
         .iter()
         .position(|dir| dir.file_name().and_then(|name| name.to_str()) == Some("subagents"));
     let (Some(agent_id), Some(at)) = (stem.strip_prefix("agent-"), subagents) else {
-        return (stem, Mode::Main);
+        return (stem, Mode::Main, true);
     };
     let session = ancestors
         .get(at + 1)
@@ -742,10 +842,9 @@ fn classify(path: &Path) -> (String, Mode) {
         .and_then(|name| name.to_str())
         .filter(|name| name.starts_with("wf_"))
         .map(str::to_owned);
-    let meta: Value = std::fs::read(path.with_extension("meta.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or(Value::Null);
+    let meta = read_meta(&path.with_extension("meta.json"));
+    let meta_read = meta.is_some();
+    let meta = meta.unwrap_or(Value::Null);
     let text = |key: &str| str_field(&meta, key).map(str::to_owned);
     (
         session,
@@ -756,6 +855,7 @@ fn classify(path: &Path) -> (String, Mode) {
             tool_use_id: text("toolUseId"),
             workflow,
         },
+        meta_read,
     )
 }
 

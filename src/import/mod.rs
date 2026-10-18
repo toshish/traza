@@ -36,8 +36,20 @@
 //! earlier lines), and only spans touched by a line at or past the recorded
 //! offset are sent: a span built entirely from earlier lines was already sent
 //! in exactly its final form. A file that shrank, or whose first bytes
-//! changed, is treated as new. `--watch` keeps converters in memory while
-//! files are active, so following a live file reads only its new lines.
+//! changed, is treated as new. `--watch` keeps converters in memory for
+//! files someone wrote to in the last [`LIVE_IDLE`] (at most
+//! [`MAX_LIVE_CONVERTERS`] at any moment), so following a live file reads
+//! only its new lines.
+//!
+//! # Destinations that go away
+//!
+//! A sink reports a failure as refused (the spans' own fault: split the
+//! batch to isolate them), fatal (a refused credential: stop) or unavailable
+//! (unreachable, or failing through the sink's own retries). A batch import
+//! stops on an unavailable destination; `--watch` keeps the file's offset
+//! where it was, drops its converter (its spans were drained into the failed
+//! send) and retries after a doubling wait capped at [`MAX_RETRY_WAIT`], so
+//! restarting the server never ends a recorder.
 //!
 //! # What the transcripts look like (observed, documented)
 //!
@@ -127,7 +139,10 @@
 //!   the turn (or of the agent span inside a sub-agent);
 //! - a **tool** step per tool call (`gen_ai.tool.name`, `.call.id`,
 //!   `.call.arguments` as JSON, `.call.result`, status `error` when the
-//!   result says so), child of the llm step that requested it;
+//!   result says so), child of the llm step that requested it; a Codex call
+//!   that applies a patch through a general tool (`shell ["apply_patch",
+//!   …]`) also carries [`crate::blame::EDIT_MARKER`], so blame finds it by
+//!   index instead of reading every shell command;
 //! - an **agent** span per sub-agent (`gen_ai.agent.name`), child of the
 //!   tool call that spawned it when the transcript names it.
 //!
@@ -135,8 +150,11 @@
 //! [`MAX_FIELD_BYTES`] and a message part past [`MAX_PART_BYTES`] is cut with
 //! a marker saying how much was dropped, and image data is replaced by a
 //! placeholder naming its size — screenshots would otherwise dominate the
-//! store. No cost is invented: tokens are recorded and the server's pricing
-//! table prices them, exactly as for any other span.
+//! store. The payload store offloads long strings but not structured values,
+//! so a span's structured attributes are held to [`MAX_STRUCTURED_BYTES`] at
+//! send time (`fit_span`), keeping every imported span under a server's
+//! `max-span-bytes` cap. No cost is invented: tokens are recorded and the
+//! server's pricing table prices them, exactly as for any other span.
 
 mod claude_code;
 mod cli;
@@ -147,7 +165,7 @@ mod state;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -178,13 +196,30 @@ pub const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 /// fold into `other`.
 const MAX_TYPE_NAMES: usize = 64;
 
-/// Converters kept in memory by `--watch`. Past it, the least recently
-/// active is dropped; it is rebuilt (with resend suppression) if its file
-/// grows again.
+/// Converters kept in memory by `--watch`, at any moment — the first pass
+/// over a whole history included. Past it, the converter of the file
+/// modified longest ago is dropped; it is rebuilt (with resend suppression)
+/// if its file grows again.
 pub const MAX_LIVE_CONVERTERS: usize = 64;
 
-/// How long `--watch` keeps an idle file's converter in memory.
+/// How long `--watch` keeps a converter for a file nobody has written to:
+/// one whose file was last modified longer ago than this is not kept at all.
 pub const LIVE_IDLE: Duration = Duration::from_secs(600);
+
+/// Longest wait between `--watch` retries while the destination is
+/// unreachable or failing.
+pub const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+
+/// Serialized bytes the structured (array and object) attributes of one span
+/// may take in all, as sent. The payload store offloads long *string*
+/// values and leaves structured ones in the record, so without this budget a
+/// response of hundreds of 64 KiB parts serialized past a server's
+/// `max-span-bytes` cap (4 MiB by default) and was refused whole — measured
+/// on a real Codex history: one span of 26 MB in 894,000.
+pub const MAX_STRUCTURED_BYTES: usize = 2 * 1024 * 1024;
+
+/// Serialized bytes one structured attribute may take, as sent.
+pub const MAX_STRUCTURED_ATTRIBUTE_BYTES: usize = 1024 * 1024;
 
 /// Spans per ingest request.
 const BATCH_SPANS: usize = 500;
@@ -317,6 +352,17 @@ impl Spans {
         Some(&mut built.span)
     }
 
+    /// Applies `change` to every span; those it reports changed are marked
+    /// touched at `offset`.
+    pub(crate) fn update_each(&mut self, offset: u64, mut change: impl FnMut(&mut Span) -> bool) {
+        for built in self.map.values_mut() {
+            if change(&mut built.span) {
+                built.touched = built.touched.max(offset);
+                built.dirty = true;
+            }
+        }
+    }
+
     /// The start time of span `id`, if it exists.
     pub(crate) fn start_of(&self, id: &str) -> Option<u64> {
         self.map.get(id).map(|built| built.span.start_time_ns)
@@ -363,6 +409,17 @@ pub(crate) trait Converter {
     /// The file is complete (a compressed rollout is final): settle anything
     /// held for a turn that will now never end. `end` is past the last line.
     fn finish(&mut self, _end: u64, _stats: &mut FileStats) {}
+    /// Whether the converter is waiting on something outside its file (a
+    /// Claude Code sub-agent's meta file, written after its transcript):
+    /// `--watch` then follows the file even when it did not grow, so
+    /// [`Converter::refresh`] gets to run.
+    fn wants_refresh(&self) -> bool {
+        false
+    }
+    /// Re-reads what lives beside the file, touching any span it changes at
+    /// `end` (the offset consumed so far). Called before a live converter
+    /// reads new lines.
+    fn refresh(&mut self, _end: u64) {}
     /// The spans built so far.
     fn spans(&mut self) -> &mut Spans;
     /// The run id this file's spans carry, once known.
@@ -566,6 +623,9 @@ pub struct ImportStats {
     pub spans_sent: u64,
     /// Spans the destination refused (named in `errors`).
     pub spans_refused: u64,
+    /// Spans sent with structured attributes cut to fit
+    /// [`MAX_STRUCTURED_BYTES`].
+    pub spans_trimmed: u64,
     /// Turn spans built.
     pub turns: u64,
     /// LLM steps built.
@@ -588,6 +648,10 @@ pub struct ImportStats {
     pub transcript: FileStats,
     /// The first few errors, verbatim.
     pub errors: Vec<String>,
+    /// Most converters `--watch` held in memory at once (bounded by
+    /// [`MAX_LIVE_CONVERTERS`]); observed by the tests.
+    #[serde(skip)]
+    pub(crate) peak_live_converters: usize,
 }
 
 /// Errors kept verbatim in [`ImportStats::errors`].
@@ -777,8 +841,9 @@ struct Tracked {
     offset: u64,
     /// The run id recorded when the offset was last saved.
     run: Option<String>,
-    /// When its converter was last fed.
-    active: Instant,
+    /// The file's modification time at the last poll: how recently someone
+    /// wrote to it, which decides whose converter `--watch` keeps.
+    modified: SystemTime,
 }
 
 /// Runs an import into `sink`, writing progress lines to `log`, and returns
@@ -806,6 +871,8 @@ pub fn run(
     let mut sessions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut ancestry = codex::Ancestry::default();
     let mut first_pass = true;
+    // Consecutive passes the destination was unreachable (watch mode only).
+    let mut outages: u32 = 0;
     loop {
         let sent_before = stats.spans_sent;
         let found = discover(options.source, &options.root);
@@ -823,13 +890,33 @@ pub fn run(
         let cutoff = options
             .since
             .and_then(|since| SystemTime::now().checked_sub(since));
+        // `--since` selects sessions, not files: a session any of whose
+        // files changed recently is read whole, so a sub-agent transcript
+        // (or a Codex parent rollout) that went quiet earlier still lands
+        // beside the file that names it.
+        let recent_sessions: std::collections::HashSet<String> = match cutoff {
+            Some(cutoff) => found
+                .iter()
+                .filter(|file| file.modified >= cutoff)
+                .map(|file| session_key(options.source, &ancestry, &file.path))
+                .collect(),
+            None => std::collections::HashSet::new(),
+        };
         let mut changed_state = false;
+        let mut unavailable: Option<String> = None;
         for file in &found {
             if first_pass {
                 stats.files_seen += 1;
             }
             if let Some(cutoff) = cutoff {
-                if file.modified < cutoff && !tracked.contains_key(&file.path) {
+                if file.modified < cutoff
+                    && !tracked.contains_key(&file.path)
+                    && !recent_sessions.contains(&session_key(
+                        options.source,
+                        &ancestry,
+                        &file.path,
+                    ))
+                {
                     if first_pass {
                         stats.files_filtered += 1;
                     }
@@ -873,9 +960,10 @@ pub fn run(
                     converter: None,
                     offset: known.map_or(0, |known| known.offset),
                     run: known.and_then(|known| known.run.clone()),
-                    active: Instant::now(),
+                    modified: file.modified,
                 }
             });
+            entry.modified = file.modified;
             if file.size == 0 {
                 continue;
             }
@@ -894,7 +982,14 @@ pub fn run(
                 }
                 entry.converter = None;
             } else {
-                if file.size == entry.offset && entry.offset > 0 {
+                // A live converter still waiting for something outside its
+                // file (a sub-agent's meta file) is followed even when the
+                // file did not grow.
+                let waiting = entry
+                    .converter
+                    .as_ref()
+                    .is_some_and(|converter| converter.wants_refresh());
+                if file.size == entry.offset && entry.offset > 0 && !waiting {
                     if first_pass {
                         stats.files_unchanged += 1;
                     }
@@ -929,27 +1024,57 @@ pub fn run(
                         );
                         entry.stored_size = Some(file.size);
                         entry.converter = None;
+                        changed_state = true;
                     } else {
-                        state.record(
-                            &options.destination_key,
-                            &key,
-                            entry.offset,
-                            run,
-                            &file.path,
-                        );
+                        // A follow that read nothing new (a converter waiting
+                        // on a sub-agent's meta file) changes no progress, and
+                        // must not rewrite the state file every poll.
+                        let recorded =
+                            state
+                                .file(&options.destination_key, &key)
+                                .is_some_and(|saved| {
+                                    saved.offset == entry.offset
+                                        && (run.is_none() || saved.run == run)
+                                })
+                                && state.head_matches(&options.destination_key, &key, &file.path);
+                        if !recorded {
+                            state.record(
+                                &options.destination_key,
+                                &key,
+                                entry.offset,
+                                run,
+                                &file.path,
+                            );
+                            changed_state = true;
+                        }
                     }
-                    changed_state = true;
                 }
-                Err(Fatal(message)) => {
+                // Watching, an unreachable destination is waited out: this
+                // file's offset is not advanced and its converter (whose
+                // spans were drained into the failed send) is dropped, so
+                // the next pass rebuilds it and re-sends from the recorded
+                // offset — re-sending is idempotent.
+                Err(Stop::Unavailable(message)) if options.watch => {
+                    entry.converter = None;
+                    unavailable = Some(message);
+                    break;
+                }
+                Err(Stop::Unavailable(message) | Stop::Fatal(message)) => {
                     if let (Some(path), true) = (&options.state, changed_state) {
                         let _ = state.save(path);
                     }
                     return Err(message);
                 }
             }
-            if !options.watch {
-                // A batch import holds one converter at a time.
+            // A batch import holds one converter at a time; a watch keeps
+            // one only for a file someone is writing to now, and never more
+            // than MAX_LIVE_CONVERTERS — during the first pass over a whole
+            // history too.
+            if !options.watch || !recently_modified(file.modified) {
                 entry.converter = None;
+            } else {
+                let live = evict(&mut tracked);
+                stats.peak_live_converters = stats.peak_live_converters.max(live);
             }
         }
         if changed_state {
@@ -960,7 +1085,7 @@ pub fn run(
             }
         }
         stats.sessions = sessions.len() as u64;
-        if first_pass {
+        if first_pass && unavailable.is_none() {
             if options.watch {
                 let _ = writeln!(log, "{}", summary_line(&stats, true));
             }
@@ -973,20 +1098,97 @@ pub fn run(
                 stats.spans_sent
             );
         }
+        let wait = match &unavailable {
+            Some(message) => {
+                outages = outages.saturating_add(1);
+                let wait = retry_wait(options.interval, outages);
+                let _ = writeln!(
+                    log,
+                    "traza import {}: the destination is unavailable ({message}); retrying in {} ms",
+                    options.source.as_str(),
+                    wait.as_millis()
+                );
+                wait
+            }
+            None => {
+                if outages > 0 {
+                    let _ = writeln!(
+                        log,
+                        "traza import {}: the destination is back",
+                        options.source.as_str()
+                    );
+                }
+                outages = 0;
+                options.interval
+            }
+        };
         first_pass = false;
         if !options.watch || stop() {
             return Ok(stats);
         }
-        evict(&mut tracked);
-        std::thread::sleep(options.interval);
+        let live = evict(&mut tracked);
+        stats.peak_live_converters = stats.peak_live_converters.max(live);
+        std::thread::sleep(wait);
         if stop() {
             return Ok(stats);
         }
     }
 }
 
-/// A destination failure no retry or split can cure: stop the import.
-struct Fatal(String);
+/// How long `--watch` waits after `outages` consecutive passes the
+/// destination could not be reached: the poll interval, doubling, capped at
+/// [`MAX_RETRY_WAIT`].
+fn retry_wait(interval: Duration, outages: u32) -> Duration {
+    let factor = 1u32 << outages.min(10);
+    interval
+        .checked_mul(factor)
+        .unwrap_or(MAX_RETRY_WAIT)
+        .min(MAX_RETRY_WAIT)
+        .max(interval)
+}
+
+/// Whether a file was written to recently enough for `--watch` to keep its
+/// converter (a clock that puts the file in the future counts as recent).
+fn recently_modified(modified: SystemTime) -> bool {
+    SystemTime::now()
+        .duration_since(modified)
+        .map_or(true, |age| age <= LIVE_IDLE)
+}
+
+/// The session a transcript file belongs to, for `--since`: a Claude Code
+/// main transcript and its sub-agents' files share `<project>/<sessionId>`;
+/// a Codex rollout belongs to its root thread (as far as the rollouts on
+/// disk tell); anything else is its own session.
+fn session_key(source: Source, ancestry: &codex::Ancestry, path: &Path) -> String {
+    match source {
+        Source::ClaudeCode => {
+            let subagents = path
+                .ancestors()
+                .find(|dir| dir.file_name().and_then(|name| name.to_str()) == Some("subagents"));
+            match subagents.and_then(Path::parent) {
+                Some(session_dir) => session_dir.to_string_lossy().into_owned(),
+                None => {
+                    let text = path.to_string_lossy();
+                    text.strip_suffix(".jsonl").unwrap_or(&text).to_owned()
+                }
+            }
+        }
+        Source::Codex => ancestry
+            .root_of(path)
+            .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+    }
+}
+
+/// Why following a file stopped the pass.
+#[derive(Debug)]
+enum Stop {
+    /// A destination failure no retry or split can cure (a refused
+    /// credential): stop the import.
+    Fatal(String),
+    /// The destination could not be reached, or kept failing: a batch import
+    /// stops; a watch waits and retries.
+    Unavailable(String),
+}
 
 /// What following one file came to.
 enum Followed {
@@ -1005,7 +1207,7 @@ fn follow(
     entry: &mut Tracked,
     sink: &mut dyn Sink,
     stats: &mut ImportStats,
-) -> Result<Followed, Fatal> {
+) -> Result<Followed, Stop> {
     let tenant = options.tenant.clone().unwrap_or_default();
     // Resuming a live converter reads only the new bytes; anything else
     // re-reads from the start and suppresses what was already sent.
@@ -1023,6 +1225,10 @@ fn follow(
     let Some(converter) = entry.converter.as_mut() else {
         return Ok(Followed::Failed);
     };
+    if !fresh {
+        // A live converter may be waiting on something beside its file.
+        converter.refresh(entry.offset);
+    }
     let mut file_stats = FileStats::default();
     let mut floor = floor;
     let read = if file.compressed {
@@ -1061,7 +1267,6 @@ fn follow(
             return Ok(Followed::Failed);
         }
     };
-    stats.files_read += 1;
     file_stats.capped = converter.spans().capped;
     let run = converter.run();
     // A run id that changed since the last save (a Codex parent thread that
@@ -1072,13 +1277,15 @@ fn follow(
         floor
     };
     let spans = converter.spans().drain(floor);
+    send_all(sink, spans, stats)?;
+    // Counted once the spans landed: a pass an outage cut short is read
+    // again, and would otherwise be counted twice.
+    stats.files_read += 1;
     if !options.watch || fresh {
         stats.tally(converter.spans());
     }
     stats.transcript.merge(&file_stats);
-    send_all(sink, spans, stats)?;
     entry.offset = consumed;
-    entry.active = Instant::now();
     if run.is_some() {
         entry.run = run.clone();
     }
@@ -1114,21 +1321,39 @@ fn decompressed(path: &Path) -> std::io::Result<Vec<u8>> {
 
 /// [`read_lines`] over any reader positioned at byte `start`.
 fn read_lines_from(
+    reader: impl BufRead,
+    start: u64,
+    converter: &mut dyn Converter,
+    stats: &mut FileStats,
+) -> std::io::Result<u64> {
+    read_lines_capped(reader, start, converter, stats, MAX_LINE_BYTES)
+}
+
+/// [`read_lines_from`] with the longest kept line as a parameter, so the
+/// over-long path is testable without a 64 MiB line. A terminated line
+/// longer than `max_line` is consumed, counted as malformed and skipped —
+/// the lines after it are still read; an unterminated one waits for its
+/// newline.
+fn read_lines_capped(
     mut reader: impl BufRead,
     start: u64,
     converter: &mut dyn Converter,
     stats: &mut FileStats,
+    max_line: usize,
 ) -> std::io::Result<u64> {
     let mut offset = start;
     let mut line = Vec::new();
     loop {
         line.clear();
-        let read = read_bounded_line(&mut reader, &mut line)?;
+        let (read, terminated) = read_bounded_line(&mut reader, &mut line, max_line)?;
         if read == 0 {
             return Ok(offset);
         }
-        let terminated = line.last() == Some(&b'\n');
-        let body: &[u8] = if terminated {
+        // The line's own length, newline excluded. Decided from what was
+        // consumed, not from what was kept: an over-long line keeps only a
+        // prefix, which never ends in its newline.
+        let oversized = read - u64::from(terminated) > max_line as u64;
+        let body: &[u8] = if terminated && !oversized {
             &line[..line.len() - 1]
         } else {
             &line
@@ -1136,14 +1361,12 @@ fn read_lines_from(
         let body = body.strip_suffix(b"\r").unwrap_or(body);
         if !terminated {
             // The tail: consume only a complete JSON value.
-            if read as usize > MAX_LINE_BYTES
-                || serde_json::from_slice::<serde::de::IgnoredAny>(body).is_err()
-            {
+            if oversized || serde_json::from_slice::<serde::de::IgnoredAny>(body).is_err() {
                 return Ok(offset);
             }
         }
         let end = offset + read;
-        if read as usize > MAX_LINE_BYTES {
+        if oversized {
             stats.lines += 1;
             stats.malformed_lines += 1;
         } else if !body.iter().all(u8::is_ascii_whitespace) {
@@ -1154,42 +1377,45 @@ fn read_lines_from(
     }
 }
 
-/// Reads one line into `out`, keeping at most [`MAX_LINE_BYTES`] + 1 bytes of
-/// it (the rest is consumed and dropped). Returns the bytes consumed.
-fn read_bounded_line(reader: &mut impl BufRead, out: &mut Vec<u8>) -> std::io::Result<u64> {
+/// Reads one line into `out`, keeping at most `max_line` + 1 bytes of it
+/// (the rest is consumed and dropped). Returns the bytes consumed and
+/// whether the line ended in a newline (the newline is kept in `out` only
+/// when the whole line fit).
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    out: &mut Vec<u8>,
+    max_line: usize,
+) -> std::io::Result<(u64, bool)> {
     let mut consumed = 0u64;
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
-            return Ok(consumed);
+            return Ok((consumed, false));
         }
         let (chunk, done) = match available.iter().position(|byte| *byte == b'\n') {
             Some(at) => (&available[..=at], true),
             None => (available, false),
         };
         let take = chunk.len();
-        if out.len() <= MAX_LINE_BYTES {
-            let room = (MAX_LINE_BYTES + 1).saturating_sub(out.len());
-            out.extend_from_slice(&chunk[..take.min(room)]);
-            if done && take > room {
-                // Keep the newline visible so the caller sees a terminated line.
-                out.push(b'\n');
-            }
-        }
+        let room = (max_line + 1).saturating_sub(out.len());
+        out.extend_from_slice(&chunk[..take.min(room)]);
         reader.consume(take);
         consumed += take as u64;
         if done {
-            return Ok(consumed);
+            return Ok((consumed, true));
         }
     }
 }
 
 /// Sends `spans` in bounded batches; a refused batch is split to isolate
 /// the spans the destination will not take.
-fn send_all(sink: &mut dyn Sink, spans: Vec<Span>, stats: &mut ImportStats) -> Result<(), Fatal> {
+fn send_all(sink: &mut dyn Sink, spans: Vec<Span>, stats: &mut ImportStats) -> Result<(), Stop> {
     let mut batch: Vec<Span> = Vec::new();
     let mut bytes = 0usize;
-    for span in spans {
+    for mut span in spans {
+        if fit_span(&mut span) {
+            stats.spans_trimmed += 1;
+        }
         let size = serde_json::to_vec(&span).map_or(0, |encoded| encoded.len());
         if !batch.is_empty() && (batch.len() >= BATCH_SPANS || bytes + size > BATCH_BYTES) {
             send_batch(sink, std::mem::take(&mut batch), stats)?;
@@ -1204,14 +1430,15 @@ fn send_all(sink: &mut dyn Sink, spans: Vec<Span>, stats: &mut ImportStats) -> R
     Ok(())
 }
 
-fn send_batch(sink: &mut dyn Sink, batch: Vec<Span>, stats: &mut ImportStats) -> Result<(), Fatal> {
+fn send_batch(sink: &mut dyn Sink, batch: Vec<Span>, stats: &mut ImportStats) -> Result<(), Stop> {
     let count = batch.len() as u64;
     match sink.send(&batch) {
         Ok(()) => {
             stats.spans_sent += count;
             Ok(())
         }
-        Err(sink::SendError::Fatal(message)) => Err(Fatal(message)),
+        Err(sink::SendError::Fatal(message)) => Err(Stop::Fatal(message)),
+        Err(sink::SendError::Unavailable(message)) => Err(Stop::Unavailable(message)),
         Err(sink::SendError::Refused(message)) if batch.len() == 1 => {
             stats.spans_refused += 1;
             stats.error(format!(
@@ -1231,29 +1458,117 @@ fn send_batch(sink: &mut dyn Sink, batch: Vec<Span>, stats: &mut ImportStats) ->
     }
 }
 
-/// Drops converters idle past [`LIVE_IDLE`], and the least recently active
-/// past [`MAX_LIVE_CONVERTERS`].
-fn evict(tracked: &mut BTreeMap<PathBuf, Tracked>) {
-    let now = Instant::now();
-    for entry in tracked.values_mut() {
-        if entry.converter.is_some() && now.duration_since(entry.active) > LIVE_IDLE {
+/// Cuts a span's structured attributes to [`MAX_STRUCTURED_ATTRIBUTE_BYTES`]
+/// each and [`MAX_STRUCTURED_BYTES`] in all (serialized), keeping them valid
+/// JSON: what is cut is replaced by a marker naming how much. Returns whether
+/// anything was cut. String attributes are left alone — they are already
+/// bounded, and the payload store offloads the long ones.
+pub(crate) fn fit_span(span: &mut Span) -> bool {
+    let mut total = MAX_STRUCTURED_BYTES;
+    let mut cut = false;
+    for value in span.attributes.values_mut() {
+        if !matches!(value, Value::Array(_) | Value::Object(_)) {
+            continue;
+        }
+        let allowed = MAX_STRUCTURED_ATTRIBUTE_BYTES.min(total);
+        let size = serialized_len(value);
+        if size > allowed {
+            let mut budget = allowed;
+            fit_value(value, &mut budget);
+            cut = true;
+        }
+        total = total.saturating_sub(serialized_len(value));
+    }
+    cut
+}
+
+fn serialized_len(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(0, |encoded| encoded.len())
+}
+
+/// Keeps what of `value` fits `budget` serialized bytes (approximately: a
+/// marker may overshoot by its own length), in document order.
+fn fit_value(value: &mut Value, budget: &mut usize) {
+    match value {
+        Value::String(text) => {
+            let cost = text.len() + 2;
+            if cost <= *budget {
+                *budget -= cost;
+            } else {
+                *value = Value::String(bounded(text, budget.saturating_sub(2)));
+                *budget = 0;
+            }
+        }
+        Value::Array(items) => {
+            let mut keep = items.len();
+            for (index, item) in items.iter_mut().enumerate() {
+                if *budget == 0 {
+                    keep = index;
+                    break;
+                }
+                fit_value(item, budget);
+                *budget = budget.saturating_sub(1);
+            }
+            if keep < items.len() {
+                let dropped = items.len() - keep;
+                items.truncate(keep);
+                items.push(Value::String(format!(
+                    "…[traza import: {dropped} more items not kept: the span's size budget]"
+                )));
+            }
+        }
+        Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for (index, key) in keys.iter().enumerate() {
+                if *budget == 0 {
+                    let dropped = keys.len() - index;
+                    for gone in &keys[index..] {
+                        map.remove(gone);
+                    }
+                    map.insert(
+                        "traza.import.cut".into(),
+                        Value::String(format!(
+                            "{dropped} more fields not kept: the span's size budget"
+                        )),
+                    );
+                    break;
+                }
+                *budget = budget.saturating_sub(key.len() + 4);
+                if let Some(item) = map.get_mut(key) {
+                    fit_value(item, budget);
+                }
+            }
+        }
+        _ => *budget = budget.saturating_sub(8),
+    }
+}
+
+/// Drops the converters of files nobody wrote to within [`LIVE_IDLE`], then,
+/// past [`MAX_LIVE_CONVERTERS`], those of the files modified longest ago —
+/// so the converters kept are the sessions actually running. Returns how
+/// many remain.
+fn evict(tracked: &mut BTreeMap<PathBuf, Tracked>) -> usize {
+    let mut live: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for (path, entry) in tracked.iter_mut() {
+        if entry.converter.is_none() {
+            continue;
+        }
+        if recently_modified(entry.modified) {
+            live.push((entry.modified, path.clone()));
+        } else {
             entry.converter = None;
         }
     }
-    let mut live: Vec<(Instant, PathBuf)> = tracked
-        .iter()
-        .filter(|(_, entry)| entry.converter.is_some())
-        .map(|(path, entry)| (entry.active, path.clone()))
-        .collect();
     if live.len() > MAX_LIVE_CONVERTERS {
         live.sort();
         let excess = live.len() - MAX_LIVE_CONVERTERS;
-        for (_, path) in live.into_iter().take(excess) {
+        for (_, path) in live.drain(..excess) {
             if let Some(entry) = tracked.get_mut(&path) {
                 entry.converter = None;
             }
         }
     }
+    live.len()
 }
 
 /// Whether a file belongs to a project matching `filter`: its path contains

@@ -11,6 +11,9 @@ use super::{run, summary_line, ImportOptions, Source};
 /// The default server a client subcommand talks to.
 const DEFAULT_URL: &str = "http://127.0.0.1:8080";
 
+/// Longest blame query the CLI sends: repository roots past it are left out.
+const MAX_QUERY_BYTES: usize = 32 * 1024;
+
 /// Payload threshold for `--data-dir` imports: the server's own default, so
 /// a store filled offline holds what one filled over HTTP would.
 const DATA_DIR_PAYLOAD_THRESHOLD: usize = 256 * 1024;
@@ -25,7 +28,7 @@ const IMPORT_USAGE: &str = "Usage: traza-server import claude-code|codex [--path
 
 const BLAME_USAGE: &str = "Usage: traza-server blame FILE:LINE [--url URL (default \
 http://127.0.0.1:8080)] [--token TOKEN (default $TRAZA_TOKEN)] [--tenant TENANT] [--limit N] \
-[--json]";
+[--json] [--anywhere (search every project, not only this repository and its worktrees)]";
 
 /// Runs `traza-server import ARGS…`. Returns the process exit code.
 pub fn import_main(args: &[String]) -> Result<i32, String> {
@@ -194,11 +197,20 @@ pub fn import_main(args: &[String]) -> Result<i32, String> {
         stats?
     } else {
         let target = HttpTarget::parse(url.as_deref().unwrap_or(DEFAULT_URL), token)?;
-        options.destination_key = format!(
-            "{}|tenant:{}",
-            target.key(),
-            tenant.as_deref().unwrap_or_default()
-        );
+        let identity = loop {
+            match whoami(&target) {
+                Ok(identity) => break identity,
+                // A watcher started before its server (at login, say) waits
+                // for it rather than exiting.
+                Err(Whoami::Unreachable(error)) if watch => {
+                    eprintln!("traza import: {error}; retrying in 5 s");
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+                Err(Whoami::Unreachable(error) | Whoami::Refused(error)) => return Err(error),
+            }
+        };
+        let effective = destination_tenant(&identity, tenant.as_deref())?;
+        options.destination_key = format!("{}|tenant:{effective}", target.key());
         let mut sink = HttpSink::new(target);
         run(&options, &mut sink as &mut dyn Sink, &mut log, &never)?
     };
@@ -220,6 +232,87 @@ pub fn import_main(args: &[String]) -> Result<i32, String> {
     })
 }
 
+/// What `GET /v1/whoami` said about the import's credential.
+#[derive(Debug, PartialEq)]
+struct Identity {
+    /// The tenant the credential is bound to (`None`: unbound, or open mode).
+    tenant: Option<String>,
+    /// `ro`, `rw` or `admin`; `None` when the server did not say.
+    scope: Option<String>,
+}
+
+/// Why the identity could not be had.
+enum Whoami {
+    /// The server could not be reached (or failed): a watcher waits.
+    Unreachable(String),
+    /// The server refused the credential, or answered something unusable.
+    Refused(String),
+}
+
+/// Asks the server who the import's credential is, before anything is
+/// read: a refused or read-only credential stops the import up front, and
+/// the binding decides the state file's key.
+fn whoami(target: &HttpTarget) -> Result<Identity, Whoami> {
+    let (status, _, body) =
+        http_request(target, "GET", "/v1/whoami", None).map_err(Whoami::Unreachable)?;
+    match status {
+        200 => {
+            let answer: Value = serde_json::from_slice(&body).map_err(|error| {
+                Whoami::Refused(format!("{}/v1/whoami answered {error}", target.key()))
+            })?;
+            Ok(Identity {
+                tenant: answer
+                    .get("tenant")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                scope: answer
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        }
+        401 | 403 => Err(Whoami::Refused(format!(
+            "the server refused the credential ({status}): {}; pass --token (or TRAZA_TOKEN) \
+             with rw scope",
+            error_text(&body)
+        ))),
+        status if status >= 500 => Err(Whoami::Unreachable(format!(
+            "{} answered {status}: {}",
+            target.key(),
+            error_text(&body)
+        ))),
+        status => Err(Whoami::Refused(format!(
+            "{}/v1/whoami answered {status}: {}; is --url a Traza server?",
+            target.key(),
+            error_text(&body)
+        ))),
+    }
+}
+
+/// The tenant an HTTP import writes, which keys its progress in the state
+/// file: a bound credential's own (so two credentials bound to different
+/// tenants never share progress, and rotating a credential keeps it), else
+/// `--tenant`, else the default tenant (`""`). A read-only credential, or a
+/// `--tenant` a bound credential cannot write, is refused here — before a
+/// single batch would be.
+fn destination_tenant(identity: &Identity, flag: Option<&str>) -> Result<String, String> {
+    if identity.scope.as_deref() == Some("ro") {
+        return Err(
+            "the credential is read-only; importing writes spans, so pass --token (or \
+             TRAZA_TOKEN) with rw scope"
+                .to_owned(),
+        );
+    }
+    match (&identity.tenant, flag) {
+        (Some(bound), Some(flag)) if bound != flag => Err(format!(
+            "--tenant {flag} conflicts with the credential, which is bound to tenant {bound}; \
+             drop --tenant (a bound credential stamps its own)"
+        )),
+        (Some(bound), _) => Ok(bound.clone()),
+        (None, flag) => Ok(flag.unwrap_or_default().to_owned()),
+    }
+}
+
 /// Runs `traza-server blame FILE:LINE …`. Exit code 0 when an agent edit
 /// introduced the line, 1 when none did.
 pub fn blame_main(args: &[String]) -> Result<i32, String> {
@@ -229,6 +322,7 @@ pub fn blame_main(args: &[String]) -> Result<i32, String> {
     let mut tenant = None;
     let mut limit = None;
     let mut as_json = false;
+    let mut anywhere = false;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -242,6 +336,7 @@ pub fn blame_main(args: &[String]) -> Result<i32, String> {
             "--url" => url = Some(value()?),
             "--token" => token = Some(value()?),
             "--tenant" => tenant = Some(value()?),
+            "--anywhere" => anywhere = true,
             "--limit" => {
                 limit = Some(
                     value()?
@@ -282,13 +377,26 @@ pub fn blame_main(args: &[String]) -> Result<i32, String> {
             "{file}:{number} is blank; blame a line with text on it"
         ));
     }
-    let query_path = repository_relative(Path::new(file));
+    let (query_path, roots) = repository_scope(Path::new(file));
     let target = HttpTarget::parse(url.as_deref().unwrap_or(DEFAULT_URL), token)?;
     let mut query = format!(
         "/v1/blame?path={}&line={}",
         percent_encode(&query_path),
         percent_encode(line)
     );
+    // Scoped to this repository (its checkout and worktrees) unless asked
+    // otherwise: a repository-relative path alone matches the same path in
+    // every project the store holds.
+    if !anywhere {
+        for root in &roots {
+            let parameter = format!("&project={}", percent_encode(root));
+            // Kept well inside the server's 64 KiB request head.
+            if query.len() + parameter.len() > MAX_QUERY_BYTES {
+                break;
+            }
+            query.push_str(&parameter);
+        }
+    }
     if let Some(limit) = limit {
         query.push_str(&format!("&limit={limit}"));
     }
@@ -329,11 +437,26 @@ fn render_blame(file: &str, number: usize, line: &str, answer: &Value) -> String
         .get("searched_spans")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let scoped = answer
+        .get("projects")
+        .and_then(Value::as_array)
+        .is_some_and(|projects| !projects.is_empty());
     if matches.is_empty() {
         let _ = writeln!(
             out,
-            "  no recorded agent edit introduced this line ({searched} candidate spans checked)"
+            "  no recorded agent edit introduced this line {}({searched} candidate spans checked)",
+            if scoped {
+                "in this repository or its worktrees "
+            } else {
+                ""
+            }
         );
+        if scoped {
+            let _ = writeln!(
+                out,
+                "  (--anywhere searches every project, e.g. sessions recorded at another path)"
+            );
+        }
         return out;
     }
     for (position, found) in matches.iter().enumerate() {
@@ -381,6 +504,11 @@ fn render_blame(file: &str, number: usize, line: &str, answer: &Value) -> String
             text("trace_id"),
             text("span_id")
         );
+        if !scoped {
+            if let Some(project) = found.get("project").and_then(Value::as_str) {
+                let _ = writeln!(out, "    project {}", crate::mcp::sanitize(project));
+            }
+        }
     }
     if answer.get("truncated").and_then(Value::as_bool) == Some(true) {
         let _ = writeln!(
@@ -392,19 +520,160 @@ fn render_blame(file: &str, number: usize, line: &str, answer: &Value) -> String
     out
 }
 
-/// The path to send for `file`: relative to its repository root (the nearest
-/// ancestor holding `.git`), so edits made in another checkout of the same
-/// repository match; else the canonical absolute path.
-fn repository_relative(file: &Path) -> String {
+/// The path to send for `file`, and the repository roots to scope the
+/// search to: the path relative to its checkout's root (the nearest ancestor
+/// holding `.git`), with that root, the main checkout, the directories of
+/// checkouts nested inside it (as `<dir>/*`) and every other worktree git
+/// lists for the repository — a line written in any of them is the same line
+/// of the same file. Outside a repository: the canonical absolute path and
+/// no roots.
+fn repository_scope(file: &Path) -> (String, Vec<String>) {
     let absolute = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     for dir in absolute.ancestors().skip(1) {
-        if dir.join(".git").exists() {
+        let dot_git = dir.join(".git");
+        if dot_git.exists() {
             if let Ok(relative) = absolute.strip_prefix(dir) {
-                return relative.to_string_lossy().replace('\\', "/");
+                let mut roots = vec![slash(dir)];
+                // The root as spelled on the command line too, when a
+                // symlink (macOS's /tmp, say) makes it differ from the
+                // canonical one: a transcript records the path the agent
+                // was given.
+                if let Some(given) = std::path::absolute(file)
+                    .ok()
+                    .and_then(|given| given_root(&given, relative))
+                {
+                    if !roots.contains(&given) {
+                        roots.push(given);
+                    }
+                }
+                let checkouts = repository_checkouts(&dot_git);
+                let mut containers: Vec<String> = Vec::new();
+                if let Some(main) = &checkouts.main {
+                    if !roots.contains(main) {
+                        roots.push(main.clone());
+                    }
+                    // Checkouts nested inside the repository — Claude
+                    // Code's `.claude/worktrees/<name>`, or wherever the
+                    // listed worktrees live inside it — stand for the
+                    // repository even after they are removed and git
+                    // forgets them, which is the usual fate of an agent's
+                    // worktree.
+                    containers.push(format!("{main}/.claude/worktrees"));
+                    for linked in &checkouts.linked {
+                        if let Some(parent) = linked.rsplit_once('/').map(|(parent, _)| parent) {
+                            let inside = parent.len() > main.len()
+                                && parent.starts_with(main.as_str())
+                                && parent.as_bytes()[main.len()] == b'/';
+                            if inside && !containers.iter().any(|known| known == parent) {
+                                containers.push(parent.to_owned());
+                            }
+                        }
+                    }
+                }
+                for container in &containers {
+                    roots.push(format!("{container}/*"));
+                }
+                // Linked worktrees a container already covers need no entry.
+                for linked in checkouts.linked {
+                    let covered = containers.iter().any(|container| {
+                        linked
+                            .strip_prefix(container.as_str())
+                            .and_then(|rest| rest.strip_prefix('/'))
+                            .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+                    });
+                    if !covered && !roots.contains(&linked) {
+                        roots.push(linked);
+                    }
+                }
+                roots.truncate(crate::blame::MAX_BLAME_PROJECTS);
+                return (slash(relative), roots);
             }
         }
     }
-    absolute.to_string_lossy().into_owned()
+    (absolute.to_string_lossy().into_owned(), Vec::new())
+}
+
+/// A path as the forward-slashed text blame compares.
+fn slash(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// `given` with `relative` taken off its end, when it ends with it.
+fn given_root(given: &Path, relative: &Path) -> Option<String> {
+    let mut root = given.to_path_buf();
+    for _ in relative.components() {
+        if !root.pop() {
+            return None;
+        }
+    }
+    (root.join(relative) == given).then(|| slash(&root))
+}
+
+/// The checkouts git knows for one repository.
+#[derive(Debug, Default)]
+struct Checkouts {
+    /// The main checkout (the directory whose `.git` is the common one).
+    main: Option<String>,
+    /// Each linked worktree, sorted.
+    linked: Vec<String>,
+}
+
+/// Every checkout of the repository whose `.git` is `dot_git`: the main
+/// checkout and each linked worktree (`<common>/worktrees/*/gitdir` names
+/// the worktree's `.git` file). Read from git's own files — no `git` process
+/// — and bounded.
+fn repository_checkouts(dot_git: &Path) -> Checkouts {
+    const MAX_WORKTREES: usize = 256;
+    // A linked worktree's `.git` is a file: `gitdir: <common>/worktrees/<name>`.
+    let common = if dot_git.is_file() {
+        let Some(gitdir) = std::fs::read_to_string(dot_git).ok().and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("gitdir:"))
+                .map(|path| PathBuf::from(path.trim()))
+        }) else {
+            return Checkouts::default();
+        };
+        let gitdir = if gitdir.is_relative() {
+            dot_git
+                .parent()
+                .map_or(gitdir.clone(), |dir| dir.join(&gitdir))
+        } else {
+            gitdir
+        };
+        let common = std::fs::read_to_string(gitdir.join("commondir"))
+            .ok()
+            .map(|text| PathBuf::from(text.trim()))
+            .unwrap_or_else(|| PathBuf::from("../.."));
+        let common = if common.is_relative() {
+            gitdir.join(common)
+        } else {
+            common
+        };
+        common.canonicalize().unwrap_or(common)
+    } else {
+        dot_git.to_path_buf()
+    };
+    let mut checkouts = Checkouts::default();
+    // The main checkout holds the common directory as its `.git`.
+    if common.file_name().and_then(|name| name.to_str()) == Some(".git") {
+        checkouts.main = common.parent().map(slash);
+    }
+    let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else {
+        return checkouts;
+    };
+    for entry in entries.flatten().take(MAX_WORKTREES) {
+        let Ok(text) = std::fs::read_to_string(entry.path().join("gitdir")) else {
+            continue;
+        };
+        let worktree_git = PathBuf::from(text.trim());
+        if let Some(root) = worktree_git.parent() {
+            let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            checkouts.linked.push(slash(&root));
+        }
+    }
+    checkouts.linked.sort();
+    checkouts.linked.dedup();
+    checkouts
 }
 
 /// Percent-encodes everything but RFC 3986's unreserved characters.
@@ -458,6 +727,88 @@ mod tests {
         assert!(parse_duration("7").is_err());
         assert!(parse_duration("d").is_err());
         assert!(parse_duration("1y").is_err());
+    }
+
+    #[test]
+    fn a_file_in_a_linked_worktree_is_scoped_to_every_checkout_of_its_repository() {
+        let base = std::env::temp_dir().join(format!(
+            "traza-blame-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let main = base.join("main");
+        let linked = base.join("linked");
+        std::fs::create_dir_all(main.join(".git/worktrees/linked")).expect("main");
+        std::fs::create_dir_all(linked.join("src")).expect("linked");
+        let main = main.canonicalize().expect("canonical");
+        let linked = linked.canonicalize().expect("canonical");
+        // git's layout: the worktree's `.git` file names its admin
+        // directory, which names the common directory and the worktree.
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/linked").display()),
+        )
+        .expect("worktree .git");
+        std::fs::write(main.join(".git/worktrees/linked/commondir"), "../..\n").expect("commondir");
+        std::fs::write(
+            main.join(".git/worktrees/linked/gitdir"),
+            format!("{}\n", linked.join(".git").display()),
+        )
+        .expect("gitdir");
+        let file = linked.join("src/lib.rs");
+        std::fs::write(&file, "x\n").expect("file");
+        let (path, roots) = repository_scope(&file);
+        assert_eq!(path, "src/lib.rs");
+        assert!(roots.contains(&slash(&linked)), "{roots:?}");
+        assert!(
+            roots.contains(&slash(&main)),
+            "the main checkout of the same repository: {roots:?}"
+        );
+        assert!(
+            roots.contains(&format!("{}/.claude/worktrees/*", slash(&main))),
+            "Claude Code's worktrees, removed ones included: {roots:?}"
+        );
+        assert_eq!(
+            given_root(Path::new("/a/b/src/lib.rs"), Path::new("src/lib.rs")),
+            Some("/a/b".to_owned())
+        );
+        assert_eq!(
+            given_root(Path::new("/a/b/x.rs"), Path::new("src/x.rs")),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_bound_credential_decides_the_destination_tenant() {
+        let bound = Identity {
+            tenant: Some("acme".into()),
+            scope: Some("rw".into()),
+        };
+        assert_eq!(destination_tenant(&bound, None), Ok("acme".to_owned()));
+        assert_eq!(
+            destination_tenant(&bound, Some("acme")),
+            Ok("acme".to_owned())
+        );
+        assert!(destination_tenant(&bound, Some("beta"))
+            .is_err_and(|error| error.contains("conflicts with the credential")));
+        let unbound = Identity {
+            tenant: None,
+            scope: Some("admin".into()),
+        };
+        assert_eq!(destination_tenant(&unbound, None), Ok(String::new()));
+        assert_eq!(
+            destination_tenant(&unbound, Some("beta")),
+            Ok("beta".to_owned())
+        );
+        let reader = Identity {
+            tenant: None,
+            scope: Some("ro".into()),
+        };
+        assert!(destination_tenant(&reader, None).is_err_and(|error| error.contains("read-only")));
     }
 
     #[test]

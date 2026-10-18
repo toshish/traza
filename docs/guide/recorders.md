@@ -48,7 +48,7 @@ derived from data both sides of it hold.
 | a session | the run: every span carries `session.id` (Claude Code's `sessionId`; for Codex, the root thread id) | `traza.source`, `code.project` (the session's working directory), `service.version` (the tool's version), `vcs.ref.head.name`; `service` is `claude-code` or `codex` |
 | a user prompt | a `turn` span (not a step) | event `gen_ai.user.message` with the prompt as `content`; the session's first prompt, cut to 200 characters, is also `session.goal`; status is that of the turn's last model call |
 | a model response | an llm step, child of its turn | `gen_ai.operation.name=chat`, `gen_ai.provider.name` (`anthropic`, `openai`), `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens` / `cache_read.input_tokens` / `cache_creation.input_tokens`, `gen_ai.input.messages` (the conversation since the previous response), `gen_ai.output.messages` (text, reasoning, tool calls) |
-| a tool call and its result | a tool step, child of the response that asked for it | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.call.arguments` (kept as JSON), `gen_ai.tool.call.result`; status `error` when Claude Code marks the result an error or a Codex command exits non-zero (`process.exit.code`) |
+| a tool call and its result | a tool step, child of the response that asked for it | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.call.arguments` (kept as JSON), `gen_ai.tool.call.result`; status `error` when Claude Code marks the result an error or a Codex command exits non-zero (`process.exit.code`); `traza.edit=true` on a Codex call that applies a patch through a general tool (an older build's `shell ["apply_patch", …]`), so blame can find it without reading every command |
 | a sub-agent | an agent step, `gen_ai.operation.name=invoke_agent` | `gen_ai.agent.name` (Claude Code's `agentType`, Codex's `agent_role`); a Claude Code sub-agent is a child of the `Agent`/`Task` tool call that spawned it and its own calls are its children |
 | an API error Claude Code synthesized | a failed llm step | `error.type`; the model is the one the session was using |
 | a Codex token count no recorded response claims | an llm step with its usage and `codex.content_unrecorded=true` | the call happened and was paid for; the rollout kept no content for it |
@@ -75,7 +75,14 @@ them like any other span's.
 Text is bounded so an import cannot balloon: a tool result, argument string or
 prompt past 1 MiB, and a message part past 64 KiB, is cut with a marker naming
 how many bytes were dropped; image data is replaced by a placeholder. The
-server's payload offload then applies as usual.
+server's payload offload then applies as usual — but it moves long *string*
+values out of the record, not structured ones, so a span's structured
+attributes (the input and output messages, JSON arguments) are also held to
+1 MiB each and 2 MiB together, serialized: past that, the later parts, items
+or fields are replaced by a marker saying how many were not kept, and the span
+is counted in `spans_trimmed`. Without it, a response of hundreds of large
+parts overran a server's 4 MiB `max-span-bytes` cap and was refused whole (on
+one real Codex history, one span of 894,000).
 
 ## Importing again is safe
 
@@ -101,11 +108,29 @@ into your server skip anything. A file is re-read from its start when it grows
 (the current turn lives in earlier lines), and only spans touched by a line past
 the recorded offset are sent; a span built entirely from earlier lines was
 already sent in exactly its final form, so a restart sends nothing twice.
-`--watch` keeps the converters of active files in memory instead (at most 64,
-each dropped after ten idle minutes), so following a live file reads only its
-new lines. When Codex replaces a finished rollout with its `.jsonl.zst`, the
+`--watch` keeps the converters of live files in memory instead, so following
+a live file reads only its new lines: only a file written to in the last ten
+minutes keeps one, and never more than 64 at any moment — the first pass over a
+whole history included, which therefore holds one file's converter at a time
+plus the live ones; past the cap, the file modified longest ago gives its
+converter up (it is rebuilt, with resend suppression, if that file grows
+again). When Codex replaces a finished rollout with its `.jsonl.zst`, the
 compressed file continues the plain file's progress (after checking it starts
 with the same bytes). `--no-state` sends everything every time.
+
+The state file's destination for `--url` is the server plus the tenant the
+spans land in — a bound credential's own (asked of
+[`GET /v1/whoami`](http-api.md#get-v1whoami) before anything is read), else
+`--tenant` — so two credentials bound to different tenants of one server keep
+separate progress, and rotating a credential keeps it. The token is never
+written down.
+
+A watch outlives its server: when the server cannot be reached, or keeps
+answering `5xx` or `429` through the client's own retries (about 15 s), the
+file being sent keeps its recorded offset, the pass stops, and the watch tries
+again after a wait that doubles from the poll interval up to 30 s; what was
+sent before the outage may be sent again, which is harmless. A watch started
+before its server waits for it too. A refused credential still ends it.
 
 The state file is written atomically after each change; a crash at worst
 re-sends spans the destination already holds, which is harmless.
@@ -122,20 +147,29 @@ re-sends spans the destination already holds, which is harmless.
   default payload threshold.
 - `--dry-run`: convert and count, send nothing, record nothing.
 
-A batch the destination refuses is split until the refused spans are isolated;
-they are counted and named, and the rest still land. A refused credential, an
-unreachable server or an exhausted quota stops the import with the server's own
-words. The exit code is 0, 3 when some spans or files were refused, and 2 when
-the import could not run.
+Before reading anything, an import over `--url` asks the server who its
+credential is: a refused credential, a read-only one, or a `--tenant` other
+than a bound credential's own stops it there, with nothing sent. A batch the
+destination refuses is split until the refused spans are isolated; they are
+counted and named, and the rest still land — except a refusal that is about the
+credential rather than a span (a tenant the credential is not bound to), which
+stops the import instead of being split into a request per span. A refused
+credential, and — for a batch import — an unreachable server or an exhausted
+quota, stop the import with the server's own words. The exit code is 0, 3 when
+some spans or files were refused, and 2 when the import could not run.
 
-`--since 7d` only reads files modified that recently (a selected session is
-imported whole); `--project-filter SUBSTR` only sessions whose file path or
-working directory contains it. `--json` prints the counts as JSON:
+`--since 7d` only reads sessions with a file modified that recently, and reads
+such a session whole: a Claude Code transcript with every sub-agent file of its
+session, a Codex rollout with the rollouts of its parent threads (as far as the
+rollouts on disk tell) — so an `Agent` call keeps its agent and a sub-agent
+thread its root. `--project-filter SUBSTR` only reads sessions whose file path
+or working directory contains it. `--json` prints the counts as JSON:
 
 ```json
 {"source":"claude-code","files_seen":3,"files_read":3,"files_unchanged":0,
  "files_filtered":0,"files_failed":0,"sessions":2,"spans_built":21,
- "spans_sent":21,"spans_refused":0,"turns":3,"llm_steps":11,"tool_steps":6,
+ "spans_sent":21,"spans_refused":0,"spans_trimmed":0,"turns":3,"llm_steps":11,
+ "tool_steps":6,
  "tool_errors":1,"agent_spans":1,"input_tokens":240,"output_tokens":625,
  "cache_read_tokens":8400,"cache_creation_tokens":3650,
  "transcript":{"lines":28,"malformed_lines":1,"records":{"assistant":13,
@@ -182,12 +216,24 @@ directory the Codex importer records. It therefore works on Claude Code and
 Codex sessions recorded any way, not only imported ones, as long as the
 arguments were recorded.
 
-**Which file.** The query path matches when it is a suffix of the recorded
-path at a component boundary (`src/lib.rs` matches `/repo/src/lib.rs`, not
-`/repo/src/glib.rs`; a leading `/` is not an anchor). The CLI sends the path
-relative to the repository root (the nearest directory holding `.git`), so a
-line written in a worktree or another checkout of the same repository is still
-found.
+**Which file, in which repository.** On its own, the query path matches when
+it is a suffix of the recorded path at a component boundary (`src/lib.rs`
+matches `/repo/src/lib.rs`, not `/repo/src/glib.rs`; a leading `/` is not an
+anchor) — in every project the store holds, so a common line in a common path
+(`}` in `src/main.rs`) can be answered from an unrelated repository. Scoped to
+one or more `project`s (absolute repository roots), a relative path must name
+exactly `<project>/<path>`; a project written `<dir>/*` stands for every
+checkout directly under `<dir>`. `traza-server blame` scopes itself: it sends
+the path relative to the repository root (the nearest directory holding
+`.git`) with that root, the main checkout, every linked worktree git lists for
+the repository (read from git's own files), and the directories of checkouts
+nested inside it — `<repo>/.claude/worktrees/*`, where Claude Code puts the
+worktrees its agents work in and removes them afterwards, when git forgets
+them. So a line written in a worktree is found, a deleted one included, and
+one written into some other repository's `src/main.rs` is not.
+`--anywhere` lifts the scope (for sessions recorded at another path or on
+another machine) and each answer then names its `project`. The
+[`blame_line`](mcp.md#the-tools) tool takes the same `project`.
 
 **Which answer.** The earliest introduction first, then later ones (a line
 introduced, deleted and re-introduced has several), up to `limit` (default 5,
@@ -199,18 +245,37 @@ found one, 1 when no recorded edit introduced the line, and 2 when it could not
 ask.
 
 **How it is found.** Candidates are the calls of the editing tools —
-`Edit`, `MultiEdit`, `Write`, `NotebookEdit`, `apply_patch`, `shell`, `local_shell`, `str_replace_based_edit_tool`, `str_replace_editor`, `text_editor`, `edit_file`, `write_file`, `create_file` — found through the exact attribute index on
-`gen_ai.tool.name` and `tool.name`, so the search decodes edit calls and
-nothing else, and every candidate is verified by parsing its edit. (The content
-index cannot serve here: a store of transcripts is mostly model calls carrying
+`Edit`, `MultiEdit`, `Write`, `NotebookEdit`, `apply_patch`,
+`str_replace_based_edit_tool`, `str_replace_editor`, `text_editor`,
+`edit_file`, `write_file`, `create_file` — found through the exact attribute
+index on `gen_ai.tool.name` and `tool.name`, plus the tool steps the Codex
+importer marked `traza.edit=true` (a shell call that applies a patch), so the
+search decodes edit calls and nothing else, and every candidate is verified by
+parsing its edit. General-purpose shells are not candidates by name: in an
+older Codex history nearly every call is a `shell` call. (The content index
+cannot serve here either: a store of transcripts is mostly model calls carrying
 whole conversations, whose word filters admit nearly every block for ordinary
 code words.) The search and the reading of each match's run share one query
-deadline; at most 200,000 candidates are verified (`truncated` says when more
-existed). Measured on a real import of one developer's Claude Code history
-(73,965 spans, 7,162 edit calls; release build, Apple-silicon laptop): a line no
-agent wrote is answered in 0.36 s, and of 100 randomly chosen code lines of
-this repository, 81 were attributed to the recorded step that wrote them, at a
-median of 0.93 s per `traza-server blame` call.
+deadline; at most 200,000 candidates are verified, and the search stops
+decoding the moment the cap is passed, answering `truncated: true` rather than
+running on to the deadline.
+
+**Measured** on one developer's real history (release build, Apple-silicon
+laptop, each figure a whole `traza-server blame` process):
+
+| Store | Spans | Edit candidates | A line no agent wrote | Lines with a recorded introduction |
+|---|---|---|---|---|
+| Claude Code history | 77,002 | 7,804 | 0.33 s | 76 of 100 (median 0.44 s, slowest 1.3 s) |
+| plus the Codex history (2,216 rollouts) | 970,972 | 52,600 | 3.2 s | 26 of 30 (median 2.9 s, slowest 5.1 s) |
+
+The lines were drawn at random from this repository's `src/` (lines with at
+least 12 non-space characters), and the search was the CLI's default, scoped
+to the repository; unscoped, it found the same lines. "A recorded
+introduction" means blame found an edit in this repository that added the
+line; whether that edit is what put today's copy of the line there was not
+checked, and for a line written, deleted and written again the earliest is
+reported. The Codex history holds 447,767 tool steps; with general-purpose
+shells no longer candidates by name, 44,796 of them are.
 
 ## Limits, honestly
 
@@ -223,10 +288,18 @@ median of 0.93 s per `traza-server blame` call.
 - **Codex sub-agents** join their root thread's run as agent spans but are not
   nested under the `spawn_agent` call that created them: the rollout does not
   record which call spawned which thread. A sub-agent whose parent rollout is
-  not on disk becomes a run of its own; if the parent appears later its spans
-  are sent again under the root's ids, and the earlier copy remains until
-  erased. Claude Code workflow agents (which name no tool call) are agent spans
-  at the top of the session's trace.
+  not on disk joins the run named by its parent's thread id (the parent's run,
+  once that rollout appears, unless it has a parent of its own); only when the
+  parent turns out to have a parent of its own does the run id change, and then
+  the sub-agent's spans are sent again under the new ids and the earlier copy
+  remains until erased. Claude Code workflow agents (which name no tool call)
+  are agent spans at the top of the session's trace.
+- **Late sub-agent metadata.** Claude Code may write a sub-agent's
+  `.meta.json` after its transcript's first lines. While a watch follows the
+  transcript, the meta file is looked for again on every poll, and when it
+  appears the agent span is re-parented under the `Agent` call and its spans
+  renamed after the agent type. A batch import of a transcript whose meta file
+  never appeared leaves the agent span at the top of the trace.
 - **Codex content.** A model call whose token count survives but whose items
   do not is kept for its usage, marked `codex.content_unrecorded`. A
   plain-text rollout whose last turn never ended keeps that turn's held items
@@ -235,9 +308,16 @@ median of 0.93 s per `traza-server blame` call.
 - **Rewrites.** Transcripts only ever grow, so a file is re-examined only when
   its size moves (a stat per file per poll); one rewritten in place to exactly
   its old size is not noticed.
-- **Prices.** Pricing applies the input and output rates; Anthropic cache reads
-  and writes are recorded but not priced separately, so a cache-heavy session's
-  derived cost understates it.
+- **Prices.** Pricing applies the input and output rates to
+  `gen_ai.usage.input_tokens` and `output_tokens`; cache counters are recorded
+  but not priced separately yet, and the error runs in **both directions**.
+  Anthropic's `input_tokens` is the uncached remainder, so cache reads and
+  writes go unpriced and a cache-heavy Claude Code session's derived cost is
+  **understated**. OpenAI's `input_tokens` *includes* the cached part, so cached
+  input is charged at the full input rate and a cache-heavy Codex session's
+  derived cost is **overstated** — with 80% of the prompt cached at a 90%
+  discount, the input share comes out about 3.6 times the real figure, and
+  approaches 10 times as the cached share nears all of it.
 - **Counting.** A session rollup's `llm_calls` counts every span carrying
   `gen_ai.operation.name`, tool and agent spans included (Traza's existing rule
   for GenAI spans); a [tape](replay.md) counts steps exactly.
@@ -246,8 +326,13 @@ median of 0.93 s per `traza-server blame` call.
   on old runs; a live one is the point.
 - **Size.** One trace per session means a very long session is a very large
   trace. Each file is capped at 200,000 spans (`capped` counts what was left
-  out), a line at 64 MiB, a decompressed rollout at 2 GiB.
+  out), a decompressed rollout at 2 GiB, and a line at 64 MiB: a longer line is
+  skipped and counted as malformed, and the lines after it are read as usual.
 - **Blame** cannot see lines written by shell commands (`sed -i`, heredocs,
-  generators), edits by a tool whose name is not in the list above, edits
-  whose arguments were not recorded, or the part of an argument offloaded to
-  the payload store beyond its inline preview.
+  generators), edits by a tool whose name is not in the list above (a patch
+  applied through some other tool is found only when the importer marked it),
+  edits whose arguments were not recorded, or the part of an argument
+  offloaded to the payload store beyond its inline preview. Scoped to a
+  repository, it misses sessions recorded under a different path for the same
+  repository (another machine, a moved checkout) — `--anywhere` finds those,
+  and with them same-named files of other repositories.

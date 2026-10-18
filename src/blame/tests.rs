@@ -5,6 +5,15 @@ use serde_json::{json, Value};
 use super::*;
 use crate::tape::tests::{span, TempStore};
 
+/// A scope over `path` in every project (no validation, so the store's own
+/// refusals are reachable).
+fn anywhere(path: &str) -> BlameScope {
+    BlameScope {
+        path: normalize_path(path),
+        projects: Vec::new(),
+    }
+}
+
 fn tool_span(trace: &str, id: &str, start: u64, name: &str, arguments: Value) -> Span {
     span(
         trace,
@@ -279,7 +288,7 @@ fn blame_names_the_earliest_introduction_with_its_prompt_model_and_step() {
         .store()
         .blame(
             Some(""),
-            "src/cart.rs",
+            &anywhere("src/cart.rs"),
             "pub fn total(&self) -> u64 { 0 }",
             5,
         )
@@ -303,7 +312,12 @@ fn blame_names_the_earliest_introduction_with_its_prompt_model_and_step() {
 
     let one = fixture
         .store()
-        .blame(Some(""), "cart.rs", "pub fn total(&self) -> u64 { 0 }", 1)
+        .blame(
+            Some(""),
+            &anywhere("cart.rs"),
+            "pub fn total(&self) -> u64 { 0 }",
+            1,
+        )
         .expect("blames");
     assert_eq!(one.matches.len(), 1);
     assert_eq!(
@@ -318,18 +332,18 @@ fn blame_is_tenant_scoped() {
     let line = "pub fn total(&self) -> u64 { 0 }";
     let acme = fixture
         .store()
-        .blame(Some("acme"), "src/cart.rs", line, 5)
+        .blame(Some("acme"), &anywhere("src/cart.rs"), line, 5)
         .expect("blames");
     assert_eq!(acme.matches.len(), 1);
     assert_eq!(acme.matches[0].tenant, "acme");
     let default = fixture
         .store()
-        .blame(Some(""), "src/cart.rs", line, 5)
+        .blame(Some(""), &anywhere("src/cart.rs"), line, 5)
         .expect("blames");
     assert!(default.matches.iter().all(|m| m.tenant.is_empty()));
     let operator = fixture
         .store()
-        .blame(None, "src/cart.rs", line, 5)
+        .blame(None, &anywhere("src/cart.rs"), line, 5)
         .expect("blames");
     assert_eq!(operator.matches.len(), 3);
     assert_eq!(
@@ -343,7 +357,7 @@ fn blame_refuses_what_it_cannot_search_and_honours_the_deadline() {
     let fixture = blame_store("refusals");
     let store = fixture.store();
     for (path, line) in [("src/cart.rs", "   "), ("", "x = 1"), ("/", "x = 1")] {
-        match store.blame(Some(""), path, line, 5) {
+        match store.blame(Some(""), &anywhere(path), line, 5) {
             Err(Error::Invalid(_)) => {}
             other => panic!("{path:?} {line:?}: expected a refusal, got {other:?}"),
         }
@@ -352,7 +366,7 @@ fn blame_refuses_what_it_cannot_search_and_honours_the_deadline() {
     // candidates come from the tool-name index, not from words.
     for line in ["}", "日本語のコメント"] {
         let answer = store
-            .blame(Some(""), "src/cart.rs", line, 5)
+            .blame(Some(""), &anywhere("src/cart.rs"), line, 5)
             .expect("answers");
         assert!(answer.matches.is_empty());
         assert_eq!(
@@ -366,8 +380,262 @@ fn blame_refuses_what_it_cannot_search_and_honours_the_deadline() {
         ..crate::Config::default()
     };
     let expired = TempStore::open("blame-deadline", config);
-    match expired.store().blame(Some(""), "a.rs", "let total = 1;", 5) {
+    match expired
+        .store()
+        .blame(Some(""), &anywhere("a.rs"), "let total = 1;", 5)
+    {
         Err(Error::DeadlineExceeded(_)) => {}
         other => panic!("a spent budget must refuse, got {other:?}"),
     }
+}
+
+#[test]
+fn a_project_scope_anchors_the_path_at_each_repository_root() {
+    let scope = BlameScope::new(
+        "src/main.rs",
+        &["/home/me/app".to_owned(), "/home/me/app-wt".to_owned()],
+    )
+    .expect("valid");
+    assert!(scope.matches("/home/me/app/src/main.rs", None));
+    assert!(
+        scope.matches("/home/me/app-wt/src/main.rs", None),
+        "a worktree of the same repository"
+    );
+    assert!(
+        !scope.matches("/home/other/src/main.rs", None),
+        "another repository's src/main.rs is not this file"
+    );
+    assert!(
+        !scope.matches("/home/me/app/crates/x/src/main.rs", None),
+        "nor is another src/main.rs in the same repository"
+    );
+    assert!(
+        !scope.matches("/home/me/application/src/main.rs", None),
+        "a root is a whole component"
+    );
+    // A recorded path that stayed relative is placed with the session's
+    // project; without one it cannot be said to be here.
+    assert!(scope.matches("src/main.rs", Some("/home/me/app")));
+    assert!(!scope.matches("src/main.rs", Some("/home/other")));
+    assert!(!scope.matches("src/main.rs", None));
+    // An absolute query path must lie under a root.
+    let absolute =
+        BlameScope::new("/home/me/app/src/main.rs", &["/home/me/app".to_owned()]).expect("valid");
+    assert!(absolute.matches("/home/me/app/src/main.rs", None));
+    assert!(!absolute.matches("/x/home/me/app/src/main.rs", None));
+    // Without projects: the suffix match across every project, as before.
+    let open = BlameScope::new("src/main.rs", &[]).expect("valid");
+    assert!(open.matches("/home/other/src/main.rs", None));
+
+    // A directory of checkouts: any one directory directly under it.
+    let nested = BlameScope::new(
+        "src/main.rs",
+        &["/home/me/app/.claude/worktrees/*".to_owned()],
+    )
+    .expect("valid");
+    assert!(nested.matches("/home/me/app/.claude/worktrees/gone-now/src/main.rs", None));
+    assert!(
+        !nested.matches("/home/me/app/.claude/worktrees/a/b/src/main.rs", None),
+        "exactly one level: a/b is not a checkout of its own"
+    );
+    assert!(!nested.matches("/home/me/app/.claude/worktrees/src/main.rs", None));
+    assert!(!nested.matches("/home/me/app/src/main.rs", None));
+
+    for bad in ["relative/dir", "/", "", "/*", "/a/*/b", "relative/*"] {
+        assert!(
+            matches!(
+                BlameScope::new("a.rs", &[bad.to_owned()]),
+                Err(Error::Invalid(_))
+            ),
+            "{bad:?} is not a repository root"
+        );
+    }
+    let many: Vec<String> = (0..=MAX_BLAME_PROJECTS).map(|i| format!("/r{i}")).collect();
+    assert!(matches!(
+        BlameScope::new("a.rs", &many),
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[test]
+fn blame_scoped_to_a_project_ignores_the_same_line_in_another_repository() {
+    let fixture = blame_store("projects");
+    let line = "pub fn total(&self) -> u64 { 0 }";
+    let scoped = BlameScope::new("src/cart.rs", &["/other".to_owned()]).expect("valid");
+    let answer = fixture
+        .store()
+        .blame(Some(""), &scoped, line, 5)
+        .expect("blames");
+    let ids: Vec<&str> = answer.matches.iter().map(|m| m.span_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["edit-2"],
+        "only /other's edit, not /repo's earlier one"
+    );
+    assert_eq!(answer.projects, ["/other"]);
+    let everywhere = fixture
+        .store()
+        .blame(Some(""), &anywhere("src/cart.rs"), line, 5)
+        .expect("blames");
+    assert_eq!(everywhere.matches.len(), 2);
+}
+
+#[test]
+fn a_shell_call_is_a_candidate_only_when_marked_as_an_edit() {
+    let fixture = TempStore::open("blame-shell", crate::Config::default());
+    let patch = "*** Begin Patch\n*** Update File: src/a.py\n@@\n+def marked():\n*** End Patch\n";
+    let mut marked = tool_span(
+        "t",
+        "marked",
+        10,
+        "shell",
+        json!({"command": ["apply_patch", patch], "workdir": "svc"}),
+    );
+    marked.attributes.insert("code.cwd".into(), json!("/repo"));
+    marked.attributes.insert(EDIT_MARKER.into(), json!(true));
+    let unmarked = tool_span(
+        "t",
+        "unmarked",
+        5,
+        "shell",
+        json!({"command": ["apply_patch", patch.replace("marked", "plain")]}),
+    );
+    let mut batch = vec![marked, unmarked];
+    for index in 0..20 {
+        batch.push(tool_span(
+            "t",
+            &format!("ls-{index}"),
+            20 + index,
+            "shell",
+            json!({"command": ["ls"]}),
+        ));
+    }
+    fixture.store().ingest_batch(batch).expect("ingests");
+    let store = fixture.store();
+    let answer = store
+        .blame(Some(""), &anywhere("svc/src/a.py"), "def marked():", 5)
+        .expect("blames");
+    assert_eq!(answer.matches.len(), 1);
+    assert_eq!(
+        answer.matches[0].file, "/repo/svc/src/a.py",
+        "joined with the call's own workdir, under the session's"
+    );
+    assert_eq!(
+        answer.searched_spans, 1,
+        "the marked call is the only candidate: plain shell commands are not read"
+    );
+    let plain = store
+        .blame(Some(""), &anywhere("src/a.py"), "def plain():", 5)
+        .expect("blames");
+    assert!(
+        plain.matches.is_empty(),
+        "an unmarked shell call is not searched"
+    );
+}
+
+#[test]
+fn a_relative_patch_path_resolves_against_the_calls_workdir_first() {
+    let patch = "*** Begin Patch\n*** Add File: src/a.py\n+x = 1\n*** End Patch\n";
+    let mut call = tool_span(
+        "t",
+        "w",
+        1,
+        "shell",
+        json!({"command": ["apply_patch", patch], "workdir": "/repo/svc"}),
+    );
+    call.attributes.insert("code.cwd".into(), json!("/repo"));
+    assert_eq!(edits(&call)[0].file, "/repo/svc/src/a.py");
+    // A relative workdir is under the session's directory.
+    let mut relative = call.clone();
+    relative.attributes.insert(
+        "gen_ai.tool.call.arguments".into(),
+        json!({"command": ["apply_patch", patch], "workdir": "svc"}),
+    );
+    assert_eq!(edits(&relative)[0].file, "/repo/svc/src/a.py");
+    // No workdir: the session's.
+    let mut bare = call.clone();
+    bare.attributes.insert(
+        "gen_ai.tool.call.arguments".into(),
+        json!({"command": ["apply_patch", patch]}),
+    );
+    assert_eq!(edits(&bare)[0].file, "/repo/src/a.py");
+}
+
+#[test]
+fn unified_diff_markers_are_read_by_hunk_not_by_prefix() {
+    let diff = "--- a/run.sql\n+++ b/run.sql\n@@ -1,3 +1,3 @@\n-- old comment\n+-- new comment\n \
+                select 1;\n---flag\n+++i;\n";
+    let (added, removed) = parse_unified_diff(diff);
+    assert_eq!(added, ["-- new comment", "++i;"]);
+    assert_eq!(removed, ["- old comment", "--flag"]);
+
+    // Two files back to back: the second header is a header again once the
+    // first hunk's counted lines are done.
+    let two =
+        "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n--- a/y\n+++ b/y\n@@ -0,0 +1,2 @@\n+c\n+-- d\n";
+    let (added, removed) = parse_unified_diff(two);
+    assert_eq!(added, ["b", "c", "-- d"]);
+    assert_eq!(removed, ["a"]);
+
+    // A hunk header without counts holds until the next `diff` line.
+    let open = "@@\n+++x\n---y\ndiff --git a/z b/z\n--- a/z\n+++ b/z\n";
+    assert_eq!(
+        parse_unified_diff(open),
+        (vec!["++x".to_owned()], vec!["--y".to_owned()])
+    );
+    assert_eq!(hunk_counts("@@ -3,7 +3,9 @@ fn main()"), Some((7, 9)));
+    assert_eq!(hunk_counts("@@ -3 +4 @@"), Some((1, 1)));
+    assert_eq!(hunk_counts("@@"), None);
+}
+
+#[test]
+fn hitting_the_candidate_cap_stops_the_search_and_says_truncated() {
+    let fixture = TempStore::open("blame-cap", crate::Config::default());
+    let store = fixture.store();
+    // Three segments of edit calls.
+    for segment in 0..3u64 {
+        let batch: Vec<Span> = (0..5u64)
+            .map(|index| {
+                tool_span(
+                    "t",
+                    &format!("e-{segment}-{index}"),
+                    segment * 100 + index,
+                    "Edit",
+                    json!({"file_path": "/r/a.rs", "old_string": "",
+                           "new_string": format!("line {segment}-{index}")}),
+                )
+            })
+            .collect();
+        store.ingest_batch(batch).expect("ingests");
+        store.flush().expect("flushes");
+    }
+    let capped = store
+        .blame_capped(Some(""), &anywhere("a.rs"), "line 0-0", 5, 2)
+        .expect("a capped search answers");
+    assert!(capped.truncated);
+    assert_eq!(capped.searched_spans, 2);
+    let whole = store
+        .blame_capped(Some(""), &anywhere("a.rs"), "line 0-0", 5, 15)
+        .expect("answers");
+    assert!(!whole.truncated, "exactly the cap is not truncation");
+    assert_eq!(whole.searched_spans, 15);
+
+    // The fold under it stops decoding when told to: one span visited, one
+    // segment examined of three.
+    let filter = SpanFilter {
+        attributes: vec![("gen_ai.tool.name".into(), json!("Edit"))],
+        ..SpanFilter::default()
+    };
+    let mut visited = 0;
+    let cost = store
+        .fold_spans_while(&filter, None, |_| {
+            visited += 1;
+            false
+        })
+        .expect("folds");
+    assert_eq!(visited, 1);
+    assert_eq!(
+        cost.segments_examined, 1,
+        "stopped inside the first segment"
+    );
 }

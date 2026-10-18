@@ -12,7 +12,7 @@ use super::{
     clamp_report_narrowing, count, known_keys, optional_usize, required_str, rfc3339, sanitize,
     text_result, tool, Context, Nature, Server, Tool, ToolResult,
 };
-use crate::blame::{DEFAULT_BLAME_LIMIT, MAX_BLAME_LIMIT};
+use crate::blame::{BlameScope, DEFAULT_BLAME_LIMIT, MAX_BLAME_LIMIT};
 
 /// Characters of a prompt shown per match.
 const PROMPT_PREVIEW: usize = 240;
@@ -28,10 +28,13 @@ pub(super) fn definitions() -> Vec<Tool> {
         "Which agent session, step, prompt and model introduced this exact line of code? \
          Searches every recorded tool call that edited files (Claude Code Edit / MultiEdit / \
          Write, Codex apply_patch, Anthropic's text-editor tool) for the earliest edit that \
-         ADDED this line (whitespace-normalised) to a file whose path ends with 'path'. Use it \
-         to find out why code looks the way it does before changing it: the answer names the \
-         run (open it with get_run_tape) and the prompt the agent was following. Lines written \
-         by shell commands are not found.",
+         ADDED this line (whitespace-normalised) to a file whose path ends with 'path'. Pass \
+         'project' (the repository's absolute root, e.g. your working directory) to search only \
+         that repository, with 'path' relative to it; without it every project in the store is \
+         searched and a common line can be answered from an unrelated repository. Use it to \
+         find out why code looks the way it does before changing it: the answer names the run \
+         (open it with get_run_tape) and the prompt the agent was following. Lines written by \
+         shell commands are not found.",
         json!({
             "type": "object",
             "properties": {
@@ -42,6 +45,15 @@ pub(super) fn definitions() -> Vec<Tool> {
                 "line": {
                     "type": "string",
                     "description": "The exact text of the line (indentation does not matter).",
+                },
+                "project": {
+                    "type": ["string", "array"],
+                    "items": {"type": "string"},
+                    "description": "The repository's absolute root directory, or a list of \
+                        them (its worktrees; '<dir>/*' for every checkout directly under <dir>, \
+                        such as '<repo>/.claude/worktrees/*'). With it, a relative 'path' must \
+                        name exactly <root>/<path>; without it, any project's file whose path \
+                        ends with 'path' matches.",
                 },
                 "limit": {
                     "type": "integer",
@@ -72,24 +84,50 @@ pub(super) fn call(
     arguments: &Map<String, Value>,
     context: &Context,
 ) -> ToolResult {
-    known_keys(arguments, &["path", "line", "limit"], "blame_line")?;
+    known_keys(
+        arguments,
+        &["path", "line", "project", "limit"],
+        "blame_line",
+    )?;
     let path = required_str(arguments, "path")?;
     let line = required_str(arguments, "line")?;
+    let not_a_root = || {
+        super::ToolError(
+            "'project' must be a repository's absolute root, or a list of them.".to_owned(),
+        )
+    };
+    let projects: Vec<String> = match arguments.get("project") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(project)) => vec![project.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned).ok_or_else(not_a_root))
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err(not_a_root()),
+    };
+    let scope = BlameScope::new(path, &projects)?;
     let limit = optional_usize(arguments, "limit")?
         .unwrap_or(DEFAULT_BLAME_LIMIT)
         .clamp(1, MAX_BLAME_LIMIT);
-    let blame = server.store.blame(context.scope(), path, line, limit)?;
+    let blame = server.store.blame(context.scope(), &scope, line, limit)?;
+    let place = if blame.projects.is_empty() {
+        format!("a file matching {} in any project", sanitize(&blame.path))
+    } else {
+        format!(
+            "{} under {}",
+            sanitize(&blame.path),
+            sanitize(blame.projects.join(", "))
+        )
+    };
     let head = if blame.matches.is_empty() {
         format!(
-            "No recorded agent edit introduced this line into a file matching {} ({} checked).",
-            sanitize(&blame.path),
+            "No recorded agent edit introduced this line into {place} ({} checked).",
             count(blame.searched_spans as u64, "candidate span"),
         )
     } else {
         format!(
-            "{} introduced this line into a file matching {}, earliest first ({} checked).{}",
+            "{} introduced this line into {place}, earliest first ({} checked).{}",
             count(blame.matches.len() as u64, "agent step"),
-            sanitize(&blame.path),
             count(blame.searched_spans as u64, "candidate span"),
             if blame.truncated {
                 " TRUNCATED: more candidates existed than one search verifies, so an earlier \
@@ -102,7 +140,7 @@ pub(super) fn call(
     let mut rows = Vec::new();
     for (index, found) in blame.matches.iter().enumerate() {
         rows.push(format!(
-            "#{} {} · {} wrote {} · run {}{}{}{} · {}  [span={} trace={}]",
+            "#{} {} · {} wrote {} · run {}{}{}{} · {}{}  [span={} trace={}]",
             index + 1,
             rfc3339(found.at_ns),
             sanitize(&found.tool),
@@ -126,6 +164,13 @@ pub(super) fn call(
                     sanitize(agent)
                 )),
             sanitize(&found.service),
+            found
+                .project
+                .as_deref()
+                .map_or(String::new(), |project| format!(
+                    " · project {}",
+                    sanitize(project)
+                )),
             sanitize(&found.span_id),
             sanitize(&found.trace_id),
         ));

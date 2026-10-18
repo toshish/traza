@@ -209,11 +209,16 @@ The reasoning behind these is worth knowing:
 
 **`blame_line` answers "why does this code look like this?"** before an
 agent changes it. It takes `path` (a file path or a suffix such as
-`src/cart.rs`), `line` (the exact text; indentation does not matter) and an
-optional `limit` (default 5, at most 50), and returns the earliest recorded
-tool steps whose edit added that line — Claude Code `Edit`/`MultiEdit`/`Write`,
-Codex patches and file changes, Anthropic's text-editor tool — each with its
-run, step, model, tool, file and the prompt the agent was following. It is the
+`src/cart.rs`), `line` (the exact text; indentation does not matter), an
+optional `project` (the repository's absolute root — an agent's own working
+directory — or a list of roots, `<dir>/*` standing for every checkout directly
+under `<dir>`, so a relative `path` must name exactly `<root>/<path>`; without
+it every project in the store is searched, and a common line can be answered
+from an unrelated repository) and an optional `limit` (default 5, at most 50),
+and returns the earliest recorded tool steps whose edit added that line —
+Claude Code `Edit`/`MultiEdit`/`Write`, Codex patches and file changes,
+Anthropic's text-editor tool — each with its run, step, model, tool, file, the
+project it was made in and the prompt the agent was following. It is the
 same search as [`GET /v1/blame`](http-api.md#get-v1blame); see the
 [recorders guide](recorders.md#agent-blame) for what counts as introducing a
 line. Paths, tool and model names, run ids and prompts render inside the

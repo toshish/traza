@@ -837,12 +837,491 @@ fn text_is_bounded_at_character_boundaries() {
 }
 
 #[test]
-fn an_oversized_line_is_skipped_and_counted() {
+fn lines_are_read_whole_and_an_unterminated_tail_says_so() {
     let mut reader = std::io::Cursor::new(b"abc\ndef".to_vec());
     let mut line = Vec::new();
-    assert_eq!(read_bounded_line(&mut reader, &mut line).expect("reads"), 4);
+    assert_eq!(
+        read_bounded_line(&mut reader, &mut line, MAX_LINE_BYTES).expect("reads"),
+        (4, true)
+    );
     assert_eq!(line, b"abc\n");
     line.clear();
-    assert_eq!(read_bounded_line(&mut reader, &mut line).expect("reads"), 3);
+    assert_eq!(
+        read_bounded_line(&mut reader, &mut line, MAX_LINE_BYTES).expect("reads"),
+        (3, false)
+    );
     assert_eq!(line, b"def", "an unterminated tail stays unterminated");
+}
+
+/// A converter that only remembers the lines it was fed.
+#[derive(Default)]
+struct Lines {
+    fed: Vec<(String, u64)>,
+    spans: Spans,
+}
+
+impl Converter for Lines {
+    fn feed(&mut self, line: &[u8], end: u64, _stats: &mut FileStats) {
+        self.fed
+            .push((String::from_utf8_lossy(line).into_owned(), end));
+    }
+    fn spans(&mut self) -> &mut Spans {
+        &mut self.spans
+    }
+    fn run(&self) -> Option<String> {
+        None
+    }
+}
+
+#[test]
+fn an_oversized_line_is_skipped_and_counted_and_the_lines_after_it_still_land() {
+    // A reader whose buffer is far smaller than the line, as a 256 KiB
+    // BufReader is against a 64 MiB cap: the newline arrives many chunks
+    // after the cap was crossed.
+    let text = format!(
+        "{{\"a\":1}}\n{{\"big\":\"{}\"}}\n{{\"b\":2}}\n",
+        "x".repeat(30)
+    );
+    for capacity in [1, 4, 7, 64, 4096] {
+        let reader = BufReader::with_capacity(capacity, std::io::Cursor::new(text.clone()));
+        let mut converter = Lines::default();
+        let mut stats = FileStats::default();
+        let consumed = read_lines_capped(reader, 0, &mut converter, &mut stats, 10).expect("reads");
+        assert_eq!(
+            consumed,
+            text.len() as u64,
+            "buffer {capacity}: read to the end, not stuck at the long line"
+        );
+        let fed: Vec<&str> = converter
+            .fed
+            .iter()
+            .map(|(line, _)| line.as_str())
+            .collect();
+        assert_eq!(fed, ["{\"a\":1}", "{\"b\":2}"], "buffer {capacity}");
+        assert_eq!(
+            converter.fed[1].1,
+            text.len() as u64,
+            "the line after it ends where the file does"
+        );
+        assert_eq!(
+            (stats.lines, stats.malformed_lines),
+            (3, 1),
+            "buffer {capacity}"
+        );
+    }
+
+    // A line exactly at the cap is kept; one byte over is not.
+    let at_cap = format!("{{\"s\":\"{}\"}}\n", "y".repeat(2)); // 10 bytes
+    let mut converter = Lines::default();
+    let mut stats = FileStats::default();
+    read_lines_capped(
+        BufReader::with_capacity(3, std::io::Cursor::new(at_cap)),
+        0,
+        &mut converter,
+        &mut stats,
+        10,
+    )
+    .expect("reads");
+    assert_eq!(converter.fed.len(), 1);
+    assert_eq!(stats.malformed_lines, 0);
+
+    // An over-long tail with no newline yet waits for it.
+    let tail = format!("{{\"a\":1}}\n{{\"big\":\"{}", "x".repeat(30));
+    let mut converter = Lines::default();
+    let mut stats = FileStats::default();
+    let consumed = read_lines_capped(
+        BufReader::with_capacity(4, std::io::Cursor::new(tail)),
+        0,
+        &mut converter,
+        &mut stats,
+        10,
+    )
+    .expect("reads");
+    assert_eq!(consumed, 8, "stops before the unfinished line");
+    assert_eq!(stats.malformed_lines, 0, "not judged until it ends");
+}
+
+/// Sets `path`'s modification time to `age` ago.
+fn age(path: &Path, age: Duration) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|handle| handle.set_modified(std::time::SystemTime::now() - age))
+        .expect("sets the modification time");
+}
+
+/// `count` one-turn Claude Code sessions in one project directory, each
+/// modified `ago`.
+fn many_sessions(label: &str, count: usize, ago: Duration) -> PathBuf {
+    let dir = scratch(label);
+    let project = dir.join("-tmp-many");
+    std::fs::create_dir_all(&project).expect("dir");
+    let template = std::fs::read(
+        fixtures()
+            .join("claude-code")
+            .join("-tmp-demo-shop")
+            .join(format!("{S2}.jsonl")),
+    )
+    .expect("fixture");
+    for index in 0..count {
+        let path = project.join(format!("00000000-0000-4000-8000-{index:012}.jsonl"));
+        std::fs::write(&path, &template).expect("write");
+        age(&path, ago);
+    }
+    dir
+}
+
+#[test]
+fn watching_a_whole_history_holds_at_most_the_live_cap_of_converters() {
+    // Seventy sessions written to just now: the first pass keeps no more
+    // than the cap, not one converter per file.
+    let dir = many_sessions("live-cap", MAX_LIVE_CONVERTERS + 6, Duration::ZERO);
+    let mut watching = options(Source::ClaudeCode, &dir, None);
+    watching.watch = true;
+    let stats = import(&watching, &mut Memory::new());
+    assert_eq!(stats.files_read, (MAX_LIVE_CONVERTERS + 6) as u64);
+    assert_eq!(stats.peak_live_converters, MAX_LIVE_CONVERTERS);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // A history nobody is writing to keeps none: every file was last
+    // modified longer ago than a live session would be.
+    let dir = many_sessions("live-idle", 8, LIVE_IDLE + Duration::from_secs(60));
+    let mut watching = options(Source::ClaudeCode, &dir, None);
+    watching.watch = true;
+    let stats = import(&watching, &mut Memory::new());
+    assert_eq!(stats.files_read, 8);
+    assert_eq!(stats.peak_live_converters, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn since_selects_whole_sessions_not_files() {
+    // A Claude Code session whose main transcript changed recently, but
+    // whose sub-agent wrote its last line days ago: both are read.
+    let dir = scratch("since-session");
+    copy_tree(&fixtures().join("claude-code"), &dir);
+    let project = dir.join("-tmp-demo-shop");
+    age(
+        &project.join(format!("{S1}.jsonl")),
+        Duration::from_secs(60),
+    );
+    age(
+        &project
+            .join(S1)
+            .join("subagents")
+            .join("agent-a1b2c3.jsonl"),
+        Duration::from_secs(3 * 86_400),
+    );
+    age(
+        &project.join(format!("{S2}.jsonl")),
+        Duration::from_secs(3 * 86_400),
+    );
+    let mut recent = options(Source::ClaudeCode, &dir, None);
+    recent.since = Some(Duration::from_secs(3600));
+    let mut sink = Memory::new();
+    let stats = import(&recent, &mut sink);
+    assert_eq!(
+        (stats.files_read, stats.files_filtered),
+        (2, 1),
+        "S1's transcript and its sub-agent's; S2 is old"
+    );
+    assert!(
+        sink.sent
+            .iter()
+            .any(|span| operation(span) == Some("invoke_agent")),
+        "the Agent tool call has its agent"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // A Codex sub-agent thread active now pulls in its older parent rollout,
+    // so its run has its root.
+    let dir = scratch("since-thread");
+    copy_tree(&fixtures().join("codex"), &dir);
+    for file in discover(Source::Codex, &dir) {
+        let recent = file.path.to_string_lossy().contains("bbbbbbbb");
+        age(
+            &file.path,
+            if recent {
+                Duration::from_secs(60)
+            } else {
+                Duration::from_secs(3 * 86_400)
+            },
+        );
+    }
+    let mut recent = options(Source::Codex, &dir, None);
+    recent.since = Some(Duration::from_secs(3600));
+    let stats = import(&recent, &mut Memory::new());
+    assert_eq!(
+        (stats.files_read, stats.files_filtered),
+        (2, 1),
+        "the child, its parent; not the unrelated legacy session"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sink that is unreachable for its first `down` sends.
+struct Flaky {
+    down: usize,
+    sent: Vec<Span>,
+}
+
+impl Sink for Flaky {
+    fn send(&mut self, spans: &[Span]) -> Result<(), SendError> {
+        if self.down > 0 {
+            self.down -= 1;
+            return Err(SendError::Unavailable("connection refused".into()));
+        }
+        self.sent.extend_from_slice(spans);
+        Ok(())
+    }
+}
+
+#[test]
+fn a_watch_waits_out_an_unreachable_destination_and_loses_nothing() {
+    let dir = scratch("outage");
+    copy_tree(&fixtures().join("claude-code"), &dir);
+    let state = dir.join("state.json");
+    let mut watching = options(Source::ClaudeCode, &dir, Some(state.clone()));
+    watching.watch = true;
+    watching.interval = Duration::from_millis(10);
+    let mut sink = Flaky {
+        down: 3,
+        sent: Vec::new(),
+    };
+    let calls = std::cell::Cell::new(0);
+    let stop = || {
+        calls.set(calls.get() + 1);
+        calls.get() >= 16
+    };
+    let mut log = Vec::new();
+    let stats = run(&watching, &mut sink, &mut log, &stop).expect("a watch survives an outage");
+    let log = String::from_utf8_lossy(&log);
+    assert!(log.contains("the destination is unavailable"), "{log}");
+    assert!(log.contains("the destination is back"), "{log}");
+    let unique: std::collections::BTreeSet<(String, String)> = sink
+        .sent
+        .iter()
+        .map(|span| (span.trace_id.clone(), span.span_id.clone()))
+        .collect();
+    assert_eq!(
+        unique.len(),
+        21,
+        "every span landed once the server was back"
+    );
+    assert_eq!(
+        stats.files_read, 3,
+        "each file counted once, not per attempt"
+    );
+    let saved = state::State::load(&state).expect("state");
+    for file in discover(Source::ClaudeCode, &dir) {
+        let key = file.path.to_string_lossy().into_owned();
+        assert_eq!(
+            saved.file("test", &key).map(|recorded| recorded.offset),
+            Some(file.size),
+            "{key} recorded as sent in full"
+        );
+    }
+
+    // A batch import does not wait: it stops, saying why.
+    let mut batch = options(Source::ClaudeCode, &dir, None);
+    batch.watch = false;
+    let mut sink = Flaky {
+        down: 1,
+        sent: Vec::new(),
+    };
+    let error =
+        run(&batch, &mut sink, &mut std::io::sink(), &|| true).expect_err("a batch import stops");
+    assert!(error.contains("connection refused"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        retry_wait(Duration::from_millis(10), 1),
+        Duration::from_millis(20)
+    );
+    assert_eq!(retry_wait(Duration::from_secs(1), 30), MAX_RETRY_WAIT);
+    assert_eq!(
+        retry_wait(Duration::from_secs(60), 1),
+        Duration::from_secs(60),
+        "never shorter than the poll interval"
+    );
+}
+
+#[test]
+fn a_subagent_meta_file_written_late_still_parents_its_agent_span() {
+    let dir = scratch("late-meta");
+    let subagents = dir.join("-tmp-demo-shop").join(S1).join("subagents");
+    std::fs::create_dir_all(&subagents).expect("dir");
+    let transcript = subagents.join("agent-a1b2c3.jsonl");
+    std::fs::copy(cc_agent(), &transcript).expect("copy");
+    age(&transcript, Duration::ZERO); // a live sub-agent
+    let meta_source = cc_agent().with_extension("meta.json");
+    let meta = transcript.with_extension("meta.json");
+    let mut watching = options(Source::ClaudeCode, &dir, None);
+    watching.watch = true;
+    watching.interval = Duration::from_millis(10);
+    let mut sink = Memory::new();
+    let calls = std::cell::Cell::new(0);
+    // After the first pass, Claude Code writes the meta file; the
+    // transcript itself does not grow again.
+    let stop = || {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            std::fs::copy(&meta_source, &meta).expect("meta");
+        }
+        calls.get() >= 6
+    };
+    run(&watching, &mut sink, &mut std::io::sink(), &stop).expect("watches");
+    let agent_id = span_id(Source::ClaudeCode, S1, "agent", "a1b2c3");
+    let versions: Vec<&Span> = sink
+        .sent
+        .iter()
+        .filter(|span| span.span_id == agent_id)
+        .collect();
+    assert!(versions.len() >= 2, "sent, then sent again once placed");
+    assert_eq!(versions[0].parent_span_id, None, "no meta yet: unplaced");
+    let last = versions[versions.len() - 1];
+    assert_eq!(
+        last.parent_span_id.as_deref(),
+        Some(span_id(Source::ClaudeCode, S1, "tool", "toolu_04").as_str()),
+        "re-parented under the Agent tool call once the meta file appeared"
+    );
+    assert_eq!(attr(last, "gen_ai.agent.name"), &json!("general-purpose"));
+    assert_eq!(
+        attr(last, "gen_ai.agent.description"),
+        &json!("Fix the Item type")
+    );
+    // The agent's own calls are renamed too, last write winning.
+    let calls_renamed = sink
+        .sent
+        .iter()
+        .rev()
+        .filter(|span| operation(span) == Some("chat"))
+        .take(2)
+        .all(|span| attr(span, "gen_ai.agent.name") == &json!("general-purpose"));
+    assert!(calls_renamed);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_patch_applied_through_a_shell_is_marked_as_an_edit() {
+    let dir = scratch("shell-patch");
+    let rollout = dir.join(format!("rollout-2025-06-02T08-00-00-{C}.jsonl"));
+    let patch = "*** Begin Patch\n*** Add File: src/new.py\n+x = 1\n*** End Patch\n";
+    let lines = [
+        json!({"timestamp": "2025-06-02T08:00:00.000Z", "type": "session_meta",
+               "payload": {"id": C, "cwd": "/repo", "cli_version": "0.1.0"}}),
+        json!({"timestamp": "2025-06-02T08:00:01.000Z", "type": "response_item",
+               "payload": {"type": "message", "role": "user",
+                           "content": [{"type": "input_text", "text": "Add new.py"}]}}),
+        json!({"timestamp": "2025-06-02T08:00:02.000Z", "type": "response_item",
+               "payload": {"type": "function_call", "name": "shell", "call_id": "c1",
+                           "arguments": json!({"command": ["apply_patch", patch],
+                                               "workdir": "/repo/svc"}).to_string()}}),
+        json!({"timestamp": "2025-06-02T08:00:03.000Z", "type": "response_item",
+               "payload": {"type": "function_call", "name": "shell", "call_id": "c2",
+                           "arguments": json!({"command": ["ls"]}).to_string()}}),
+    ];
+    let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(&rollout, text).expect("write");
+    let (spans, _) = codex_with(&rollout, &codex::Ancestry::default());
+    let call = |id: &str| -> Span {
+        spans
+            .iter()
+            .find(|span| attr(span, "gen_ai.tool.call.id") == &json!(id))
+            .unwrap_or_else(|| panic!("no call {id}"))
+            .clone()
+    };
+    let marked = call("c1");
+    assert_eq!(attr(&marked, crate::blame::EDIT_MARKER), &json!(true));
+    let plain = call("c2");
+    assert!(
+        !plain.attributes.contains_key(crate::blame::EDIT_MARKER),
+        "a command that carries no patch is not an edit"
+    );
+    let edits = crate::blame::edits(&marked);
+    assert_eq!(edits[0].file, "/repo/svc/src/new.py");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A model call whose response had hundreds of large parts: 26 MB as
+/// structured JSON, which the payload store does not offload.
+fn huge_span() -> Span {
+    let mut span = blank_span(
+        Source::Codex,
+        "",
+        &trace_id(Source::Codex, "huge"),
+        &span_id(Source::Codex, "huge", "llm", "1"),
+        None,
+        "chat gpt-5-codex".into(),
+        1,
+    );
+    let parts: Vec<Value> = (0..400)
+        .map(|index| json!({"type": "text", "content": format!("{index:03}{}", "x".repeat(64 * 1024))}))
+        .collect();
+    span.attributes.insert(
+        "gen_ai.output.messages".into(),
+        json!([{"role": "assistant", "parts": parts}]),
+    );
+    let fields: Map<String, Value> = (0..10)
+        .map(|index| (format!("f{index}"), json!("y".repeat(512 * 1024))))
+        .collect();
+    span.attributes
+        .insert("gen_ai.input.messages".into(), Value::Object(fields));
+    span.attributes
+        .insert("gen_ai.operation.name".into(), json!("chat"));
+    span
+}
+
+#[test]
+fn a_span_too_large_for_the_store_is_trimmed_not_refused() {
+    let mut span = huge_span();
+    assert!(fit_span(&mut span));
+    let size = |key: &str| serde_json::to_vec(&span.attributes[key]).map_or(0, |v| v.len());
+    let output = size("gen_ai.output.messages");
+    let input = size("gen_ai.input.messages");
+    assert!(
+        output <= MAX_STRUCTURED_ATTRIBUTE_BYTES + 4096,
+        "one attribute within its budget: {output}"
+    );
+    assert!(
+        output + input <= MAX_STRUCTURED_BYTES + 8192,
+        "the span's structured attributes within theirs: {output} + {input}"
+    );
+    let parts = span.attributes["gen_ai.output.messages"][0]["parts"]
+        .as_array()
+        .expect("still an array of parts");
+    assert!(parts.len() > 10, "the first parts are kept whole");
+    assert!(
+        parts[parts.len() - 1]
+            .as_str()
+            .is_some_and(|marker| marker.contains("more items not kept")),
+        "the cut is marked"
+    );
+    assert_eq!(attr(&span, "gen_ai.operation.name"), &json!("chat"));
+    let small = blank_span(Source::Codex, "", "t", "s", None, "n".into(), 1);
+    let mut unchanged = small.clone();
+    assert!(!fit_span(&mut unchanged));
+    assert_eq!(unchanged, small);
+
+    // Through a real store with its default caps: accepted, counted trimmed.
+    let dir = scratch("trim");
+    let store = crate::Store::open(
+        &dir,
+        crate::Config {
+            payload_threshold: Some(256 * 1024),
+            ..crate::Config::default()
+        },
+    )
+    .expect("store");
+    let mut sink = StoreSink::new(store);
+    let mut stats = ImportStats::default();
+    send_all(&mut sink, vec![huge_span()], &mut stats).expect("sends");
+    assert_eq!(
+        (stats.spans_sent, stats.spans_refused, stats.spans_trimmed),
+        (1, 0, 1),
+        "{:?}",
+        stats.errors
+    );
+    sink.finish().expect("closes");
+    let _ = std::fs::remove_dir_all(&dir);
 }

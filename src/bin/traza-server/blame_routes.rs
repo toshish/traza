@@ -1,7 +1,8 @@
 //! HTTP route for Agent Blame.
 //!
-//! - `GET /v1/blame?path=&line=&limit=&tenant=` — the earliest tool steps
-//!   whose edit introduced `line` into a file matching `path`
+//! - `GET /v1/blame?path=&line=&project=&limit=&tenant=` — the earliest tool
+//!   steps whose edit introduced `line` into a file matching `path`, in the
+//!   repositories `project` names (repeatable; absent: every project)
 //!   ([`traza::blame`]).
 //!
 //! A child module of the server binary, like `replay_routes`: it shares the
@@ -11,7 +12,7 @@
 use std::io;
 
 use serde_json::json;
-use traza::blame::{DEFAULT_BLAME_LIMIT, MAX_BLAME_LIMIT};
+use traza::blame::{BlameScope, DEFAULT_BLAME_LIMIT, MAX_BLAME_LIMIT};
 use traza::Store;
 
 use super::{bind_tenant, engine_error, foreign_tenant, percent_decode, Responder, ServerMetrics};
@@ -28,6 +29,7 @@ pub(super) fn serve(
     principal: Option<&traza::auth::Principal>,
 ) -> io::Result<()> {
     let (mut path, mut line, mut selected) = (None, None, None);
+    let mut projects: Vec<String> = Vec::new();
     let mut limit = DEFAULT_BLAME_LIMIT;
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
@@ -36,6 +38,7 @@ pub(super) fn serve(
             "path" => path = Some(value),
             "line" => line = Some(value),
             "tenant" => selected = Some(value),
+            "project" => projects.push(value),
             "limit" => match value.parse::<usize>() {
                 Ok(parsed) if parsed > 0 => limit = parsed.min(MAX_BLAME_LIMIT),
                 _ => {
@@ -61,7 +64,11 @@ pub(super) fn serve(
         Ok(tenant) => tenant,
         Err(()) => return foreign_tenant(responder),
     };
-    match engine.blame(effective.as_deref(), &path, &line, limit) {
+    let scope = match BlameScope::new(&path, &projects) {
+        Ok(scope) => scope,
+        Err(error) => return engine_error(responder, metrics, error),
+    };
+    match engine.blame(effective.as_deref(), &scope, &line, limit) {
         Ok(blame) => responder.json(
             200,
             serde_json::to_value(blame).unwrap_or_else(|_| json!({})),

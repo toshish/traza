@@ -29,6 +29,8 @@ const MAX_ANCESTRY_DEPTH: usize = 16;
 #[derive(Debug, Default)]
 pub(crate) struct Ancestry {
     parents: HashMap<String, Option<String>>,
+    /// Each rollout's own thread, once its meta line was read.
+    threads: HashMap<PathBuf, String>,
     seen: HashSet<PathBuf>,
 }
 
@@ -38,10 +40,18 @@ impl Ancestry {
         for file in found {
             if self.seen.insert(file.path.clone()) {
                 if let Some((thread, parent)) = meta_of(&file.path) {
+                    self.threads.insert(file.path.clone(), thread.clone());
                     self.parents.insert(thread, parent);
                 }
             }
         }
+    }
+
+    /// The root thread of the rollout at `path`, when its meta line was read.
+    pub(crate) fn root_of(&self, path: &Path) -> Option<String> {
+        let thread = self.threads.get(path)?;
+        let parent = self.parents.get(thread).cloned().flatten();
+        Some(self.root(thread, parent.as_deref()))
     }
 
     /// The root of `thread`'s spawn tree, as far as the rollouts on disk tell.
@@ -81,6 +91,19 @@ fn parent_of(meta: &Value) -> Option<String> {
                 .and_then(Value::as_str)
         })
         .map(str::to_owned)
+}
+
+/// Whether any string in `value` holds a Codex patch (depth-bounded).
+fn carries_patch(value: &Value, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match value {
+        Value::String(text) => text.contains("*** Begin Patch"),
+        Value::Array(items) => items.iter().any(|item| carries_patch(item, depth + 1)),
+        Value::Object(map) => map.values().any(|item| carries_patch(item, depth + 1)),
+        _ => false,
+    }
 }
 
 /// Response-item payload types that are model output.
@@ -467,6 +490,10 @@ impl Codex {
         let call_id = call_key.to_owned();
         let tool_name = name.to_owned();
         let arguments = bounded_value(&arguments, MAX_FIELD_BYTES);
+        // A patch applied through a general tool (an older build's
+        // `shell ["apply_patch", …]`) is marked, so blame finds it by an
+        // index lookup instead of reading every shell command.
+        let patched = !crate::blame::EDIT_TOOLS.contains(&name) && carries_patch(&arguments, 0);
         let made = self.spans.touch(&id, end, || {
             let mut span = blank_span(
                 SOURCE,
@@ -488,6 +515,9 @@ impl Codex {
             // joins them with this.
             if let Some(cwd) = cwd {
                 a.insert("code.cwd".into(), json!(cwd));
+            }
+            if patched {
+                a.insert(crate::blame::EDIT_MARKER.into(), json!(true));
             }
             span
         });

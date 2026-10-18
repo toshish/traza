@@ -19,9 +19,14 @@ pub enum SendError {
     /// own (an admission cap, an invalid tenant): splitting the batch can
     /// isolate them, and the rest can still be sent.
     Refused(String),
-    /// Nothing will get through (a bad credential, an unreachable server, a
-    /// quota): the import stops.
+    /// Nothing will get through, now or later, without the operator's help
+    /// (a refused credential, a tenant the credential is not bound to): the
+    /// import stops.
     Fatal(String),
+    /// The destination could not be reached, or kept failing (5xx, a quota
+    /// still exhausted) through the sink's own retries: a batch import stops;
+    /// `--watch` keeps its place and tries again later.
+    Unavailable(String),
 }
 
 /// Something spans can be sent to.
@@ -214,7 +219,17 @@ impl Sink for HttpSink {
             match http_request(&self.target, "POST", "/v1/spans", Some(&body)) {
                 Ok((200, _, _)) => return Ok(()),
                 Ok((400 | 409 | 413, _, body)) => {
-                    return Err(SendError::Refused(error_text(&body)))
+                    let reason = error_text(&body);
+                    // Refused for the credential, not for a span: every span
+                    // of every batch would be refused the same way, and
+                    // bisecting would turn N spans into 2N requests.
+                    if reason.contains("does not match the credential's binding") {
+                        return Err(SendError::Fatal(format!(
+                            "{reason}: the credential is bound to a tenant and --tenant names \
+                             another; drop --tenant (a bound credential stamps its own)"
+                        )));
+                    }
+                    return Err(SendError::Refused(reason));
                 }
                 Ok((status @ (401 | 403), _, body)) => {
                     return Err(SendError::Fatal(format!(
@@ -232,6 +247,12 @@ impl Sink for HttpSink {
                     let _ = body;
                     std::thread::sleep(Duration::from_millis(250 << attempt.min(5)));
                 }
+                Ok((status @ (429 | 500..=599), _, body)) => {
+                    return Err(SendError::Unavailable(format!(
+                        "the server answered {status}: {}",
+                        error_text(&body)
+                    )))
+                }
                 Ok((status, _, body)) => {
                     return Err(SendError::Fatal(format!(
                         "the server answered {status}: {}",
@@ -241,7 +262,7 @@ impl Sink for HttpSink {
                 Err(_) if !exhausted => {
                     std::thread::sleep(Duration::from_millis(250 << attempt.min(5)));
                 }
-                Err(error) => return Err(SendError::Fatal(error)),
+                Err(error) => return Err(SendError::Unavailable(error)),
             }
         }
     }
@@ -306,6 +327,163 @@ mod tests {
         assert!(HttpTarget::parse("https://x:1", None).is_err());
         assert!(HttpTarget::parse("http://:80", None).is_err());
         assert!(HttpTarget::parse("http://h:notaport", None).is_err());
+    }
+
+    /// An HTTP server on a loopback port answering every request with
+    /// `status` and `body`, until it has been idle for half a second (three
+    /// before the first request). Joined, it says how many it served.
+    fn canned(status: u16, body: &'static str) -> (HttpTarget, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("address");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let handle = std::thread::spawn(move || {
+            let mut served = 0;
+            let mut idle_until = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < idle_until {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        idle_until = std::time::Instant::now() + Duration::from_millis(500);
+                        let _ = stream.set_nonblocking(false);
+                        let mut request = Vec::new();
+                        let mut buffer = [0u8; 8192];
+                        // Read the head, then exactly Content-Length bytes.
+                        loop {
+                            let read = stream.read(&mut buffer).unwrap_or(0);
+                            if read == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&buffer[..read]);
+                            if let Some(split) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head =
+                                    String::from_utf8_lossy(&request[..split]).to_lowercase();
+                                let length = head
+                                    .lines()
+                                    .find_map(|line| line.strip_prefix("content-length:"))
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                                    .unwrap_or(0);
+                                if request.len() >= split + 4 + length {
+                                    break;
+                                }
+                            }
+                        }
+                        let reply = format!(
+                            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(reply.as_bytes());
+                        served += 1;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            served
+        });
+        let target = HttpTarget {
+            host: "127.0.0.1".into(),
+            port: address.port(),
+            prefix: String::new(),
+            token: Some("t".into()),
+        };
+        (target, handle)
+    }
+
+    fn some_spans(count: usize) -> Vec<Span> {
+        (0..count)
+            .map(|index| Span {
+                trace_id: "t".into(),
+                span_id: format!("s{index}"),
+                tenant: "beta".into(),
+                parent_span_id: None,
+                name: "n".into(),
+                start_time_ns: 1,
+                end_time_ns: 2,
+                status: "ok".into(),
+                service: "svc".into(),
+                attributes: serde_json::Map::new(),
+                events: Vec::new(),
+                links: Vec::new(),
+                extra: serde_json::Map::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_refusal_for_the_credential_stops_instead_of_bisecting() {
+        let (target, handle) = canned(
+            400,
+            r#"{"error":"span 0: tenant does not match the credential's binding"}"#,
+        );
+        let mut sink = HttpSink::new(target);
+        let mut stats = crate::import::ImportStats::default();
+        match crate::import::send_all(&mut sink, some_spans(8), &mut stats) {
+            Err(crate::import::Stop::Fatal(message)) => {
+                assert!(message.contains("drop --tenant"), "{message}");
+            }
+            Err(crate::import::Stop::Unavailable(message)) => {
+                panic!("a binding mismatch is fatal, not unavailable: {message}")
+            }
+            Ok(()) => panic!("a binding mismatch is fatal"),
+        }
+        assert_eq!(
+            handle.join().expect("server"),
+            1,
+            "asked once, not split into 2N requests"
+        );
+        assert_eq!(stats.spans_refused, 0);
+
+        // A refusal that names one span's own defect is still split, to
+        // isolate that span.
+        let (target, handle) = canned(400, r#"{"error":"span 2: span_id is empty"}"#);
+        let mut sink = HttpSink::new(target);
+        let mut stats = crate::import::ImportStats::default();
+        assert!(crate::import::send_all(&mut sink, some_spans(2), &mut stats).is_ok());
+        assert_eq!(
+            stats.spans_refused, 2,
+            "the canned server refuses everything"
+        );
+        assert_eq!(
+            handle.join().expect("server"),
+            3,
+            "the batch, then each half"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_or_failing_server_is_unavailable_not_fatal() {
+        // A port nothing listens on: bind one, then let it go.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port();
+        let mut sink = HttpSink::new(HttpTarget {
+            host: "127.0.0.1".into(),
+            port,
+            prefix: String::new(),
+            token: None,
+        });
+        sink.retries = 0;
+        assert!(matches!(
+            sink.send(&some_spans(1)),
+            Err(SendError::Unavailable(_))
+        ));
+
+        let (target, handle) = canned(503, r#"{"error":"busy"}"#);
+        let mut sink = HttpSink::new(target);
+        sink.retries = 0;
+        match sink.send(&some_spans(1)) {
+            Err(SendError::Unavailable(message)) => assert!(message.contains("503"), "{message}"),
+            other => panic!("a 503 is unavailable, got {other:?}"),
+        }
+        drop(handle);
+
+        let (target, handle) = canned(401, r#"{"error":"unauthorized"}"#);
+        let mut sink = HttpSink::new(target);
+        assert!(
+            matches!(sink.send(&some_spans(1)), Err(SendError::Fatal(_))),
+            "a refused credential stays fatal"
+        );
+        drop(handle);
     }
 
     #[test]

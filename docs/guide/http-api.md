@@ -1305,6 +1305,7 @@ recorded them, not only [imported](recorders.md) ones. The
 |---|---|---|
 | `path` | string, required | The file's path, or a suffix of it (`src/cart.rs`); matched by path component, a leading `/` is not an anchor |
 | `line` | string, required | The exact line text; compared with whitespace normalised (runs fold to one space, ends trimmed) |
+| `project` | string, repeatable | An absolute repository root (a checkout, a worktree) to search in, or `<dir>/*` for every checkout directly under `<dir>` (where worktrees that no longer exist used to live); at most 64. With any, a relative `path` must name exactly `<root>/<path>` and an absolute one must lie under a root; a recorded path that stayed relative is placed with the span's `code.project`. Without, every project is searched and `path` is a suffix match — so a common line in a common path (`}` in `src/main.rs`) can be answered from an unrelated repository |
 | `limit` | integer | Introductions to return, earliest first. Default 5, capped at 50 |
 | `tenant` | string | Tenant scope |
 
@@ -1313,7 +1314,7 @@ curl 'http://localhost:8080/v1/blame?path=src/item.rs&line=pub%20price%3A%20u64%
 ```
 
 ```json
-{"line":"pub price: u64,","matches":[{"agent":"general-purpose","at_ns":1767607225000000000,"file":"/tmp/demo-shop/src/item.rs","model":"claude-haiku-4-5-20251001","prompt":"Add a price field to Item in src/item.rs","run":"11111111-1111-4111-8111-111111111111","service":"claude-code","span_id":"fe06d3b7c5815378","step_index":10,"tenant":"","tool":"MultiEdit","trace_id":"257eaef69d566d3579947aac638045ca"}],"path":"src/item.rs","searched_spans":6,"truncated":false}
+{"line":"pub price: u64,","matches":[{"agent":"general-purpose","at_ns":1767607225000000000,"file":"/tmp/demo-shop/src/item.rs","model":"claude-haiku-4-5-20251001","project":"/tmp/demo-shop","prompt":"Add a price field to Item in src/item.rs","run":"11111111-1111-4111-8111-111111111111","service":"claude-code","span_id":"fe06d3b7c5815378","step_index":10,"tenant":"","tool":"MultiEdit","trace_id":"257eaef69d566d3579947aac638045ca"}],"path":"src/item.rs","searched_spans":6,"truncated":false}
 ```
 
 A step **introduces** a line when its edit adds it more times than it removes
@@ -1323,22 +1324,32 @@ authorship. Each match names its `run`, `tenant`, `trace_id` and `span_id`, the
 the recorded working directory), `at_ns` (the tool step's start), `model` (of
 the response that requested the edit), `step_index` (its position on the run's
 [tape](#get-v1tapesrun), from zero; `null` past a tape's 20,000-span read),
-`service`, and when known `prompt` — the `gen_ai.user.message` of the nearest
-ancestor, cut to 500 characters: the turn's prompt, or the task a sub-agent was
-given, in which case `agent` names the sub-agent. `line` and `path` echo what
-was compared.
+`service`, when known `project` (the session's `code.project`, the directory it
+worked in — which repository the edit was made in), and when known `prompt` —
+the `gen_ai.user.message` of the nearest ancestor, cut to 500 characters: the
+turn's prompt, or the task a sub-agent was given, in which case `agent` names
+the sub-agent. `line` and `path` echo what was compared, and `projects` the
+roots it was scoped to (absent when unscoped).
 
-Candidates are the calls of the editing tools (`Edit`, `MultiEdit`, `Write`, `NotebookEdit`, `apply_patch`, `shell`, `local_shell`, `str_replace_based_edit_tool`, `str_replace_editor`, `text_editor`, `edit_file`, `write_file`, `create_file`), found
-through the exact attribute index on `gen_ai.tool.name` and `tool.name`, and
-every one is verified by parsing its edit. `searched_spans` counts the
-candidates verified; at most 200,000 are, and `truncated: true` says more
-existed, so an earlier introduction may be missing. The search and the reading
-of each match's run spend one [query deadline](../configuration.md#server-flags).
+Candidates are the calls of the editing tools (`Edit`, `MultiEdit`, `Write`,
+`NotebookEdit`, `apply_patch`, `str_replace_based_edit_tool`,
+`str_replace_editor`, `text_editor`, `edit_file`, `write_file`, `create_file`),
+found through the exact attribute index on `gen_ai.tool.name` and `tool.name`,
+plus any tool step carrying `traza.edit=true` (the Codex importer sets it on a
+shell call that applies a patch); every one is verified by parsing its edit.
+General-purpose shells are not candidates by name, so a store full of shell
+commands costs blame nothing. `searched_spans` counts the candidates verified;
+at most 200,000 are — the search stops decoding at the cap — and
+`truncated: true` says more existed, so an earlier introduction may be
+missing. The search and the reading of each match's run spend one
+[query deadline](../configuration.md#server-flags).
 
 `400` for a missing `path` or `line`, an empty line, a path with no file in
-it, an invalid `limit`, or an unknown parameter; `403` when a bound credential
-names another tenant. Lines written by shell commands, or by a tool not in the
-list, are not found.
+it, a `project` that is not an absolute directory (`*` is allowed only as
+its last component; at most 64), an
+invalid `limit`, or an unknown parameter; `403` when a bound credential names
+another tenant. Lines written by shell commands, or by a tool not in the list,
+are not found.
 
 ---
 

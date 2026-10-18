@@ -240,27 +240,36 @@ runs.
 | Flag | Default | What it does |
 |---|---|---|
 | `--path DIR` | `~/.claude/projects` / `~/.codex/sessions` | Where the transcripts are. Searched recursively (eight levels) for `*.jsonl`, and for Codex also `*.jsonl.zst`. |
-| `--url URL` | `http://127.0.0.1:8080` | The server to `POST /v1/spans` to; needs `rw`. A bound credential stamps its tenant on every span. |
+| `--url URL` | `http://127.0.0.1:8080` | The server to `POST /v1/spans` to; needs `rw`. Before reading anything the import asks [`GET /v1/whoami`](guide/http-api.md#get-v1whoami): a refused or read-only credential, or a `--tenant` other than a bound credential's own, stops it there. A bound credential stamps its tenant on every span. |
 | `--token TOKEN` | `$TRAZA_TOKEN` | Bearer token for `--url`. |
 | `--data-dir DIR` | — | Ingest straight into a data directory instead (refused while a server holds it), with the server's default 256 KiB payload threshold. |
 | `--dry-run` | off | Convert and count; send and record nothing. |
-| `--tenant TENANT` | none | Tenant to stamp on spans (for an unbound credential or `--data-dir`). |
-| `--since DURATION` | all | Only files modified within `30m`/`12h`/`7d`/`2w`; a selected session is imported whole. |
+| `--tenant TENANT` | none | Tenant to stamp on spans (for an unbound credential or `--data-dir`). Refused with a bound credential bound elsewhere. |
+| `--since DURATION` | all | Only sessions with a file modified within `30m`/`12h`/`7d`/`2w`. A selected session is read whole: a Claude Code transcript with its sub-agents' files, a Codex rollout with the rollouts of its parent threads (as far as the rollouts on disk tell). |
 | `--project-filter SUBSTR` | all | Only sessions whose file path or working directory contains `SUBSTR`. |
-| `--watch` | off | Keep polling for appended lines and new files. At most 64 active files keep their converters in memory, each dropped after 10 idle minutes. |
+| `--watch` | off | Keep polling for appended lines and new files. Only files written to in the last 10 minutes keep their converters in memory, at most 64 at any moment (the first pass over a whole history included; past it, the file modified longest ago gives its up). An unreachable or failing server is waited out — progress is kept and the pass retried, the wait doubling from the poll interval up to 30 s — instead of ending the watch; a refused credential still ends it. |
 | `--interval-ms N` | `1000` | Watch poll interval (50–60000). |
-| `--state FILE` | `~/.traza/import-state.json` | Per-destination progress, so a re-run or restart sends only what is new. Written atomically. |
+| `--state FILE` | `~/.traza/import-state.json` | Per-destination progress, so a re-run or restart sends only what is new. A destination is the server URL plus the tenant written to (a bound credential's own, else `--tenant`), or a data directory plus `--tenant`; the token itself is never stored. Written atomically. |
 | `--no-state` | off | Ignore and do not write the state file: send everything (idempotent — derived ids, last write wins). |
 | `--json` | off | Print the final counts as JSON instead of a summary line. |
 
 Exit status `0`; `3` when some spans or files were refused (named in the
 output); `2`, with the reason on stderr, when the import could not run — an
-unreadable state file, a refused credential, an unreachable server.
+unreadable state file, a refused or read-only credential, a `--tenant` the
+credential is not bound to, an unreachable server (a batch import only: a
+`--watch` waits for it, at start-up too).
 
 **`traza-server blame FILE:LINE`** reads line `LINE` (from 1) of `FILE` and asks
 [`GET /v1/blame`](guide/http-api.md#get-v1blame) which agent step introduced
-it, sending the path relative to the repository root (the nearest directory
-holding `.git`) when there is one.
+it. Inside a git repository (the nearest directory holding `.git`) it sends the
+path relative to the repository root and scopes the search to this repository:
+the root, the main checkout, the directories of checkouts nested inside it
+(`<repo>/.claude/worktrees/*` — where Claude Code puts its worktrees — and the
+parent of any listed worktree inside the repository, so a worktree removed
+since still counts), and every other linked worktree git lists for it (read
+from git's own files; at most 64 in all), each as a `project`. A line some
+other repository's session wrote into its own file of the same name is not an
+answer. Outside a repository it sends the absolute path.
 
 | Flag | Default | What it does |
 |---|---|---|
@@ -268,6 +277,7 @@ holding `.git`) when there is one.
 | `--token TOKEN` | `$TRAZA_TOKEN` | Bearer token (`ro` suffices). |
 | `--tenant TENANT` | none | Tenant scope for an unbound credential. |
 | `--limit N` | `5` | Introductions to show, earliest first (at most 50). |
+| `--anywhere` | off | Search every project the store holds, not only this repository and its worktrees (sessions recorded at another path, or on another machine). Each answer then names its `project`. |
 | `--json` | off | Print the route's JSON instead of the human rendering. |
 
 Exit status `0` when an introduction was found, `1` when no recorded edit
