@@ -83,7 +83,10 @@ fn claude(path: &Path) -> (Vec<Span>, FileStats) {
 }
 
 fn codex_with(path: &Path, ancestry: &codex::Ancestry) -> (Vec<Span>, FileStats) {
-    convert(&mut codex::Codex::new(path, "", ancestry), path)
+    convert(
+        &mut codex::Codex::open(path, "", ancestry).expect("an identity"),
+        path,
+    )
 }
 
 fn operation(span: &Span) -> Option<&str> {
@@ -513,7 +516,8 @@ fn resend_suppression_equals_live_following_at_every_cut() {
                 as fn(&Path) -> Box<dyn Converter>,
         ),
         (codex_parent(), |p: &Path| {
-            Box::new(codex::Codex::new(p, "", &codex::Ancestry::default())) as Box<dyn Converter>
+            Box::new(codex::Codex::open(p, "", &codex::Ancestry::default()).expect("identity"))
+                as Box<dyn Converter>
         }),
     ] {
         let bytes = std::fs::read(&path).expect("fixture");
@@ -1597,5 +1601,535 @@ fn a_codex_compaction_restarts_from_its_replacement_history() {
         ["Summary: the API is frozen.", "Add a health route"]
     );
     assert_eq!(attr(second, crate::xray::CONVERSATION_ATTRIBUTE), &json!(C));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn one_response_repeated_with_endless_new_blocks_holds_bounded_dedup_state() {
+    // A malformed transcript: one message id, record after record, each
+    // with a text block never seen before. One span; the digests remembered
+    // to recognise a repeat must not grow with the file.
+    let path = Path::new("/nowhere").join(format!("{S2}.jsonl"));
+    let mut converter = claude_code::ClaudeCode::new(&path, "");
+    let mut stats = FileStats::default();
+    let records = claude_code::MAX_SEEN_BLOCKS + 500;
+    let mut end = 0u64;
+    for index in 0..records {
+        let line = cc_record(
+            &format!("a{index}"),
+            1,
+            json!({"type": "assistant", "message": {
+                "id": "msg_same", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-4-5-20250929",
+                "content": [{"type": "text", "text": format!("block {index}")}]}}),
+        );
+        end += line.len() as u64 + 1;
+        converter.feed(line.as_bytes(), end, &mut stats);
+    }
+    assert!(
+        converter.dedup_entries() <= claude_code::MAX_SEEN_BLOCKS,
+        "{} digests held for {records} blocks",
+        converter.dedup_entries()
+    );
+    assert_eq!(
+        stats.records.get("dedup/forgotten"),
+        Some(&500),
+        "what was forgotten is counted"
+    );
+    assert_eq!(
+        converter.spans().len(),
+        2,
+        "the implicit turn and one response"
+    );
+    // A block repeated within the window is still recognised.
+    let repeat = cc_record(
+        "again",
+        2,
+        json!({"type": "assistant", "message": {
+            "id": "msg_same", "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": format!("block {}", records - 1)}]}}),
+    );
+    let before = stats.clone();
+    converter.feed(repeat.as_bytes(), end + 1000, &mut stats);
+    assert_eq!(
+        stats.records.get("dedup/forgotten"),
+        before.records.get("dedup/forgotten")
+    );
+    assert_eq!(converter.dedup_entries(), claude_code::MAX_SEEN_BLOCKS);
+}
+
+#[test]
+fn completions_of_turns_that_never_started_hold_bounded_state() {
+    let path = Path::new("/nowhere").join(format!("rollout-2025-06-04T08-00-00-{C}.jsonl"));
+    let mut converter = codex::Codex::new(&path, "", &codex::Ancestry::default(), None);
+    let mut stats = FileStats::default();
+    let completions = 3 * codex::MAX_CLOSED_TURNS;
+    let mut end = 0u64;
+    for index in 0..completions {
+        let line = json!({"timestamp": "2025-06-04T08:00:01.000Z", "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": format!("never-started-{index}")}})
+        .to_string();
+        end += line.len() as u64 + 1;
+        converter.feed(line.as_bytes(), end, &mut stats);
+    }
+    assert!(
+        converter.closed_turns_len() <= codex::MAX_CLOSED_TURNS,
+        "{} turn ids held for {completions} completions",
+        converter.closed_turns_len()
+    );
+    assert_eq!(
+        stats.records.get("closed_turns/forgotten"),
+        Some(&(2 * codex::MAX_CLOSED_TURNS as u64))
+    );
+    // The most recent ones are still recognised: an item naming one is late.
+    let late = json!({"timestamp": "2025-06-04T08:00:02.000Z", "type": "event_msg",
+        "payload": {"type": "item_completed", "turn_id": format!("never-started-{}", completions - 1),
+                    "item": {"type": "AgentMessage", "id": "x"}}})
+    .to_string();
+    converter.feed(late.as_bytes(), end + 1000, &mut stats);
+    assert_eq!(stats.records.get("item_completed/late"), Some(&1));
+}
+
+#[test]
+fn items_held_for_a_turn_are_bounded_by_bytes_as_well_as_count() {
+    let path = Path::new("/nowhere").join(format!("rollout-2025-06-04T08-00-00-{C}.jsonl"));
+    let budget = 8 * 1024;
+    let mut converter =
+        codex::Codex::new(&path, "", &codex::Ancestry::default(), None).with_pending_budget(budget);
+    let mut stats = FileStats::default();
+    let start = json!({"timestamp": "2025-06-04T08:00:00.000Z", "type": "event_msg",
+        "payload": {"type": "task_started", "turn_id": "t1"}})
+    .to_string();
+    converter.feed(start.as_bytes(), 100, &mut stats);
+    for index in 0..64u64 {
+        let line = json!({"timestamp": "2025-06-04T08:00:01.000Z", "type": "event_msg",
+            "payload": {"type": "item_completed", "turn_id": "t1",
+                "item": {"type": "CommandExecution", "id": format!("i{index}"),
+                         "command": "cat big", "aggregated_output": "x".repeat(1024)}}})
+        .to_string();
+        converter.feed(line.as_bytes(), 200 + index, &mut stats);
+    }
+    assert!(
+        converter.pending_bytes() <= budget,
+        "{} bytes held against a budget of {budget}",
+        converter.pending_bytes()
+    );
+    assert!(stats
+        .records
+        .get("item_completed/overflow")
+        .is_some_and(|n| *n > 0));
+}
+
+/// The Codex fixtures copied under a scratch directory, with the child
+/// rollout cut half-way through its first (meta) line, as a watch finds a
+/// rollout Codex has only begun to write. Returns the directory, the child's
+/// path and its whole content.
+fn codex_with_partial_child(label: &str) -> (PathBuf, PathBuf, Vec<u8>) {
+    let dir = scratch(label);
+    let day = dir.join("2026/01/06");
+    std::fs::create_dir_all(&day).expect("dir");
+    std::fs::copy(
+        codex_parent(),
+        day.join(codex_parent().file_name().expect("name")),
+    )
+    .expect("parent");
+    let child = day.join(codex_child().file_name().expect("name"));
+    let content = std::fs::read(codex_child()).expect("fixture");
+    let meta_end = content
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("a first line");
+    std::fs::write(&child, &content[..meta_end / 2]).expect("partial");
+    (dir, child, content)
+}
+
+#[test]
+fn a_rollout_whose_meta_line_was_incomplete_is_learned_once_it_is_whole() {
+    let (dir, child, content) = codex_with_partial_child("learn-retry");
+    let mut ancestry = codex::Ancestry::default();
+    ancestry.learn(&discover(Source::Codex, &dir));
+    assert_eq!(ancestry.root_of(&child), None, "nothing to learn yet");
+    std::fs::write(&child, &content).expect("whole");
+    ancestry.learn(&discover(Source::Codex, &dir));
+    assert_eq!(
+        ancestry.root_of(&child),
+        Some(A.to_owned()),
+        "asked again once the meta line is whole: the child joins its parent's run"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_watch_that_finds_a_rollout_mid_meta_line_keeps_its_sub_agent_identity() {
+    let (dir, child, content) = codex_with_partial_child("partial-meta");
+    age(&child, Duration::ZERO); // a live rollout: its converter is kept
+    let mut watching = options(Source::Codex, &dir, None);
+    watching.watch = true;
+    watching.interval = Duration::from_millis(10);
+    let mut sink = Memory::new();
+    let calls = std::cell::Cell::new(0);
+    // After the first pass, Codex finishes the meta line and the turn.
+    let stop = || {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            std::fs::write(&child, &content).expect("whole");
+            age(&child, Duration::ZERO);
+        }
+        calls.get() >= 6
+    };
+    run(&watching, &mut sink, &mut std::io::sink(), &stop).expect("watches");
+    let child_spans: Vec<&Span> = sink
+        .sent
+        .iter()
+        .filter(|span| {
+            attr(span, "gen_ai.agent.name") == &json!("reviewer")
+                || attr(span, "gen_ai.request.model") == &json!("gpt-5-codex-mini")
+        })
+        .collect();
+    assert!(!child_spans.is_empty(), "the child's turn was imported");
+    for span in &sink.sent {
+        assert_eq!(
+            attr(span, "session.id"),
+            &json!(A),
+            "{}: every span joins the root's run, the sub-agent's included",
+            span.name
+        );
+    }
+    assert!(
+        sink.sent
+            .iter()
+            .any(|span| operation(span) == Some("invoke_agent")),
+        "the sub-agent is an agent span, not a session of its own"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sub-agent transcript copied under a scratch directory WITHOUT its meta
+/// file. Returns the directory, the transcript, where the meta file goes and
+/// where its content is.
+fn subagent_without_meta(label: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let dir = scratch(label);
+    let subagents = dir.join("-tmp-demo-shop").join(S1).join("subagents");
+    std::fs::create_dir_all(&subagents).expect("dir");
+    let transcript = subagents.join("agent-a1b2c3.jsonl");
+    std::fs::copy(cc_agent(), &transcript).expect("copy");
+    let meta = transcript.with_extension("meta.json");
+    (
+        dir,
+        transcript,
+        meta,
+        cc_agent().with_extension("meta.json"),
+    )
+}
+
+/// The versions of the sub-agent's agent span `sink` was sent, in order.
+fn agent_versions(sink: &Memory) -> Vec<&Span> {
+    let agent_id = span_id(Source::ClaudeCode, S1, "agent", "a1b2c3");
+    sink.sent
+        .iter()
+        .filter(|span| span.span_id == agent_id)
+        .collect()
+}
+
+/// Asserts `span` is the sub-agent's agent span placed by its meta file.
+fn assert_placed(span: &Span) {
+    assert_eq!(
+        span.parent_span_id.as_deref(),
+        Some(span_id(Source::ClaudeCode, S1, "tool", "toolu_04").as_str()),
+        "under the Agent tool call that spawned it"
+    );
+    assert_eq!(attr(span, "gen_ai.agent.name"), &json!("general-purpose"));
+}
+
+#[test]
+fn a_subagent_meta_file_that_appears_after_a_restart_still_places_the_agent() {
+    let (dir, _, meta, meta_source) = subagent_without_meta("late-meta-restart");
+    let options = options(Source::ClaudeCode, &dir, Some(dir.join("state.json")));
+    let mut sink = Memory::new();
+    import(&options, &mut sink);
+    assert_eq!(agent_versions(&sink)[0].parent_span_id, None, "no meta yet");
+
+    // The importer is restarted; meanwhile Claude Code wrote the meta file.
+    // The transcript itself did not change.
+    std::fs::copy(&meta_source, &meta).expect("meta");
+    let mut sink = Memory::new();
+    let again = import(&options, &mut sink);
+    let versions = agent_versions(&sink);
+    assert_eq!(versions.len(), 1, "sent again: {again:?}");
+    assert_placed(versions[0]);
+    assert!(
+        sink.sent
+            .iter()
+            .filter(|span| operation(span) == Some("chat"))
+            .all(|span| attr(span, "gen_ai.agent.name") == &json!("general-purpose")),
+        "the agent's calls are renamed too"
+    );
+
+    // Nothing changed since: nothing is sent.
+    let mut sink = Memory::new();
+    let idle = import(&options, &mut sink);
+    assert_eq!((idle.spans_sent, idle.files_unchanged), (0, 1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_subagent_meta_file_that_appears_after_its_converter_was_dropped_still_places_the_agent() {
+    // A watch keeps no converter for a transcript nobody wrote to lately;
+    // the meta file appearing must still reach the spans.
+    let (dir, transcript, meta, meta_source) = subagent_without_meta("late-meta-idle");
+    age(&transcript, LIVE_IDLE + Duration::from_secs(60));
+    let mut watching = options(Source::ClaudeCode, &dir, None);
+    watching.watch = true;
+    watching.interval = Duration::from_millis(10);
+    let mut sink = Memory::new();
+    let calls = std::cell::Cell::new(0);
+    let stop = || {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            std::fs::copy(&meta_source, &meta).expect("meta");
+        }
+        calls.get() >= 6
+    };
+    let stats = run(&watching, &mut sink, &mut std::io::sink(), &stop).expect("watches");
+    assert_eq!(stats.peak_live_converters, 0, "the transcript is idle");
+    let versions = agent_versions(&sink);
+    assert!(versions.len() >= 2, "sent, then sent again once placed");
+    assert_eq!(versions[0].parent_span_id, None);
+    assert_placed(versions[versions.len() - 1]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_transcript_rewritten_to_the_same_length_is_read_again() {
+    let dir = scratch("same-length");
+    copy_tree(&fixtures().join("claude-code"), &dir);
+    let options = options(Source::ClaudeCode, &dir, Some(dir.join("state.json")));
+    import(&options, &mut Memory::new());
+
+    // A change past the head the state file digests, the size unchanged.
+    let main = dir.join("-tmp-demo-shop").join(format!("{S1}.jsonl"));
+    let original = std::fs::read_to_string(&main).expect("read");
+    let rewritten = original.replacen(
+        "Switched total to Decimal.",
+        "Switched total to Integer.",
+        1,
+    );
+    assert_eq!(rewritten.len(), original.len());
+    assert_ne!(rewritten, original);
+    std::fs::write(&main, &rewritten).expect("rewrite");
+    age(&main, Duration::from_secs(30));
+    let mut sink = Memory::new();
+    let again = import(&options, &mut sink);
+    assert_eq!(
+        again.files_unchanged, 2,
+        "the other two files only: {again:?}"
+    );
+    assert!(
+        sink.sent
+            .iter()
+            .any(|span| attr(span, "gen_ai.output.messages")
+                .to_string()
+                .contains("Switched total to Integer.")),
+        "the rewritten content was read and sent"
+    );
+
+    // A change inside the head, likewise.
+    let other = dir.join("-tmp-demo-shop").join(format!("{S2}.jsonl"));
+    let original = std::fs::read_to_string(&other).expect("read");
+    let rewritten = original.replacen("flaky", "shaky", 1);
+    assert_eq!(rewritten.len(), original.len());
+    std::fs::write(&other, &rewritten).expect("rewrite");
+    age(&other, Duration::from_secs(30));
+    let mut sink = Memory::new();
+    let again = import(&options, &mut sink);
+    assert_eq!(again.files_unchanged, 2, "{again:?}");
+    assert!(again.spans_sent > 0);
+
+    // Nothing moved since: an idle tree costs a stat per file.
+    let idle = import(&options, &mut Memory::new());
+    assert_eq!((idle.spans_sent, idle.files_unchanged), (0, 3));
+
+    // A state file written before stamps were: the head vouches for each
+    // file once, its stamp is recorded, and nothing is sent again.
+    let state_path = dir.join("state.json");
+    let text = std::fs::read_to_string(&state_path).expect("state");
+    let mut saved: Value = serde_json::from_str(&text).expect("json");
+    for file in saved["destinations"]["test"]["files"]
+        .as_object_mut()
+        .expect("files")
+        .values_mut()
+    {
+        file.as_object_mut().expect("file").remove("stamp");
+    }
+    std::fs::write(&state_path, saved.to_string()).expect("older state");
+    let upgraded = import(&options, &mut Memory::new());
+    assert_eq!((upgraded.spans_sent, upgraded.files_unchanged), (0, 3));
+    let reloaded = state::State::load(&state_path).expect("state");
+    assert!(discover(Source::ClaudeCode, &dir)
+        .iter()
+        .all(|file| reloaded
+            .file("test", &file.path.to_string_lossy())
+            .is_some_and(|saved| saved.stamp.is_some())));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_oversized_subagent_meta_file_is_refused_and_counted() {
+    let (dir, _, meta, _) = subagent_without_meta("meta-oversized");
+    let padding = "x".repeat(claude_code::MAX_META_BYTES);
+    std::fs::write(
+        &meta,
+        json!({"agentType": "general-purpose", "toolUseId": "toolu_04", "description": padding})
+            .to_string(),
+    )
+    .expect("meta");
+    let mut sink = Memory::new();
+    let stats = import(&options(Source::ClaudeCode, &dir, None), &mut sink);
+    assert_eq!(stats.files_failed, 1, "{:?}", stats.errors);
+    assert!(
+        stats
+            .errors
+            .iter()
+            .any(|error| error.contains("agent-a1b2c3.meta.json") && error.contains("bytes")),
+        "{:?}",
+        stats.errors
+    );
+    assert_eq!(stats.files_read, 1, "the transcript itself still lands");
+    assert_eq!(
+        agent_versions(&sink)[0].parent_span_id,
+        None,
+        "unplaced: what the meta file says was not read"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn files_beside_and_behind_a_transcript_are_read_within_a_cap() {
+    let over = vec![b'x'; 4096];
+    let error = read_capped(&over[..], 1024).expect_err("past the cap");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        read_capped(&over[..], 4096).expect("at the cap").len(),
+        4096
+    );
+    // The cap holds while reading: an endless source (a file that keeps
+    // growing) is refused once it passes the cap, not read to its end.
+    let error = read_capped(std::io::repeat(b'x'), 1024).expect_err("endless");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    // A compressed rollout past its cap is refused before it is
+    // decompressed.
+    let dir = scratch("zst-cap");
+    let path = dir.join(format!("rollout-x-{A}.jsonl.zst"));
+    std::fs::write(&path, raw_zstd(&vec![b'a'; 4096])).expect("zst");
+    let error = decompressed_within(&path, 1024).expect_err("past the cap");
+    assert!(error.to_string().contains("1024"), "{error}");
+    assert_eq!(
+        decompressed_within(&path, 1 << 20).expect("within").len(),
+        4096
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One Claude Code record of session `S2` at second `second`.
+fn cc_record(uuid: &str, second: u32, body: Value) -> String {
+    let mut record = json!({
+        "parentUuid": null, "isSidechain": false, "cwd": "/tmp/demo-shop",
+        "sessionId": S2, "version": "2.1.0", "uuid": uuid,
+        "timestamp": format!("2026-01-05T12:00:{second:02}.000Z"),
+    });
+    for (key, value) in body.as_object().expect("object") {
+        record[key] = value.clone();
+    }
+    record.to_string()
+}
+
+/// An assistant record asking for one `Edit` adding `line` to `file`.
+fn cc_edit(uuid: &str, second: u32, call: &str, file: &str, line: &str) -> String {
+    cc_record(
+        uuid,
+        second,
+        json!({"type": "assistant", "message": {
+            "id": format!("msg_{call}"), "type": "message", "role": "assistant",
+            "model": "claude-sonnet-4-5-20250929", "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": call, "name": "Edit",
+                "input": {"file_path": file, "old_string": "fn stale() {}", "new_string": line}}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+    )
+}
+
+/// The user record carrying `call`'s result.
+fn cc_result(uuid: &str, second: u32, call: &str, text: &str, is_error: bool) -> String {
+    cc_record(
+        uuid,
+        second,
+        json!({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": call, "content": text, "is_error": is_error}]}}),
+    )
+}
+
+#[test]
+fn a_failed_claude_code_edit_is_not_blamed_for_the_line_a_later_edit_wrote() {
+    let dir = scratch("failed-edit");
+    let path = dir.join(format!("{S2}.jsonl"));
+    let line = "let total = items.len();";
+    let lines = [
+        cc_record(
+            "u1",
+            0,
+            json!({"type": "user", "message": {"role": "user", "content": "Count the items"}}),
+        ),
+        cc_edit("a1", 1, "toolu_fail", "/tmp/demo-shop/src/a.rs", line),
+        cc_result(
+            "r1",
+            2,
+            "toolu_fail",
+            "<tool_use_error>String to replace not found in file.</tool_use_error>",
+            true,
+        ),
+        cc_edit("a2", 3, "toolu_ok", "/tmp/demo-shop/src/a.rs", line),
+        cc_result("r2", 4, "toolu_ok", "The file has been updated.", false),
+        // A last call whose result was never written (the session stopped).
+        cc_edit("a3", 5, "toolu_open", "/tmp/demo-shop/src/b.rs", line),
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").expect("writes");
+    let (spans, _) = claude(&path);
+    let status = |call: &str| tool(&spans, S2, call).status;
+    assert_eq!(status("toolu_fail"), "error");
+    assert_eq!(status("toolu_ok"), "ok");
+    assert_eq!(
+        status("toolu_open"),
+        "",
+        "no result, no outcome: the status stays unset rather than claiming success"
+    );
+
+    let fixture = crate::tape::tests::TempStore::open("failed-edit", crate::Config::default());
+    fixture.store().ingest_batch(spans).expect("ingests");
+    let scope = crate::blame::BlameScope::new("src/a.rs", &[]).expect("scope");
+    let blame = fixture
+        .store()
+        .blame(Some(""), &scope, line, 5)
+        .expect("blames");
+    let found: Vec<&str> = blame.matches.iter().map(|m| m.span_id.as_str()).collect();
+    assert_eq!(
+        found,
+        [span_id(Source::ClaudeCode, S2, "tool", "toolu_ok").as_str()],
+        "the failed attempt is not an introduction"
+    );
+    assert_eq!(blame.matches[0].outcome, crate::blame::EditOutcome::Applied);
+    let open = fixture
+        .store()
+        .blame(
+            Some(""),
+            &crate::blame::BlameScope::new("src/b.rs", &[]).expect("scope"),
+            line,
+            5,
+        )
+        .expect("blames");
+    assert_eq!(
+        open.matches[0].outcome,
+        crate::blame::EditOutcome::Unconfirmed,
+        "a call whose result was never written is an attempt, not a confirmed introduction"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

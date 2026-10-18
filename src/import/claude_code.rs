@@ -1,15 +1,15 @@
 //! Claude Code transcripts to spans. The observed format is documented on
 //! the parent module; this file is the state machine that reads it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
 use super::{
-    blank_span, bounded, bounded_value, extend_end, preview, span_id, str_field, timestamp_ns,
-    trace_id, Base, Converter, FileStats, Source, Spans, MAX_FIELD_BYTES, MAX_PART_BYTES,
-    TURN_SPAN_NAME,
+    blank_span, bounded, bounded_value, digest_of, extend_end, preview, span_id, str_field,
+    timestamp_ns, trace_id, Base, Converter, FileStats, RecentDigests, Source, Spans,
+    MAX_FIELD_BYTES, MAX_PART_BYTES, TURN_SPAN_NAME,
 };
 use crate::hash::{hash128, Hash128};
 use crate::Event;
@@ -25,8 +25,21 @@ const MAX_DELTA_MESSAGES: usize = 256;
 const MAX_OUTPUT_PARTS: usize = 1024;
 
 /// Record uuids remembered for their timestamps (a model call starts when
-/// the record it continues from was written).
+/// the record it continues from was written), each by its 16-byte digest:
+/// about 50 MiB of table at most, however long the uuids.
 const MAX_REMEMBERED_RECORDS: usize = 1_000_000;
+
+/// Largest sub-agent `.meta.json` read, in bytes.
+pub(crate) const MAX_META_BYTES: usize = 64 * 1024;
+
+/// Content blocks remembered to recognise a repeat, by the digest of the
+/// response and the block: the most recent 16,384 (well under 1 MiB). A
+/// repeat is written right after what it repeats — the records of one
+/// response are consecutive, and one response keeps at most
+/// [`MAX_OUTPUT_PARTS`] parts — so a window of many responses' blocks
+/// misses none; a malformed file of endless new blocks churns the window
+/// instead of growing it (`dedup/forgotten` counts what it forgot).
+pub(crate) const MAX_SEEN_BLOCKS: usize = 16_384;
 
 /// Record types that are bookkeeping: counted, not converted.
 const BOOKKEEPING: &[&str] = &[
@@ -93,30 +106,31 @@ pub(crate) struct ClaudeCode {
     summary_held: bool,
     /// message id → llm span id.
     messages: HashMap<String, String>,
-    /// Content blocks already folded into each response, by digest, so a
-    /// transcript that repeats earlier blocks in later records (older builds
-    /// wrote cumulative content) does not double them.
-    seen_blocks: HashSet<(String, Hash128)>,
+    /// Content blocks already folded into a response, by the digest of the
+    /// response's id and the block, so a transcript that repeats earlier
+    /// blocks in later records (older builds wrote cumulative content) does
+    /// not double them. Bounded: [`MAX_SEEN_BLOCKS`].
+    seen_blocks: RecentDigests,
     /// tool-use id → tool span id.
     tools: HashMap<String, String>,
-    /// record uuid → its timestamp.
-    times: HashMap<String, u64>,
+    /// record uuid (its digest) → its timestamp. Bounded:
+    /// [`MAX_REMEMBERED_RECORDS`].
+    times: HashMap<Hash128, u64>,
     /// The last real model seen: a locally synthesized error reply names
     /// none, and the call it stands for was made with this one.
     last_model: Option<String>,
-    /// Agent mode: the sub-agent's `.meta.json`, while it has not been read
-    /// yet (Claude Code may write it after the transcript's first lines).
-    pending_meta: Option<PathBuf>,
+    /// Agent mode: why the sub-agent's meta file could not be read, until
+    /// the import takes it.
+    side_failure: Option<String>,
 }
 
 impl ClaudeCode {
-    /// A converter for the transcript at `path`, stamping `tenant`.
+    /// A converter for the transcript at `path`, stamping `tenant`. A
+    /// sub-agent's `.meta.json` is read now, once: Claude Code may write it
+    /// after the transcript's first lines, and the import then builds a new
+    /// converter (see [`super::side_stamp`]).
     pub(crate) fn new(path: &Path, tenant: &str) -> Self {
-        let (session, mode, meta_read) = classify(path);
-        let pending_meta = match (&mode, meta_read) {
-            (Mode::Agent { .. }, false) => Some(path.with_extension("meta.json")),
-            _ => None,
-        };
+        let (session, mode, side_failure) = classify(path);
         let conversation = match &mode {
             Mode::Main => session.clone(),
             Mode::Agent { agent_id, .. } => format!("{session}/{agent_id}"),
@@ -146,91 +160,22 @@ impl ClaudeCode {
             restart: false,
             summary_held: false,
             messages: HashMap::new(),
-            seen_blocks: HashSet::new(),
+            seen_blocks: RecentDigests::new(MAX_SEEN_BLOCKS),
             tools: HashMap::new(),
             times: HashMap::new(),
             last_model: None,
-            pending_meta,
+            side_failure,
         }
-    }
-
-    /// Reads a sub-agent's meta file that was missing when the converter was
-    /// built, and puts what it says onto the spans already built: the agent
-    /// span gets its parent (the tool call that spawned it) and description,
-    /// and every span its agent name. Touched at `end`, so they are sent
-    /// again.
-    fn read_pending_meta(&mut self, end: u64) {
-        let Some(path) = &self.pending_meta else {
-            return;
-        };
-        let Some(meta) = read_meta(path) else {
-            return;
-        };
-        self.pending_meta = None;
-        let Mode::Agent {
-            agent_type,
-            description,
-            tool_use_id,
-            ..
-        } = &mut self.mode
-        else {
-            return;
-        };
-        let text = |key: &str| str_field(&meta, key).map(str::to_owned);
-        if agent_type.is_none() {
-            *agent_type = text("agentType");
-        }
-        if description.is_none() {
-            *description = text("description");
-        }
-        if tool_use_id.is_none() {
-            *tool_use_id = text("toolUseId");
-        }
-        let (agent_type, description, tool_use_id) =
-            (agent_type.clone(), description.clone(), tool_use_id.clone());
-        let old_name = self.agent_name.clone();
-        if let Some(kind) = &agent_type {
-            self.agent_name.clone_from(kind);
-        }
-        let new_name = self.agent_name.clone();
-        let parent = tool_use_id.map(|tool| span_id(SOURCE, self.session(), "tool", &tool));
-        let agent_span = self.agent_span.clone();
-        self.spans.update_each(end, |span| {
-            let mut changed = false;
-            if Some(&span.span_id) == agent_span.as_ref() {
-                if span.parent_span_id.is_none() && parent.is_some() {
-                    span.parent_span_id.clone_from(&parent);
-                    changed = true;
-                }
-                if let Some(description) = &description {
-                    span.attributes
-                        .insert("gen_ai.agent.description".into(), json!(description));
-                    changed = true;
-                }
-                if let Some(kind) = &agent_type {
-                    span.attributes
-                        .insert("claude_code.agent_type".into(), json!(kind));
-                    span.name = format!("invoke_agent {new_name}");
-                    changed = true;
-                }
-            }
-            if new_name != old_name
-                && span
-                    .attributes
-                    .get("gen_ai.agent.name")
-                    .and_then(Value::as_str)
-                    == Some(old_name.as_str())
-            {
-                span.attributes
-                    .insert("gen_ai.agent.name".into(), json!(new_name));
-                changed = true;
-            }
-            changed
-        });
     }
 
     fn session(&self) -> &str {
         &self.base.session
+    }
+
+    /// Content-block digests held for deduplication.
+    #[cfg(test)]
+    pub(crate) fn dedup_entries(&self) -> usize {
+        self.seen_blocks.len()
     }
 
     /// The span llm calls hang under: the turn (opening an implicit one when
@@ -509,7 +454,7 @@ impl ClaudeCode {
             None => {
                 let id = span_id(SOURCE, self.session(), "llm", &message_id);
                 let mut started = str_field(record, "parentUuid")
-                    .and_then(|parent| self.times.get(parent).copied())
+                    .and_then(|parent| self.times.get(&hash128(parent.as_bytes())).copied())
                     .filter(|started| *started <= at)
                     .unwrap_or(at);
                 // A sub-agent's first call starts the instant its agent does;
@@ -575,8 +520,8 @@ impl ClaudeCode {
         let mut last_text = None;
         if let Some(Value::Array(blocks)) = message.get("content") {
             for block in blocks {
-                let digest = hash128(block.to_string().as_bytes());
-                if !self.seen_blocks.insert((message_id.clone(), digest)) {
+                let digest = digest_of(&[message_id.as_bytes(), block.to_string().as_bytes()]);
+                if !self.seen_blocks.insert(digest, stats, "dedup/forgotten") {
                     continue;
                 }
                 match str_field(block, "type") {
@@ -703,6 +648,10 @@ impl ClaudeCode {
                 format!("execute_tool {name}"),
                 at,
             );
+            // No outcome until the result says one: a call whose result was
+            // never written did not succeed as far as anyone knows (blame
+            // reads it as unconfirmed).
+            span.status = String::new();
             base.apply(SOURCE, &mut span.attributes);
             let a = &mut span.attributes;
             a.insert("gen_ai.operation.name".into(), json!("execute_tool"));
@@ -824,7 +773,7 @@ impl Converter for ClaudeCode {
         }
         if let (Some(uuid), Some(at)) = (str_field(&record, "uuid"), at) {
             if self.times.len() < MAX_REMEMBERED_RECORDS {
-                self.times.insert(uuid.to_owned(), at);
+                self.times.insert(hash128(uuid.as_bytes()), at);
             }
         }
     }
@@ -837,28 +786,43 @@ impl Converter for ClaudeCode {
         Some(self.base.session.clone())
     }
 
-    fn wants_refresh(&self) -> bool {
-        self.pending_meta.is_some()
-    }
-
-    fn refresh(&mut self, end: u64) {
-        self.read_pending_meta(end);
+    fn take_side_failures(&mut self) -> Vec<String> {
+        self.side_failure.take().into_iter().collect()
     }
 }
 
-/// A sub-agent's `.meta.json`, when it exists and parses.
-fn read_meta(path: &Path) -> Option<Value> {
-    std::fs::read(path)
+/// A sub-agent's `.meta.json`, when it exists and parses (one being written
+/// does not parse yet). Read within [`MAX_META_BYTES`]: a longer file, or
+/// one that cannot be read, is an error naming it, and is not used.
+fn read_meta(path: &Path) -> Result<Option<Value>, String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let bytes = super::read_capped(file, MAX_META_BYTES as u64)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(serde_json::from_slice::<Value>(&bytes)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .filter(Value::is_object)
+        .filter(Value::is_object))
+}
+
+/// Where the `.meta.json` of the sub-agent transcript at `path` lives, when
+/// `path` is a sub-agent's transcript (`…/subagents/[…/]agent-<id>.jsonl`).
+pub(crate) fn meta_path(path: &Path) -> Option<PathBuf> {
+    let stem = path.file_stem()?.to_str()?;
+    let subagent = stem.starts_with("agent-")
+        && path
+            .ancestors()
+            .any(|dir| dir.file_name().and_then(|name| name.to_str()) == Some("subagents"));
+    subagent.then(|| path.with_extension("meta.json"))
 }
 
 /// The session and mode a path implies: `<session>.jsonl` is a main
 /// transcript; `<session>/subagents/[workflows/<wf>/]agent-<id>.jsonl` a
-/// sub-agent's, with its `.meta.json` beside it. The flag says whether a
-/// sub-agent's meta file was there to read.
-fn classify(path: &Path) -> (String, Mode, bool) {
+/// sub-agent's, described by the `.meta.json` beside it when that is there
+/// to read. The error is a meta file that could not be read.
+fn classify(path: &Path) -> (String, Mode, Option<String>) {
     let stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -869,7 +833,7 @@ fn classify(path: &Path) -> (String, Mode, bool) {
         .iter()
         .position(|dir| dir.file_name().and_then(|name| name.to_str()) == Some("subagents"));
     let (Some(agent_id), Some(at)) = (stem.strip_prefix("agent-"), subagents) else {
-        return (stem, Mode::Main, true);
+        return (stem, Mode::Main, None);
     };
     let session = ancestors
         .get(at + 1)
@@ -883,9 +847,10 @@ fn classify(path: &Path) -> (String, Mode, bool) {
         .and_then(|name| name.to_str())
         .filter(|name| name.starts_with("wf_"))
         .map(str::to_owned);
-    let meta = read_meta(&path.with_extension("meta.json"));
-    let meta_read = meta.is_some();
-    let meta = meta.unwrap_or(Value::Null);
+    let (meta, failure) = match read_meta(&path.with_extension("meta.json")) {
+        Ok(meta) => (meta.unwrap_or(Value::Null), None),
+        Err(failure) => (Value::Null, Some(failure)),
+    };
     let text = |key: &str| str_field(&meta, key).map(str::to_owned);
     (
         session,
@@ -896,7 +861,7 @@ fn classify(path: &Path) -> (String, Mode, bool) {
             tool_use_id: text("toolUseId"),
             workflow,
         },
-        meta_read,
+        failure,
     )
 }
 

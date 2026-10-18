@@ -285,12 +285,13 @@ answer. Outside a repository it sends the absolute path.
 | `--url URL` | `http://127.0.0.1:8080` | The server to ask. |
 | `--token TOKEN` | `$TRAZA_TOKEN` | Bearer token (`ro` suffices). |
 | `--tenant TENANT` | none | Tenant scope for an unbound credential. |
-| `--limit N` | `5` | Introductions to show, earliest first (at most 50). |
+| `--limit N` | `5` | Introductions to show, earliest first, any whose result was never recorded after the applied ones (at most 50). |
 | `--anywhere` | off | Search every project the store holds, not only this repository and its worktrees (sessions recorded at another path, or on another machine). Each answer then names its `project`. |
 | `--json` | off | Print the route's JSON instead of the human rendering. |
 
-Exit status `0` when an introduction was found, `1` when no recorded edit
-introduced the line, `2` (reason on stderr) when it could not ask.
+Exit status `0` when an introduction was found (applied, or unconfirmed: its
+result was never recorded), `1` when no recorded edit introduced the line (a
+failed edit is none), `2` (reason on stderr) when it could not ask.
 
 ## Model pricing
 

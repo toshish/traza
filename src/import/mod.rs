@@ -35,11 +35,31 @@
 //! file is re-read from its start (context such as the current turn lives in
 //! earlier lines), and only spans touched by a line at or past the recorded
 //! offset are sent: a span built entirely from earlier lines was already sent
-//! in exactly its final form. A file that shrank, or whose first bytes
-//! changed, is treated as new. `--watch` keeps converters in memory for
-//! files someone wrote to in the last [`LIVE_IDLE`] (at most
-//! [`MAX_LIVE_CONVERTERS`] at any moment), so following a live file reads
-//! only its new lines.
+//! in exactly its final form. A file is unchanged while its size AND its
+//! stamp (modification time, and on Unix device and inode) are what was
+//! recorded; a file that shrank, whose first bytes changed, or that was
+//! written to without growing is treated as new. The stamp of the file
+//! beside a transcript whose content its spans carry (a Claude Code
+//! sub-agent's `.meta.json`) is recorded too: when it changes — the meta
+//! file appearing after the transcript, say — the transcript is converted
+//! again and sent whole, whether or not a converter was alive to see it.
+//! `--watch` keeps converters in memory for files someone wrote to in the
+//! last [`LIVE_IDLE`] (at most [`MAX_LIVE_CONVERTERS`] at any moment), so
+//! following a live file reads only its new lines.
+//!
+//! # Bounded, whatever a file holds
+//!
+//! A line is read within [`MAX_LINE_BYTES`], a file converts to at most
+//! [`MAX_SPANS_PER_FILE`] spans, a compressed rollout is read within
+//! [`MAX_COMPRESSED_BYTES`] and decompressed within
+//! [`MAX_DECOMPRESSED_BYTES`], and a sub-agent's meta file within 64 KiB —
+//! each read stops at its cap rather than checking a length first. What a
+//! converter remembers beside its spans is bounded too, by entries and by
+//! bytes: digests (16 bytes, however long the text) of the most recent
+//! content blocks and settled turns, record timestamps by digest, and a
+//! Codex turn's held items by count and by the bytes of their lines. What a
+//! bound forgets or drops is counted under `records` (`dedup/forgotten`,
+//! `closed_turns/forgotten`, `item_completed/overflow`).
 //!
 //! # Destinations that go away
 //!
@@ -139,7 +159,9 @@
 //!   the turn (or of the agent span inside a sub-agent);
 //! - a **tool** step per tool call (`gen_ai.tool.name`, `.call.id`,
 //!   `.call.arguments` as JSON, `.call.result`, status `error` when the
-//!   result says so), child of the llm step that requested it; a Codex call
+//!   result says so and `ok` when it does not — and no status at all while
+//!   no result was recorded, so a call that never returned claims no
+//!   outcome), child of the llm step that requested it; a Codex call
 //!   that applies a patch through a general tool (`shell ["apply_patch",
 //!   …]`) also carries [`crate::blame::EDIT_MARKER`], so blame finds it by
 //!   index instead of reading every shell command;
@@ -162,7 +184,7 @@ mod codex;
 mod sink;
 mod state;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -170,6 +192,7 @@ use std::time::{Duration, SystemTime};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
+use crate::hash::{hash128, Hash128};
 use crate::Span;
 
 pub use cli::{blame_main, import_main};
@@ -352,17 +375,6 @@ impl Spans {
         Some(&mut built.span)
     }
 
-    /// Applies `change` to every span; those it reports changed are marked
-    /// touched at `offset`.
-    pub(crate) fn update_each(&mut self, offset: u64, mut change: impl FnMut(&mut Span) -> bool) {
-        for built in self.map.values_mut() {
-            if change(&mut built.span) {
-                built.touched = built.touched.max(offset);
-                built.dirty = true;
-            }
-        }
-    }
-
     /// The start time of span `id`, if it exists.
     pub(crate) fn start_of(&self, id: &str) -> Option<u64> {
         self.map.get(id).map(|built| built.span.start_time_ns)
@@ -409,17 +421,14 @@ pub(crate) trait Converter {
     /// The file is complete (a compressed rollout is final): settle anything
     /// held for a turn that will now never end. `end` is past the last line.
     fn finish(&mut self, _end: u64, _stats: &mut FileStats) {}
-    /// Whether the converter is waiting on something outside its file (a
-    /// Claude Code sub-agent's meta file, written after its transcript):
-    /// `--watch` then follows the file even when it did not grow, so
-    /// [`Converter::refresh`] gets to run.
-    fn wants_refresh(&self) -> bool {
-        false
+    /// Files beside the transcript that the converter could not read (each
+    /// a message naming the file), taken once: the import counts each as a
+    /// failed file. What lives beside a transcript is read when its
+    /// converter is built; when it changes, the converter is rebuilt (see
+    /// [`side_stamp`]).
+    fn take_side_failures(&mut self) -> Vec<String> {
+        Vec::new()
     }
-    /// Re-reads what lives beside the file, touching any span it changes at
-    /// `end` (the offset consumed so far). Called before a live converter
-    /// reads new lines.
-    fn refresh(&mut self, _end: u64) {}
     /// The spans built so far.
     fn spans(&mut self) -> &mut Spans;
     /// The run id this file's spans carry, once known.
@@ -487,6 +496,70 @@ impl Base {
             attributes.insert("vcs.ref.head.name".into(), json!(branch));
         }
     }
+}
+
+// ------------------------------------------------------------ bookkeeping
+
+/// The most recent `cap` distinct 128-bit digests a converter has seen: how
+/// it recognises a repeat (a content block written twice, a turn already
+/// settled) in memory bounded by entries AND bytes whatever the transcript
+/// holds — a digest is 16 bytes however long the text it stands for, kept
+/// twice (the set and its arrival order), plus the tables' own overhead.
+/// Past `cap` the oldest digest is forgotten, and counted.
+#[derive(Debug)]
+pub(crate) struct RecentDigests {
+    cap: usize,
+    set: HashSet<Hash128>,
+    order: VecDeque<Hash128>,
+}
+
+impl RecentDigests {
+    /// An empty set remembering at most `cap` digests.
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            set: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Remembers `digest`, returning whether it was new. Forgetting the
+    /// oldest to make room is counted in `stats` under `counter`.
+    pub(crate) fn insert(&mut self, digest: Hash128, stats: &mut FileStats, counter: &str) -> bool {
+        if !self.set.insert(digest) {
+            return false;
+        }
+        self.order.push_back(digest);
+        while self.order.len() > self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+                stats.record(counter);
+            }
+        }
+        true
+    }
+
+    /// Whether `digest` is remembered.
+    pub(crate) fn contains(&self, digest: &Hash128) -> bool {
+        self.set.contains(digest)
+    }
+
+    /// Digests remembered.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
+/// The digest of `parts` joined by NUL bytes: one fixed-size key for a
+/// compound identity (a response and a block of it).
+pub(crate) fn digest_of(parts: &[&[u8]]) -> Hash128 {
+    let mut bytes = Vec::with_capacity(parts.iter().map(|part| part.len() + 1).sum());
+    for part in parts {
+        bytes.extend_from_slice(part);
+        bytes.push(0);
+    }
+    hash128(&bytes)
 }
 
 // ------------------------------------------------------------------ text
@@ -711,8 +784,48 @@ pub(crate) struct Found {
     pub(crate) path: PathBuf,
     pub(crate) size: u64,
     pub(crate) modified: SystemTime,
+    /// The file's [`file_stamp`].
+    pub(crate) stamp: String,
     /// A zstd-compressed transcript (`.jsonl.zst`).
     pub(crate) compressed: bool,
+}
+
+/// A file's stamp: its modification time in nanoseconds and, on Unix, its
+/// device and inode — what moves when a file is written in place or replaced
+/// by another, whatever its size.
+pub(crate) fn file_stamp(meta: &std::fs::Metadata) -> String {
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        format!("{modified}:{}:{}", meta.dev(), meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        modified.to_string()
+    }
+}
+
+/// The stamp of the file beside a transcript whose content the
+/// transcript's spans carry, when it has one: a Claude Code sub-agent's
+/// `.meta.json` (its size and [`file_stamp`]; `absent` while it is missing).
+/// One stat. When it differs from the stamp recorded with the file's
+/// progress, the file is converted again from its start and every span sent
+/// again — the transcript need not have changed.
+fn side_stamp(source: Source, path: &Path) -> Option<String> {
+    let side = match source {
+        Source::ClaudeCode => claude_code::meta_path(path)?,
+        Source::Codex => return None,
+    };
+    Some(match std::fs::metadata(&side) {
+        Ok(meta) => format!("{}:{}", meta.len(), file_stamp(&meta)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent".to_owned(),
+        Err(error) => format!("unreadable:{:?}", error.kind()),
+    })
 }
 
 /// The suffix of a zstd-compressed transcript.
@@ -723,26 +836,72 @@ pub(crate) const COMPRESSED_SUFFIX: &str = ".jsonl.zst";
 /// the memory one file can take.
 pub const MAX_DECOMPRESSED_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
-/// The first lines of a transcript (decompressing only a prefix of a
-/// compressed one), for reading its header without reading all of it.
-pub(crate) fn head_lines(path: &Path, max_lines: usize) -> Vec<String> {
-    const HEAD_BYTES: u64 = 4 * 1024 * 1024;
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
+/// Largest compressed transcript read, in bytes: the file is read with this
+/// cap (never whole first), and a longer one is refused, counted as a failed
+/// file. Equal to [`MAX_DECOMPRESSED_BYTES`]: a zstd frame is never much
+/// longer than its content (a few bytes per 128 KiB block), so a file past
+/// this cap holds more than the content cap allows, give or take that
+/// overhead, or is padding. Decompressing one file holds at most both, 4 GiB.
+pub const MAX_COMPRESSED_BYTES: u64 = MAX_DECOMPRESSED_BYTES as u64;
+
+/// Bytes of a transcript's head read to find its first lines (decompressed
+/// bytes, for a compressed one).
+const HEAD_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A transcript's first [`HEAD_BYTES`] (decompressing only a prefix of a
+/// compressed one), and whether there is more after them.
+fn head_bytes(path: &Path) -> std::io::Result<(Vec<u8>, bool)> {
+    let file = std::fs::File::open(path)?;
     let mut raw = Vec::new();
-    if file.take(HEAD_BYTES).read_to_end(&mut raw).is_err() {
-        return Vec::new();
+    file.take(HEAD_BYTES).read_to_end(&mut raw)?;
+    let mut more = raw.len() as u64 >= HEAD_BYTES;
+    if crate::zstd::is_zstd(&raw) {
+        raw = crate::zstd::decompress_prefix(&raw, HEAD_BYTES as usize);
+        more = more || raw.len() as u64 >= HEAD_BYTES;
     }
-    let text = if crate::zstd::is_zstd(&raw) {
-        crate::zstd::decompress_prefix(&raw, HEAD_BYTES as usize)
-    } else {
-        raw
+    Ok((raw, more))
+}
+
+/// The first lines of a transcript, for reading its header without reading
+/// all of it.
+pub(crate) fn head_lines(path: &Path, max_lines: usize) -> Vec<String> {
+    let Ok((text, _)) = head_bytes(path) else {
+        return Vec::new();
     };
     text.split(|byte| *byte == b'\n')
         .take(max_lines)
         .map(|line| String::from_utf8_lossy(line).into_owned())
         .collect()
+}
+
+/// What a transcript's first line is, as far as its head says.
+#[derive(Debug)]
+pub(crate) enum FirstLine {
+    /// A whole line: newline-terminated, or the file's whole content when it
+    /// already parses as JSON (a writer that has not yet written the newline
+    /// — the line [`read_lines`] would consume).
+    Whole(Vec<u8>),
+    /// Still being written: no newline yet, and not yet valid JSON. The
+    /// lines [`read_lines`] would consume are none.
+    Partial,
+    /// Longer than [`HEAD_BYTES`]: there is a first line, but it is not read.
+    TooLong,
+}
+
+/// `path`'s first line.
+pub(crate) fn first_line(path: &Path) -> std::io::Result<FirstLine> {
+    let (head, more) = head_bytes(path)?;
+    Ok(match head.iter().position(|byte| *byte == b'\n') {
+        Some(at) => {
+            let line = &head[..at];
+            FirstLine::Whole(line.strip_suffix(b"\r").unwrap_or(line).to_vec())
+        }
+        None if more => FirstLine::TooLong,
+        None if serde_json::from_slice::<serde::de::IgnoredAny>(&head).is_ok() => {
+            FirstLine::Whole(head)
+        }
+        None => FirstLine::Partial,
+    })
 }
 
 /// Every transcript file of `source` under `root`, sorted by path.
@@ -777,6 +936,7 @@ pub(crate) fn discover(source: Source, root: &Path) -> Vec<Found> {
                     path,
                     size: meta.len(),
                     modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    stamp: file_stamp(&meta),
                     compressed,
                 });
             }
@@ -844,6 +1004,11 @@ struct Tracked {
     /// The file's modification time at the last poll: how recently someone
     /// wrote to it, which decides whose converter `--watch` keeps.
     modified: SystemTime,
+    /// The file's [`file_stamp`] when `offset` was recorded (`None`: not
+    /// known — the file moved while it was read, or an older state file).
+    stamp: Option<String>,
+    /// The [`side_stamp`] the sent spans were built with.
+    side: Option<String>,
 }
 
 /// Runs an import into `sink`, writing progress lines to `log`, and returns
@@ -961,90 +1126,107 @@ pub fn run(
                     offset: known.map_or(0, |known| known.offset),
                     run: known.and_then(|known| known.run.clone()),
                     modified: file.modified,
+                    stamp: saved.and_then(|saved| saved.stamp.clone()),
+                    side: saved.and_then(|saved| saved.side.clone()),
                 }
             });
             entry.modified = file.modified;
             if file.size == 0 {
                 continue;
             }
-            if file.compressed {
-                // Compressed files are immutable once written: the same size
-                // is the same file, and a different one is a rewrite.
-                if entry.stored_size == Some(file.size) {
+            // What the spans carry from beside the file (a sub-agent's meta
+            // file) changed since they were sent — appeared late, while no
+            // converter was alive to notice: the file is converted again
+            // and sent whole, though it did not change itself.
+            let side = side_stamp(options.source, &file.path);
+            let side_moved = side != entry.side;
+            // The size is what was read and the stamp too: unchanged. The
+            // size alone is not enough — a file rewritten in place, or
+            // replaced, at exactly its old size has a new stamp.
+            let same_size = if file.compressed {
+                entry.stored_size == Some(file.size)
+            } else {
+                file.size == entry.offset && entry.offset > 0
+            };
+            if same_size && !side_moved {
+                let unchanged = match entry.stamp.as_deref() {
+                    Some(stamp) => stamp == file.stamp,
+                    // An offset recorded before stamps were: the head
+                    // decides, once, and the stamp is recorded.
+                    None => {
+                        let same = file.compressed
+                            || state.head_matches(&options.destination_key, &key, &file.path);
+                        if same {
+                            state.record_stamp(&options.destination_key, &key, &file.stamp);
+                            entry.stamp = Some(file.stamp.clone());
+                            changed_state = true;
+                        }
+                        same
+                    }
+                };
+                if unchanged {
                     if first_pass {
                         stats.files_unchanged += 1;
                     }
                     continue;
                 }
+            }
+            if file.compressed {
+                // A compressed file read again was rewritten: read whole.
                 if entry.stored_size.is_some() {
                     entry.offset = 0;
                     entry.run = None;
                 }
                 entry.converter = None;
-            } else {
-                // A live converter still waiting for something outside its
-                // file (a sub-agent's meta file) is followed even when the
-                // file did not grow.
-                let waiting = entry
-                    .converter
-                    .as_ref()
-                    .is_some_and(|converter| converter.wants_refresh());
-                if file.size == entry.offset && entry.offset > 0 && !waiting {
-                    if first_pass {
-                        stats.files_unchanged += 1;
-                    }
-                    continue;
-                }
-                // A file that shrank or was rewritten is a new file. (Checked
-                // only when the size moved, so an idle tree costs a stat per
+            } else if file.size < entry.offset
+                || same_size
+                || side_moved
+                || !state.head_matches(&options.destination_key, &key, &file.path)
+            {
+                // A file that shrank, was written to without growing, or
+                // whose first bytes changed is a new file; one whose side
+                // file changed is converted again. Either is read from its
+                // start and sent whole. (The head is read only when the
+                // size or stamp moved, so an idle tree costs a stat per
                 // file.)
-                if file.size < entry.offset
-                    || !state.head_matches(&options.destination_key, &key, &file.path)
-                {
-                    entry.offset = 0;
-                    entry.converter = None;
-                    entry.run = None;
-                }
+                entry.offset = 0;
+                entry.converter = None;
+                entry.run = None;
             }
-            match follow(options, &ancestry, file, entry, sink, &mut stats) {
-                // Unreadable (named in the errors): nothing is recorded, so
-                // the next import tries again.
-                Ok(Followed::Failed) => {}
+            match follow(options, &ancestry, file, side, entry, sink, &mut stats) {
+                // Unreadable (named in the errors), or not readable yet:
+                // nothing is recorded, so the next import tries again.
+                Ok(Followed::Failed | Followed::Deferred) => {}
                 Ok(Followed::Read(run)) => {
                     if let Some(run) = &run {
                         sessions.insert(run.clone());
                     }
+                    let progress = state::Progress {
+                        offset: entry.offset,
+                        run,
+                        stamp: entry.stamp.clone(),
+                        side: entry.side.clone(),
+                    };
                     if file.compressed {
                         state.record_compressed(
                             &options.destination_key,
                             &key,
-                            entry.offset,
-                            run,
+                            progress,
                             file.size,
                         );
                         entry.stored_size = Some(file.size);
                         entry.converter = None;
                         changed_state = true;
                     } else {
-                        // A follow that read nothing new (a converter waiting
-                        // on a sub-agent's meta file) changes no progress, and
-                        // must not rewrite the state file every poll.
-                        let recorded =
-                            state
-                                .file(&options.destination_key, &key)
-                                .is_some_and(|saved| {
-                                    saved.offset == entry.offset
-                                        && (run.is_none() || saved.run == run)
-                                })
-                                && state.head_matches(&options.destination_key, &key, &file.path);
+                        // A follow that read nothing new (a tail still being
+                        // written) changes no progress, and must not rewrite
+                        // the state file every poll.
+                        let recorded = state
+                            .file(&options.destination_key, &key)
+                            .is_some_and(|saved| progress.recorded_in(saved))
+                            && state.head_matches(&options.destination_key, &key, &file.path);
                         if !recorded {
-                            state.record(
-                                &options.destination_key,
-                                &key,
-                                entry.offset,
-                                run,
-                                &file.path,
-                            );
+                            state.record(&options.destination_key, &key, progress, &file.path);
                             changed_state = true;
                         }
                     }
@@ -1196,14 +1378,19 @@ enum Followed {
     Read(Option<String>),
     /// The file could not be read or decompressed.
     Failed,
+    /// Not read yet: what its identity derives from is still being written.
+    Deferred,
 }
 
 /// Reads whatever `file` holds past what `entry` has consumed, converts it
 /// and sends the spans it touched. Returns the file's run id when known.
+/// `side` is the file's [`side_stamp`], taken before anything beside it was
+/// read: recorded with the progress once the spans landed.
 fn follow(
     options: &ImportOptions,
     ancestry: &codex::Ancestry,
     file: &Found,
+    side: Option<String>,
     entry: &mut Tracked,
     sink: &mut dyn Sink,
     stats: &mut ImportStats,
@@ -1218,16 +1405,27 @@ fn follow(
     if fresh {
         let converter: Box<dyn Converter> = match options.source {
             Source::ClaudeCode => Box::new(claude_code::ClaudeCode::new(&file.path, &tenant)),
-            Source::Codex => Box::new(codex::Codex::new(&file.path, &tenant, ancestry)),
+            Source::Codex => match codex::Codex::open(&file.path, &tenant, ancestry) {
+                Ok(converter) => Box::new(converter),
+                // The meta line every id derives from is still being
+                // written; no line is whole yet, so nothing is lost by
+                // asking again next poll.
+                Err(codex::NotYet::Pending) => return Ok(Followed::Deferred),
+                Err(codex::NotYet::Unreadable(error)) => {
+                    stats.files_failed += 1;
+                    stats.error(format!("{}: {error}", file.path.display()));
+                    return Ok(Followed::Failed);
+                }
+            },
         };
         entry.converter = Some(converter);
     }
     let Some(converter) = entry.converter.as_mut() else {
         return Ok(Followed::Failed);
     };
-    if !fresh {
-        // A live converter may be waiting on something beside its file.
-        converter.refresh(entry.offset);
+    for failure in converter.take_side_failures() {
+        stats.files_failed += 1;
+        stats.error(failure);
     }
     let mut file_stats = FileStats::default();
     let mut floor = floor;
@@ -1289,6 +1487,14 @@ fn follow(
     if run.is_some() {
         entry.run = run.clone();
     }
+    // The stamp of what was read: the file's now, if it still is the size
+    // that was read (else it moved meanwhile, and the next poll sees that).
+    let read_size = if file.compressed { file.size } else { consumed };
+    entry.stamp = std::fs::metadata(&file.path)
+        .ok()
+        .filter(|meta| meta.len() == read_size)
+        .map(|meta| file_stamp(&meta));
+    entry.side = side;
     Ok(Followed::Read(run))
 }
 
@@ -1314,9 +1520,30 @@ fn read_lines(
 
 /// A compressed transcript's whole content.
 fn decompressed(path: &Path) -> std::io::Result<Vec<u8>> {
-    let raw = std::fs::read(path)?;
+    decompressed_within(path, MAX_COMPRESSED_BYTES)
+}
+
+/// [`decompressed`] reading at most `max_compressed` bytes of the file: a
+/// longer one is refused before anything is decompressed.
+fn decompressed_within(path: &Path, max_compressed: u64) -> std::io::Result<Vec<u8>> {
+    let raw = read_capped(std::fs::File::open(path)?, max_compressed)?;
     crate::zstd::decompress(&raw, MAX_DECOMPRESSED_BYTES)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Everything `reader` holds, refused (`InvalidData`) past `max` bytes. The
+/// cap holds while reading — at most `max + 1` bytes are read — so a file
+/// that grows after its length was looked at cannot outrun it.
+pub(crate) fn read_capped(reader: impl Read, max: u64) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("longer than {max} bytes; not read"),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// [`read_lines`] over any reader positioned at byte `start`.

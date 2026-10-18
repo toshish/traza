@@ -39,6 +39,41 @@ pub(crate) struct FileState {
     /// the decompressed content).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stored_size: Option<u64>,
+    /// The file's stamp (modification time, and on Unix its device and
+    /// inode) when it was last read in full: a file whose size is unchanged
+    /// is unchanged only while its stamp is too. `None` when the file moved
+    /// while it was read, or the record predates stamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stamp: Option<String>,
+    /// The stamp of the file beside it whose content its spans carry (a
+    /// Claude Code sub-agent's `.meta.json`, `absent` while it is missing),
+    /// as it was when they were sent: when it changes, the spans are rebuilt
+    /// and sent again although the transcript did not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) side: Option<String>,
+}
+
+/// What one successful read of a file left to record.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Progress {
+    /// Bytes read and sent.
+    pub(crate) offset: u64,
+    /// The run id the file's spans carried, when known.
+    pub(crate) run: Option<String>,
+    /// The file's stamp after the read, when it still matched what was read.
+    pub(crate) stamp: Option<String>,
+    /// The stamp of the file beside it, taken before the read.
+    pub(crate) side: Option<String>,
+}
+
+impl Progress {
+    /// Whether `saved` already says this.
+    pub(crate) fn recorded_in(&self, saved: &FileState) -> bool {
+        saved.offset == self.offset
+            && (self.run.is_none() || saved.run == self.run)
+            && saved.stamp == self.stamp
+            && saved.side == self.side
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -119,29 +154,20 @@ impl State {
             .is_some_and(|(digest, len)| len == saved.head_len && digest == saved.head)
     }
 
-    /// Records a compressed `file`'s progress: `offset` into its content,
-    /// `stored_size` its size on disk.
+    /// Records a compressed `file`'s progress (its offset is into its
+    /// content), `stored_size` its size on disk.
     pub(crate) fn record_compressed(
         &mut self,
         destination: &str,
         file: &str,
-        offset: u64,
-        run: Option<String>,
+        progress: Progress,
         stored_size: u64,
     ) {
-        let files = &mut self
-            .destinations
-            .entry(destination.to_owned())
-            .or_default()
-            .files;
-        let entry = files.entry(file.to_owned()).or_default();
-        entry.offset = offset;
+        let entry = self.entry(destination, file);
         entry.head = String::new();
         entry.head_len = 0;
         entry.stored_size = Some(stored_size);
-        if run.is_some() {
-            entry.run = run;
-        }
+        entry.apply(progress);
     }
 
     /// Records `file`'s progress.
@@ -149,23 +175,41 @@ impl State {
         &mut self,
         destination: &str,
         file: &str,
-        offset: u64,
-        run: Option<String>,
+        progress: Progress,
         path: &Path,
     ) {
-        let (head, head_len) = head_digest(path, HEAD_BYTES.min(offset)).unwrap_or_default();
-        let files = &mut self
-            .destinations
-            .entry(destination.to_owned())
-            .or_default()
-            .files;
-        let entry = files.entry(file.to_owned()).or_default();
-        entry.offset = offset;
+        let (head, head_len) =
+            head_digest(path, HEAD_BYTES.min(progress.offset)).unwrap_or_default();
+        let entry = self.entry(destination, file);
         entry.head = head;
         entry.head_len = head_len;
-        if run.is_some() {
-            entry.run = run;
+        entry.apply(progress);
+    }
+
+    /// Records `stamp` as `file`'s, its progress otherwise unchanged (an
+    /// offset recorded before stamps were).
+    pub(crate) fn record_stamp(&mut self, destination: &str, file: &str, stamp: &str) {
+        self.entry(destination, file).stamp = Some(stamp.to_owned());
+    }
+
+    fn entry(&mut self, destination: &str, file: &str) -> &mut FileState {
+        self.destinations
+            .entry(destination.to_owned())
+            .or_default()
+            .files
+            .entry(file.to_owned())
+            .or_default()
+    }
+}
+
+impl FileState {
+    fn apply(&mut self, progress: Progress) {
+        self.offset = progress.offset;
+        if progress.run.is_some() {
+            self.run = progress.run;
         }
+        self.stamp = progress.stamp;
+        self.side = progress.side;
     }
 }
 
@@ -200,7 +244,17 @@ mod tests {
         let transcript = dir.join("t.jsonl");
         std::fs::write(&transcript, b"{\"a\":1}\n{\"b\":2}\n").expect("write");
         let mut state = State::default();
-        state.record("url:a", "t", 16, Some("run-1".into()), &transcript);
+        state.record(
+            "url:a",
+            "t",
+            Progress {
+                offset: 16,
+                run: Some("run-1".into()),
+                stamp: Some("stamp".into()),
+                side: Some("absent".into()),
+            },
+            &transcript,
+        );
         let path = dir.join("nested").join("state.json");
         state.save(&path).expect("save");
         let loaded = State::load(&path).expect("load");
@@ -208,6 +262,11 @@ mod tests {
         assert_eq!(
             loaded.file("url:a", "t").and_then(|f| f.run.clone()),
             Some("run-1".to_owned())
+        );
+        let saved = loaded.file("url:a", "t").expect("saved");
+        assert_eq!(
+            (saved.stamp.as_deref(), saved.side.as_deref()),
+            (Some("stamp"), Some("absent"))
         );
         assert!(
             loaded.file("url:b", "t").is_none(),
