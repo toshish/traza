@@ -663,6 +663,8 @@ besides loopback)] \
 predictive fuses; default 300)] \
 [--fate-tenant-maps N (tenants whose default-window Fate Map, the one predictive fuses read, \
 stays cached; default 32)] \
+[--fate-build-seconds N (budget of a background Fate Map build, never less than the query \
+deadline; default 120)] \
 [--tape-max-bytes N (payload bytes one tape or replay inlines; default 8MiB)] \
 [--allow-unauthenticated-non-loopback] [--version] \
 [--restore BACKUP_DIR (install a backup into --data-dir, then serve it)]\n\
@@ -1033,6 +1035,10 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--fate-tenant-maps" => {
                 i += 1;
                 fate.tenant_maps = (number(i, "--fate-tenant-maps")? as usize).max(1);
+            }
+            "--fate-build-seconds" => {
+                i += 1;
+                fate.build_budget = Duration::from_secs(number(i, "--fate-build-seconds")?);
             }
             "--allow-unauthenticated-non-loopback" => {
                 allow_unauthenticated_non_loopback = true;
@@ -1408,8 +1414,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Fate Maps the predictive fuses asked for are built here, off every
     // request path: a fuse check reads only a cached map and never builds
-    // one. A thread of its own, because a build runs up to the query
-    // deadline and must not hold up compaction or an erasure resume.
+    // one. A thread of its own, because a build runs up to
+    // --fate-build-seconds and must not hold up compaction or an erasure
+    // resume.
     {
         let warmer = Arc::clone(&engine);
         thread::Builder::new()
@@ -2771,6 +2778,7 @@ fn serve_request(
             engine.metrics().render_prometheus(&mut rendered);
             engine.render_usage_prometheus(&mut rendered);
             engine.render_fuse_metrics(&mut rendered);
+            engine.render_fate_metrics(&mut rendered);
             metrics.render_prometheus(&mut rendered);
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",

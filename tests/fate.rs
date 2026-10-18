@@ -328,6 +328,15 @@ fn a_predictive_fuse_stops_a_doomed_run_at_the_check_and_never_on_ingest() {
         doomed["tripped_by"].is_null(),
         "a prediction is not a latched trip"
     );
+    // The warmer's builds are counted where operators look.
+    let (status, _, metrics) = server.request("GET", "/v1/metrics", None, &[]);
+    assert_eq!(status, 200);
+    assert!(
+        metrics.contains("traza_fate_builds_total{result=\"ok\"} ")
+            && metrics.contains("traza_fate_builds_total{result=\"failed\"} 0\n")
+            && metrics.contains("traza_fate_cached_builds 1\n"),
+        "{metrics}"
+    );
     let (_, queried) = get(&server, "/v1/fuses/runs/live-doomed-0", &[]);
     assert_eq!(queried["verdict"], "stop", "verdict queries foresee too");
     // The listing is answered from memory and foresees nothing.

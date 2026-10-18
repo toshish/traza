@@ -1166,6 +1166,76 @@ fn cached_foresight_never_builds_on_the_request_path() {
 }
 
 #[test]
+fn background_builds_have_their_own_budget_beyond_the_query_deadline() {
+    // A query deadline so short no request-path build could finish: the
+    // warmer's budget is its own, so the fuses still get their map.
+    let config = crate::Config {
+        query_deadline: Some(Duration::from_nanos(1)),
+        ..crate::Config::default()
+    };
+    let (fixture, now) = seeded("background-budget", config, true);
+    let store = fixture.store();
+    assert!(matches!(
+        store.fate_map("", &MapRequest::new("support-agent"), now),
+        Err(Error::DeadlineExceeded(_))
+    ));
+    let _ = store.foresee_cached("", "live-doomed-0", 30);
+    assert_eq!(store.maintain_fate().expect("warms"), 1);
+    let fuses = BuildKey::of(Some(""), None, None);
+    assert!(store.fate.peek(&fuses).is_some());
+}
+
+#[test]
+fn a_background_build_out_of_time_says_so_and_retries_over_a_shorter_window() {
+    let config = crate::Config {
+        fate: FateConfig {
+            build_budget: Duration::ZERO,
+            ..FateConfig::default()
+        },
+        query_deadline: Some(Duration::ZERO),
+        ..crate::Config::default()
+    };
+    let (fixture, now) = seeded("background-failure", config, true);
+    let store = fixture.store();
+    let _ = store.foresee_cached("", "live-doomed-0", 30);
+    assert!(matches!(
+        store.maintain_fate(),
+        Err(Error::DeadlineExceeded(_))
+    ));
+    // The fuse says why it has no map, rather than that one is coming.
+    let after = store.foresee_cached("", "live-doomed-0", 30);
+    assert_eq!(after.verdict, ForesightVerdict::InsufficientHistory);
+    assert!(
+        after.explanation.contains("ran out of time")
+            && after.explanation.contains("shorter window"),
+        "{}",
+        after.explanation
+    );
+    // The metric counts it.
+    let mut metrics = String::new();
+    store.render_fate_metrics(&mut metrics);
+    assert!(
+        metrics.contains("traza_fate_builds_total{result=\"failed\"} 1\n"),
+        "{metrics}"
+    );
+    // The next build of that key covers half the window, and says so.
+    let fuses = BuildKey::of(Some(""), None, None);
+    let build = store
+        .fate
+        .get_or_build(store, &fuses, now, None)
+        .expect("builds without a deadline");
+    assert_eq!(build.window.since_ns, now - DEFAULT_WINDOW_NS / 2);
+    assert!(build.bounds.window_narrowed);
+    assert!(metrics_after(store).contains("traza_fate_builds_total{result=\"ok\"} 1\n"));
+}
+
+fn metrics_after(store: &Store) -> String {
+    let mut metrics = String::new();
+    store.render_fate_metrics(&mut metrics);
+    metrics
+}
+
+#[test]
 fn explicit_windows_never_evict_the_maps_the_fuses_read() {
     let (fixture, now) = seeded("eviction", crate::Config::default(), false);
     let store = fixture.store();

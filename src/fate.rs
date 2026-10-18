@@ -89,6 +89,7 @@ pub mod http;
 mod stats;
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -169,6 +170,13 @@ pub const CACHE_ENTRIES: usize = 8;
 /// Default for [`FateConfig::tenant_maps`] (`--fate-tenant-maps`).
 pub const DEFAULT_TENANT_MAPS: usize = 32;
 
+/// Default for [`FateConfig::build_budget`] (`--fate-build-seconds`).
+pub const DEFAULT_BUILD_SECONDS: u64 = 120;
+
+/// Times a tenant's default window is halved after background builds that
+/// ran out of time: thirty days down to under two.
+const MAX_SHRINK: u8 = 4;
+
 /// Spans of one run read to compute its foresight.
 pub const FORESIGHT_RUN_SPANS: usize = 20_000;
 
@@ -238,6 +246,13 @@ pub struct FateConfig {
     /// from; past this many tenants the least recently used one's is
     /// rebuilt when next asked for.
     pub tenant_maps: usize,
+    /// The budget of a build the background warmer makes
+    /// ([`Store::maintain_fate`], `--fate-build-seconds`): never less than
+    /// the query deadline. Such a build reads a tenant's whole default
+    /// window off every request path, so it may take longer than a request
+    /// may; one that still runs out of time is retried over half the
+    /// window, down to under two days, and the fuses say so meanwhile.
+    pub build_budget: Duration,
 }
 
 impl Default for FateConfig {
@@ -247,6 +262,7 @@ impl Default for FateConfig {
             max_nodes: DEFAULT_MAX_NODES,
             cache_ttl: Duration::from_secs(DEFAULT_CACHE_SECONDS),
             tenant_maps: DEFAULT_TENANT_MAPS,
+            build_budget: Duration::from_secs(DEFAULT_BUILD_SECONDS),
         }
     }
 }
@@ -1823,23 +1839,26 @@ impl Build {
 /// A cohort while a build groups runs: tenant and interned agent name.
 type CohortKey = (Arc<str>, u32);
 
-/// Builds the cohorts `key` describes, as of `now_ns`.
+/// Builds the cohorts `key` describes, as of `now_ns`. A default-window key
+/// covers the last `default_window_ns` — [`DEFAULT_WINDOW_NS`] unless its
+/// background builds ran out of time.
 fn build(
     store: &Store,
     key: &BuildKey,
     config: &FateConfig,
     now_ns: u64,
     deadline: Option<Deadline>,
+    default_window_ns: u64,
 ) -> Result<Build> {
     let (mut since_ns, until_ns) = match key.window {
-        Window::Default => (now_ns.saturating_sub(DEFAULT_WINDOW_NS), now_ns),
+        Window::Default => (now_ns.saturating_sub(default_window_ns), now_ns),
         Window::Range(since, until) => (since, until),
     };
     let max_runs = config.max_runs.max(1);
     // A window holding more runs than the fold may track is narrowed to its
     // most recent part that fits, so the map keeps the newest runs rather
     // than whichever the fold happened to meet first — and says so.
-    let mut narrowed = false;
+    let mut narrowed = key.window == Window::Default && default_window_ns < DEFAULT_WINDOW_NS;
     let mut attempts = 0;
     let fold = loop {
         let filter = SpanFilter {
@@ -2115,6 +2134,10 @@ pub(crate) struct FateCache {
     config: FateConfig,
     state: Mutex<CacheState>,
     settled: Condvar,
+    /// Builds that finished, and builds that failed (request and
+    /// background alike), for `traza_fate_builds_total`.
+    builds_ok: AtomicU64,
+    builds_failed: AtomicU64,
 }
 
 #[derive(Default)]
@@ -2128,9 +2151,15 @@ struct CacheState {
     #[cfg(test)]
     peak: usize,
     demand: Vec<BuildKey>,
-    /// Keys whose last background build failed, and when: retried after a
-    /// cache lifetime, not every tick.
-    failed: HashMap<BuildKey, Instant>,
+    /// Keys whose last background build failed, when, and why: retried
+    /// after a cache lifetime (at least a minute), not every tick, and the
+    /// reason is what a fuse reports meanwhile.
+    failed: HashMap<BuildKey, (Instant, String)>,
+    /// Default-window keys whose background builds ran out of time, and how
+    /// many times their window has been halved since (at most
+    /// [`MAX_SHRINK`]). A build that then finishes in under a quarter of its
+    /// budget widens it again by one step.
+    shrink: HashMap<BuildKey, u8>,
     /// Bumped by every erasure: a build that began before one is not
     /// installed.
     epoch: u64,
@@ -2179,6 +2208,8 @@ impl FateCache {
             config: config.clone(),
             state: Mutex::new(CacheState::default()),
             settled: Condvar::new(),
+            builds_ok: AtomicU64::new(0),
+            builds_failed: AtomicU64::new(0),
         }
     }
 
@@ -2236,13 +2267,37 @@ impl FateCache {
             state.peak = state.peak.max(state.active);
         }
         let epoch = state.epoch;
+        let shrink = state.shrink.get(key).copied().unwrap_or(0);
         drop(state);
         let in_flight = InFlight {
             cache: self,
             key: key.clone(),
         };
-        let built = Arc::new(build(store, key, &self.config, now_ns, deadline)?);
+        let started = Instant::now();
+        let built = match build(
+            store,
+            key,
+            &self.config,
+            now_ns,
+            deadline,
+            DEFAULT_WINDOW_NS >> shrink,
+        ) {
+            Ok(built) => Arc::new(built),
+            Err(error) => {
+                self.builds_failed.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        self.builds_ok.fetch_add(1, Ordering::Relaxed);
         let mut state = self.lock()?;
+        // A narrowed window widens again, a step at a time, once a build of
+        // it finishes in under a quarter of what it had.
+        let roomy = deadline.is_some_and(|deadline| {
+            started.elapsed() * 4 < deadline.at.saturating_duration_since(started)
+        });
+        if shrink > 0 && roomy {
+            state.shrink.insert(key.clone(), shrink - 1);
+        }
         if state.epoch == epoch && !self.config.cache_ttl.is_zero() {
             state.tick += 1;
             let used = state.tick;
@@ -2293,11 +2348,20 @@ impl FateCache {
     /// The cached build for `key` without building: served for up to twice
     /// the cache lifetime, and asked to be rebuilt in the background once
     /// past one lifetime (or when absent).
+    #[cfg(test)]
     fn peek(&self, key: &BuildKey) -> Option<Arc<Build>> {
-        let mut state = self.state.lock().ok()?;
+        self.peek_or_why(key).ok()
+    }
+
+    /// [`Self::peek`], or — when nothing is served — why: the reason the
+    /// last background build of `key` failed, if one did.
+    fn peek_or_why(&self, key: &BuildKey) -> std::result::Result<Arc<Build>, Option<String>> {
+        let Ok(mut state) = self.state.lock() else {
+            return Err(None);
+        };
         let ttl = self.config.cache_ttl;
         if ttl.is_zero() {
-            return None;
+            return Err(None);
         }
         let (found, stale) = match state.entries.get(key) {
             Some(entry) => {
@@ -2312,7 +2376,7 @@ impl FateCache {
         if stale && !state.demand.contains(key) && state.demand.len() < DEMAND_KEYS {
             state.demand.push(key.clone());
         }
-        found
+        found.ok_or_else(|| state.failed.get(key).map(|(_, reason)| reason.clone()))
     }
 
     /// Drops every cached build, and keeps any build in flight from being
@@ -2335,7 +2399,7 @@ impl FateCache {
             let backing_off = state
                 .failed
                 .get(&key)
-                .is_some_and(|at| at.elapsed() < ttl.max(Duration::from_secs(60)));
+                .is_some_and(|(at, _)| at.elapsed() < ttl.max(Duration::from_secs(60)));
             let fresh = state
                 .entries
                 .get(&key)
@@ -2353,13 +2417,58 @@ impl FateCache {
         taken
     }
 
-    fn failed(&self, key: &BuildKey) {
-        if let Ok(mut state) = self.state.lock() {
-            if state.failed.len() >= DEMAND_KEYS {
-                state.failed.clear();
+    /// Records that a background build of `key` failed with `error`. One
+    /// that ran out of time halves a default window for the next attempt
+    /// (at most [`MAX_SHRINK`] times).
+    fn failed(&self, key: &BuildKey, error: &Error) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let timed_out = matches!(error, Error::DeadlineExceeded(_));
+        let mut reason = if timed_out {
+            "the last background build of this tenant's Fate Map ran out of time".to_owned()
+        } else {
+            format!("the last background build of this tenant's Fate Map failed: {error}")
+        };
+        if timed_out && key.window == Window::Default {
+            let level = state.shrink.get(key).copied().unwrap_or(0);
+            if level < MAX_SHRINK {
+                if state.shrink.len() >= DEMAND_KEYS && !state.shrink.contains_key(key) {
+                    state.shrink.clear();
+                }
+                state.shrink.insert(key.clone(), level + 1);
+                reason.push_str(&format!(
+                    "; it is retried over a shorter window, the last {:.1} days",
+                    (DEFAULT_WINDOW_NS >> (level + 1)) as f64 / 86_400e9
+                ));
+            } else {
+                reason.push_str("; it is retried over its shortest window");
             }
-            state.failed.insert(key.clone(), Instant::now());
         }
+        if state.failed.len() >= DEMAND_KEYS && !state.failed.contains_key(key) {
+            state.failed.clear();
+        }
+        state.failed.insert(key.clone(), (Instant::now(), reason));
+    }
+
+    /// Appends the build counters and the cached-build gauge in Prometheus
+    /// text format.
+    fn render_metrics(&self, into: &mut String) {
+        use std::fmt::Write as _;
+        let cached = self.state.lock().map_or(0, |state| state.entries.len());
+        let _ = writeln!(into, "# TYPE traza_fate_builds_total counter");
+        let _ = writeln!(
+            into,
+            "traza_fate_builds_total{{result=\"ok\"}} {}",
+            self.builds_ok.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            into,
+            "traza_fate_builds_total{{result=\"failed\"}} {}",
+            self.builds_failed.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(into, "# TYPE traza_fate_cached_builds gauge");
+        let _ = writeln!(into, "traza_fate_cached_builds {cached}");
     }
 }
 
@@ -3268,21 +3377,28 @@ impl Store {
 
     /// Builds, off any request path, the maps the predictive fuses asked
     /// for and found missing or stale — at most two per call, each under
-    /// the query deadline. Returns how many it built. `traza-server` calls
+    /// [`FateConfig::build_budget`] (never less than the query deadline).
+    /// A build that runs out of time is retried, after a minute or a cache
+    /// lifetime, over half its window, and the fuses report why they have
+    /// no map meanwhile. Returns how many it built. `traza-server` calls
     /// it every few seconds; an embedder that sets `min_success_odds` on a
     /// policy calls it on its own cadence, or its fuses see no map.
     pub fn maintain_fate(&self) -> Result<usize> {
+        let budget = match self.config.query_deadline {
+            Some(query) => query.max(self.config.fate.build_budget),
+            None => self.config.fate.build_budget,
+        };
         let mut built = 0;
         let mut first_error = None;
         for key in self.fate.take_demand(WARM_PER_CALL) {
-            let deadline = self.query_deadline(Instant::now());
+            let deadline = Deadline::starting(Instant::now(), Some(budget));
             match self
                 .fate
                 .get_or_build(self, &key, crate::mcp::unix_nanos_now(), deadline)
             {
                 Ok(_) => built += 1,
                 Err(error) => {
-                    self.fate.failed(&key);
+                    self.fate.failed(&key, &error);
                     first_error.get_or_insert(error);
                 }
             }
@@ -3306,6 +3422,13 @@ impl Store {
     /// Drops every cached map: called by every erasure.
     pub(crate) fn forget_fate(&self) {
         self.fate.invalidate();
+    }
+
+    /// Appends the Fate Map counters in Prometheus text format: builds that
+    /// finished and builds that failed (`traza_fate_builds_total`, by
+    /// `result`), and the builds cached now.
+    pub fn render_fate_metrics(&self, into: &mut String) {
+        self.fate.render_metrics(into);
     }
 
     /// Foresight for a fuse verdict: read only from a cached map, never
@@ -3334,11 +3457,17 @@ impl Store {
             map_built_at_ns: None,
         };
         let key = BuildKey::of(Some(tenant), None, None);
-        let Some(build) = self.fate.peek(&key) else {
-            out.explanation = "no Fate Map is cached for this tenant yet; it is being built in \
-                               the background"
-                .to_owned();
-            return out;
+        let build = match self.fate.peek_or_why(&key) {
+            Ok(build) => build,
+            Err(failure) => {
+                out.explanation = match failure {
+                    Some(reason) => format!("foresight is unavailable: {reason}"),
+                    None => "no Fate Map is cached for this tenant yet; it is being built in \
+                             the background"
+                        .to_owned(),
+                };
+                return out;
+            }
         };
         out.map_built_at_ns = Some(build.built_at_ns);
         let deadline = self.query_deadline(started);
