@@ -1957,6 +1957,25 @@ impl<'a> Server<'a> {
         }
         let text = clamp_report(&head, &rows, &notes, self.limits.max_result_bytes);
         let mut structured = serde_json::to_value(&doc).unwrap_or_else(|_| json!({}));
+        // Producer and caller text in the structured half is made JSON-safe,
+        // as foresee_run does for the same foresight: the reasons, and the
+        // foresight's explanation (which quotes tool names) and next tool.
+        if let Some(object) = structured.as_object_mut() {
+            if let Some(reasons) = object.get_mut("reasons").and_then(Value::as_array_mut) {
+                for reason in reasons.iter_mut() {
+                    if let Value::String(text) = reason {
+                        *text = json_safe(text);
+                    }
+                }
+            }
+            if let Some(foresight) = object.get_mut("foresight").and_then(Value::as_object_mut) {
+                for key in ["explanation", "next_tool"] {
+                    if let Some(Value::String(text)) = foresight.get_mut(key) {
+                        *text = json_safe(text);
+                    }
+                }
+            }
+        }
         let mut result = json!({
             "content": [{"type": "text", "text": text}],
             "structuredContent": structured.clone(),

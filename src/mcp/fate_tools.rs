@@ -386,4 +386,77 @@ mod tests {
             .unwrap_or_default()
             .contains("bound to a different tenant"));
     }
+
+    #[test]
+    fn check_run_guard_keeps_foresight_text_json_safe() {
+        let fixture = TempStore::open("mcp-guard-foresight", crate::Config::default());
+        let store = fixture.store();
+        let now = crate::mcp::unix_nanos_now();
+        let step = |run: &str, id: &str, tool: &str, start: u64| {
+            let mut span = crate::tape::tests::span(
+                &format!("{run}-trace"),
+                id,
+                start,
+                json!({"session.id": run, "gen_ai.operation.name": "execute_tool",
+                       "gen_ai.tool.name": tool}),
+            );
+            span.service = "svc".into();
+            span
+        };
+        // Forty finished runs went on to a tool whose name carries a bell;
+        // one live run goes somewhere new, so its foresight quotes it.
+        let mut spans = Vec::new();
+        for index in 0..40_u64 {
+            let start = now - 3 * 3_600_000_000_000 - index * 60_000_000_000;
+            let run = format!("done-{index}");
+            spans.push(step(&run, "a", "plan", start));
+            spans.push(step(&run, "b", "ring\u{7}bell", start + 1_000));
+        }
+        spans.push(step("going", "a", "plan", now - 2_000_000_000));
+        spans.push(step("going", "b", "elsewhere", now - 1_000_000_000));
+        store.ingest_batch(spans).expect("ingests");
+        store
+            .put_fuse_policy(crate::guard::PolicySpec {
+                name: "svc".into(),
+                matches: crate::guard::PolicyMatch {
+                    service: Some("svc".into()),
+                },
+                limits: crate::guard::Limits {
+                    min_success_odds: Some(0.5),
+                    ..crate::guard::Limits::default()
+                },
+                ..crate::guard::PolicySpec::default()
+            })
+            .expect("policy");
+        let server = Server::new(
+            store,
+            Limits {
+                max_result_bytes: 16 * 1024,
+                max_payload_bytes: 4096,
+            },
+            false,
+        );
+        let call = || {
+            server
+                .handle(
+                    &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "check_run_guard",
+                                   "arguments": {"run_id": "going"}}}),
+                    Context {
+                        access: Access::Read,
+                        tenant: None,
+                        now_ns: now,
+                    },
+                )
+                .expect("a response")
+        };
+        let _ = call();
+        store.maintain_fate().expect("warms");
+        let response = call();
+        let foresight = &response["result"]["structuredContent"]["foresight"];
+        assert_eq!(foresight["verdict"], "novel", "{response}");
+        let explanation = foresight["explanation"].as_str().expect("explanation");
+        assert!(explanation.contains("ring\u{fffd}bell"), "{explanation}");
+        assert!(!explanation.chars().any(char::is_control), "{explanation}");
+    }
 }
