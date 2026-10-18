@@ -534,6 +534,42 @@ describe('a credential change', () => {
     expect(screen.queryByRole('dialog', { name: 'Credential minted' })).toBeNull();
   });
 
+  it('never loses the store\'s first admin secret: a mint that closed an open store is shown even after a switch', async () => {
+    // An open store takes any token, so a handoff link followed while the
+    // first mint is in flight switches the tab before the answer lands —
+    // and that answer is the only admin credential the store now has.
+    const server = serveTokens({ '': { whoami: whoamiOpen }, 'Bearer handed-off': { whoami: whoamiOpen } });
+    const minted = {
+      id: 'cr_first', token: 'trz_first', prefix: 'trz_firs', scope: 'admin', tenant: null,
+      label: null, source: 'api', created_at_ns: 1, expires_at_ns: null,
+    };
+    server.route = (c) => {
+      if (c.path !== '/v1/admin/credentials' || c.method !== 'POST') return undefined;
+      server.byToken = { 'Bearer trz_first': { whoami: OPERATOR } };
+      return json(200, minted);
+    };
+    window.location.hash = '#/credentials';
+    render(<App />);
+    await settle(0);
+    await settle(10);
+
+    server.hold = (c) => c.path === '/v1/admin/credentials' && c.method === 'POST';
+    await act(async () => { fireEvent.click(screen.getByText('Mint')); });
+    await settle(10);
+    await navigateTo('#/overview?token=handed-off');
+    expect(getToken()).toBe('handed-off');
+
+    server.release((c) => c.method === 'POST');
+    await settle(10);
+    const dialog = screen.getByRole('dialog', { name: 'Credential minted' });
+    expect(within(dialog).getByTestId('minted-token').textContent).toContain('trz_first');
+    expect(dialog.textContent).toMatch(/closed the store/);
+    // Not adopted behind the reader's back: the tab keeps the token it was
+    // switched to, and the dialog offers this one.
+    expect(getToken()).toBe('handed-off');
+    expect(within(dialog).getByText('Use in this tab')).toBeTruthy();
+  });
+
   it('clears a minted secret on display when the tab switches to another credential', async () => {
     const server = serveMint();
     setToken('op-token');

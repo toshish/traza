@@ -12,6 +12,7 @@ import { render, act, cleanup, fireEvent, screen, within } from '@testing-librar
 import tape from '../test/fixtures/tape_tkt4101.json';
 import topology from '../test/fixtures/topology_pingpong.json';
 import single from '../test/fixtures/topology_single.json';
+import fanout from '../test/fixtures/topology_fanout.json';
 import nudges from '../test/fixtures/nudges.json';
 import forks from '../test/fixtures/forks.json';
 import forkCreated from '../test/fixtures/fork_created.json';
@@ -68,6 +69,15 @@ describe('the agents', () => {
       .toEqual(topology.sequence);
   });
 
+  it('lists a supervisor\'s returns plainly, never as ping-pong', async () => {
+    api.topology.mockImplementation(async () => fanout);
+    await show();
+    const card = screen.getByTestId('topology-card');
+    expect(within(card).getAllByTestId('topology-edge').some((e) => e.dataset.cycle === 'true')).toBe(false);
+    expect(card.textContent).not.toMatch(/ping-pong\s*supervisor/);
+    expect(card.textContent).toMatch(/returns\s*supervisor → refunds → supervisor\s*×1/);
+  });
+
   it('says one agent in a sentence instead of drawing it', async () => {
     api.topology.mockImplementation(async () => single);
     await show();
@@ -119,8 +129,13 @@ describe('fork from here', () => {
     expect(created).toContain(`export TRAZA_FORK_ID=${forkCreated.fork_id}`);
     expect(created).toContain('export TRAZA_FORK_PARENT=tkt-4101');
     expect(created).toContain(`/v1/replays/${forkCreated.id}/openai/v1`);
-    expect(created).toContain('traza.fork("tkt-4101", at_step=1, tool_result={"orders": [], "query": "E-9904", "note": "no match"}) as fork:');
-    expect(created).toContain("traza fork tkt-4101 --at 1 --tool-result '{\"orders\":[],\"query\":\"E-9904\",\"note\":\"no match\"}' -- python agent.py");
+    // Both snippets name the run's tenant — the default one, explicitly.
+    expect(created).toContain('tenant="")');
+    expect(created).toContain('client.fork("tkt-4101", at_step=1, tool_result={"orders": [], "query": "E-9904", "note": "no match"}) as fork:');
+    expect(created).toContain("traza fork tkt-4101 --tenant '' --at 1 --tool-result '{\"orders\":[],\"query\":\"E-9904\",\"note\":\"no match\"}' -- python agent.py");
+    // The harness's key is a replay key, never the Traza token.
+    expect(created).toContain('TRAZA_REPLAY_KEY');
+    expect(created).not.toContain('$TRAZA_TOKEN');
     await act(async () => { fireEvent.click(within(dialog).getByText('What has it served?')); });
     expect(within(dialog).getByTestId('fork-status').textContent).toMatch(/went live at .*, 1 live calls · tool_result at 1 served/);
     // The listing reads again for the new fork.
@@ -145,6 +160,11 @@ describe('fork from here', () => {
     fireEvent.click(within(dialog).getByText('loose'));
     await act(async () => { fireEvent.click(within(dialog).getByText('Create fork')); });
     expect(api.createReplay).toHaveBeenLastCalledWith({ run: 'tkt-4101', mode: 'loose', tenant: '', live_after: 1 });
+    // traza fork has no mode: no command that would make a strict fork.
+    const created = within(dialog).getByTestId('fork-created').textContent;
+    expect(created).toContain('mode="loose"');
+    expect(created).not.toContain('traza fork tkt-4101');
+    expect(created).toMatch(/cannot make a loose fork/);
   });
 
   it('refuses JSON that does not parse before asking the server', async () => {

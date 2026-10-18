@@ -24,9 +24,22 @@ export function ForesightChip({ foresight, style }) {
   }}>{known.label}</Tag>;
 }
 
-/** The rate on a 0–100% track, with its interval and the base rate.
+/** The rate as it should be read: this run's path's rate, or — for a run
+    on a novel path — the rate of the path before it left it, which is not
+    this run's odds and is shown muted and labelled `before`. */
+function Rate({ foresight, marks, faded }) {
+  const before = foresight.verdict === 'novel';
+  return <span title={before ? 'the success rate of the path before this run left it' : undefined}
+    style={{ color: faded || before ? 'var(--ink-muted)' : 'var(--accent)', fontWeight: 500 }}>
+    {before ? <span style={{ fontWeight: 400 }}>before </span> : null}{fmtPct(marks.p)}
+  </span>;
+}
 
-    `compact` is the table cell: the track and one line of figures. */
+/** The rate on a 0–100% track, with its interval, the base rate and the
+    number of runs behind it.
+
+    `compact` is the phone card: the track and one line of figures, the run
+    count always among them — a touch screen shows no tooltip. */
 export function ForesightBar({ foresight, compact = false, width = '100%' }) {
   const marks = foresightMarks(foresight);
   const title = foresightSentence(foresight);
@@ -36,25 +49,26 @@ export function ForesightBar({ foresight, compact = false, width = '100%' }) {
       {!compact ? <div style={{ fontSize: 11, color: 'var(--ink-faint)' }}>{title}</div> : null}
     </div>;
   }
-  const faded = foresight.verdict === 'insufficient_history';
+  const faded = foresight.verdict === 'insufficient_history' || foresight.verdict === 'novel';
   return <div title={title} role="img" aria-label={title} style={{ width, display: 'grid', gap: 3, minWidth: 0 }}>
     <Track width={width} marks={marks} faded={faded} />
     <div style={{
       display: 'flex', alignItems: 'baseline', gap: 6, fontFamily: 'var(--font-mono)', fontSize: 11,
       fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap', overflow: 'hidden',
     }}>
-      <span style={{ color: faded ? 'var(--ink-muted)' : 'var(--accent)', fontWeight: 500 }}>{fmtPct(marks.p)}</span>
+      <Rate foresight={foresight} marks={marks} faded={foresight.verdict === 'insufficient_history'} />
       {marks.lo != null && marks.hi != null ? <span style={{ color: 'var(--ink-muted)' }}>{fmtInterval(foresight.ci95)}</span> : null}
+      <span style={{ color: 'var(--ink-muted)' }}>n {marks.support}</span>
       {marks.base != null ? <span style={{ color: 'var(--ink-faint)' }}>base {fmtPct(marks.base)}</span> : null}
-      {!compact ? <span style={{ color: 'var(--ink-faint)' }}>n {marks.support}</span> : null}
     </div>
   </div>;
 }
 
-/** The table cell: the verdict and the rate on one line, the track under
-    it. The interval and base rate are drawn, and spelled out in the title.
-    A run without enough history says how much it has, and draws nothing:
-    an interval over three runs is a picture of noise. */
+/** The table cell: the verdict, the rate, its interval and the runs behind
+    it, the track under them; the base rate is drawn, and spelled out in the
+    title. The figures wrap under the chip when the column is narrow rather
+    than being cut. A run without enough history says how much it has, and
+    draws nothing: an interval over three runs is a picture of noise. */
 export function ForesightCell({ foresight }) {
   const marks = foresightMarks(foresight);
   const title = foresightSentence(foresight);
@@ -65,15 +79,17 @@ export function ForesightCell({ foresight }) {
         ? <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-faint)', fontVariantNumeric: 'tabular-nums' }}>n {marks ? marks.support : 0}/30</span> : null}
     </div>;
   }
+  const novel = foresight.verdict === 'novel';
   return <div title={title} role="img" aria-label={title} style={{ display: 'grid', gap: 3, minWidth: 0 }}>
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, whiteSpace: 'nowrap' }}>
+    <div style={{ display: 'flex', alignItems: 'center', columnGap: 6, rowGap: 2, minWidth: 0, flexWrap: 'wrap' }}>
       <ForesightChip foresight={foresight} />
-      <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 11, fontVariantNumeric: 'tabular-nums', display: 'inline-flex', gap: 5 }}>
-        <span style={{ color: 'var(--accent)', fontWeight: 500 }}>{fmtPct(marks.p)}</span>
+      <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 11, fontVariantNumeric: 'tabular-nums', display: 'inline-flex', gap: 5, whiteSpace: 'nowrap' }}>
+        <Rate foresight={foresight} marks={marks} />
         {marks.lo != null && marks.hi != null ? <span style={{ color: 'var(--ink-faint)' }}>{fmtInterval(foresight.ci95)}</span> : null}
+        <span style={{ color: 'var(--ink-faint)' }}>n {marks.support}</span>
       </span>
     </div>
-    <Track width="100%" marks={marks} />
+    <Track width="100%" marks={marks} faded={novel} />
   </div>;
 }
 

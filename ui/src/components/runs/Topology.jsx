@@ -15,8 +15,9 @@ import { Card, ErrorState, Mono, PanelHead, Skeleton } from '../primitives/Chrom
 export function TopologyGraph({ doc, width = 400, height = 200 }) {
   const id = React.useId().replace(/[^a-zA-Z0-9_-]/g, '');
   const layout = React.useMemo(() => layoutTopology(doc, { width, height }), [doc, width, height]);
+  const bounced = layout.cycles.filter((pair) => pair.pingPong).length;
   const label = `Agent graph: ${layout.nodes.length} agents, ${layout.edges.filter((e) => e.kind === 'handoff').length} handoff routes`
-    + (layout.cycles.length ? `, ${layout.cycles.length} ping-pong pairs` : '');
+    + (bounced ? `, ${bounced} ping-pong pairs` : '');
   return <svg viewBox={`0 0 ${width} ${height}`} width="100%" role="img" aria-label={label}
     style={{ display: 'block', maxHeight: height, overflow: 'visible' }}>
     <defs>
@@ -52,7 +53,8 @@ export function TopologyGraph({ doc, width = 400, height = 200 }) {
   </svg>;
 }
 
-/** The Run screen's card: the graph, the ping-pong pairs, the turns. */
+/** The Run screen's card: the graph, the pairs control came back between
+    (ping-pong in the error colour, a plain return in ink), the turns. */
 export function TopologyCard({ run, tenant, go }) {
   const read = useRead((signal) => api.topology(run, tenantParams(tenant), signal), [run, tenant]);
   if (read.loading && !read.data) return <Card><PanelHead title="Agents" /><Skeleton height={120} /></Card>;
@@ -74,8 +76,10 @@ export function TopologyCard({ run, tenant, go }) {
     {layout.hidden ? <div style={{ fontSize: 11, color: 'var(--ink-faint)' }}>{layout.hidden} quieter agents not drawn.</div> : null}
 
     {layout.cycles.length ? <div style={{ display: 'grid', gap: 4, marginTop: 8 }}>
-      {layout.cycles.map((pair) => <div key={pair.agents.join('\u0000')} data-testid="topology-cycle" style={{ display: 'flex', alignItems: 'baseline', gap: 6, fontSize: 12, flexWrap: 'wrap' }}>
-        <span style={{ color: 'var(--error)', fontWeight: 500 }}>ping-pong</span>
+      {layout.cycles.map((pair) => <div key={pair.agents.join('\u0000')} data-testid="topology-cycle" data-ping-pong={pair.pingPong ? 'true' : 'false'} style={{ display: 'flex', alignItems: 'baseline', gap: 6, fontSize: 12, flexWrap: 'wrap' }}>
+        {pair.pingPong
+          ? <span style={{ color: 'var(--error)', fontWeight: 500 }}>ping-pong</span>
+          : <span style={{ color: 'var(--ink-muted)' }}>returns</span>}
         <Mono>{pair.agents[0]} → {pair.agents[1]} → {pair.agents[0]}</Mono>
         <Mono color="var(--accent)">×{pair.count}</Mono>
         {pair.example && go ? <a href={'#/trace/' + encodeURIComponent(pair.example.trace_id) + '?span=' + encodeURIComponent(pair.example.span_id)}

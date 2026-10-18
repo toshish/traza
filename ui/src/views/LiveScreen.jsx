@@ -1,11 +1,12 @@
 import React from 'react';
 import { api } from '../lib/api.js';
-import { navigate, useMedia } from '../lib/route.js';
+import { hashFor, navigate, useMedia } from '../lib/route.js';
 import { fmtCompact, fmtNum, fmtTimeNs } from '../lib/format.js';
 import { tenantParams } from '../lib/runs.js';
 import {
   FILTERS, SORTS, ageOut, agentsOf, applyRun, applySnapshot, foresightSentence, guardState, idleMs, isQuiet,
-  liveTotals, matches, newLiveState, rowKey, runLiveStream, serverNowMs, sortEntries, stepElapsedMs,
+  liveTotals, matches, newLiveState, probeCandidates, rowKey, runLiveStream, serverNowMs, sortEntries,
+  stepElapsedMs, waitingKeys,
 } from '../lib/live.js';
 import { Card, Chip, EmptyState, ErrorState, LiveDot, Mono, Skeleton } from '../components/primitives/Chrome.jsx';
 import { Tag } from '../components/primitives/Tag.jsx';
@@ -48,24 +49,31 @@ function useNow(intervalMs = 1000) {
 }
 
 /** Follows the live view for one scope: rows, connection state, and a note
-    when the view was rebuilt from a fresh snapshot. */
+    when the view was rebuilt from a fresh snapshot. `updatedAt` is when a
+    snapshot or poll last landed in this scope — null until the first does,
+    so the screen never states anything about the runs before it has read
+    them. `retry()` starts over after a refusal. */
 function useLiveRuns(tenant) {
   const [state, setState] = React.useState(newLiveState);
   const [status, setStatus] = React.useState({ state: 'connecting' });
   const [updatedAt, setUpdatedAt] = React.useState(null);
   const [note, setNote] = React.useState(null);
   const [breaks, setBreaks] = React.useState(0);
+  const [attempt, setAttempt] = React.useState(0);
 
   React.useEffect(() => {
     const controller = new AbortController();
     setState(newLiveState());
     setStatus({ state: 'connecting' });
+    setUpdatedAt(null);
     setNote(null);
     setBreaks(0);
     let broken = false;
     let seen = false;
     runLiveStream({
-      open: (params) => api.liveChunks(params, controller.signal),
+      // The runner's own signal per connection, so a connection it gives up
+      // on (silent past the heartbeat) is closed, not left holding a socket.
+      open: (params, signal) => api.liveChunks(params, signal),
       poll: (params) => api.liveRuns(params, controller.signal),
       params: tenant ? { tenant } : {},
       signal: controller.signal,
@@ -97,7 +105,7 @@ function useLiveRuns(tenant) {
     });
     const ager = setInterval(() => setState((current) => ageOut(current, Date.now())), 5000);
     return () => { controller.abort(); clearInterval(ager); };
-  }, [tenant]);
+  }, [tenant, attempt]);
 
   React.useEffect(() => {
     if (!note) return undefined;
@@ -105,43 +113,55 @@ function useLiveRuns(tenant) {
     return () => clearTimeout(timer);
   }, [note]);
 
-  return { state, status, updatedAt, note, breaks };
+  const retry = React.useCallback(() => setAttempt((n) => n + 1), []);
+  return { state, status, updatedAt, note, breaks, retry };
 }
 
-/** Finds the runs the live listing cannot say are held.
+/** Finds the runs the live listing cannot say are held — as far as the
+    verdict route can say it.
 
     A predictive stop — `min_success_odds` — is evaluated on the pre-call
     check and the verdict route only, never into the guard's listing. A run
     it holds shows its next step pending, and nothing else. So a run whose
     named step has stayed pending a few seconds is asked about, with the
     verdict route: a read from memory that is neither activity nor a change,
-    and never takes the run's nudges. At most four a round, each run at most
-    once per ten seconds or per move it makes. */
+    and never takes the run's nudges. That route judges the path so far,
+    without the step the check was asked about, so a hold that exists only
+    for that step — a predictive limit judging the named tool, a budget its
+    estimate would cross, a block nudge — is not found here; such a run is
+    shown as waiting instead. At most four a round, each run at most once
+    per ten seconds or per move it makes, the runs never asked first and
+    then the longest waiting. `forget(key)` drops what is known about a run,
+    so it is asked again at the next round (after an approval, say). */
 function useHeldProbe(state, serverNow) {
   const [held, setHeld] = React.useState(() => new Map());
   const latest = React.useRef({ state, serverNow });
   latest.current = { state, serverNow };
   const asked = React.useRef(new Map());
+  const forget = React.useCallback((key) => {
+    asked.current.delete(key);
+    setHeld((map) => {
+      if (!map.has(key)) return map;
+      const next = new Map(map);
+      next.delete(key);
+      return next;
+    });
+  }, []);
 
   React.useEffect(() => {
     let live = true;
     const round = () => {
       if (document.hidden) return;
       const { state: current, serverNow: now } = latest.current;
-      const candidates = [];
-      for (const [key, entry] of current.rows) {
-        const row = entry.row;
-        if (!row.current || !row.current.pending || row.verdict === 'stop') continue;
-        if ((stepElapsedMs(row, now) || 0) < PROBE_AFTER_MS) continue;
-        const last = asked.current.get(key);
-        if (last && last.activity === row.last_activity_ns && Date.now() - last.at < PROBE_TTL_MS) continue;
-        candidates.push({ key, row });
-        if (candidates.length >= PROBE_BATCH) break;
-      }
+      const candidates = probeCandidates(current.rows, asked.current, now, Date.now(),
+        { afterMs: PROBE_AFTER_MS, ttlMs: PROBE_TTL_MS, batch: PROBE_BATCH });
       for (const { key, row } of candidates) {
-        asked.current.set(key, { activity: row.last_activity_ns, at: Date.now() });
+        const ask = { activity: row.last_activity_ns, at: Date.now() };
+        asked.current.set(key, ask);
         api.fuseRun(row.run, tenantParams(row.tenant || '')).then((doc) => {
-          if (!live) return;
+          // An answer to a question since forgotten (an approval in between)
+          // or asked again is out of date.
+          if (!live || asked.current.get(key) !== ask) return;
           setHeld((map) => {
             const next = new Map(map);
             if (doc && doc.verdict === 'stop') next.set(key, { doc, activity: row.last_activity_ns });
@@ -154,7 +174,7 @@ function useHeldProbe(state, serverNow) {
     const timer = setInterval(round, PROBE_MS);
     return () => { live = false; clearInterval(timer); };
   }, []);
-  return held;
+  return { held, forget };
 }
 
 /** "4 s", "1m 04s", "2h 05m": a running step's age at a glance. Whole
@@ -202,16 +222,22 @@ function Ticking({ value, format, style }) {
   return <span title={typeof value === 'number' ? String(value) : undefined} style={style}>{format(shown)}</span>;
 }
 
-/** The current step's age, from the shared clock. */
+/** How long the current step has been pending, from the shared clock — or,
+    for a recorded step, which has already ended (spans arrive when they
+    end), how long ago the run's latest span arrived. */
 function Elapsed({ row }) {
   const serverNow = React.useContext(ClockContext);
   const idle = idleMs(row, serverNow);
+  if (row.current && row.current.pending) {
+    return <span title={'named by a pre-call check at ' + fmtTimeNs(row.current.started_ns) + '; no span since'}>
+      {fmtElapsed(stepElapsedMs(row, serverNow))}
+    </span>;
+  }
   if (isQuiet(row, serverNow)) {
     return <span title={'last activity ' + fmtTimeNs(row.last_activity_ns)} style={{ color: 'var(--ink-faint)' }}>idle {fmtElapsed(idle)}</span>;
   }
-  return <span title={row.current && row.current.started_ns ? 'started ' + fmtTimeNs(row.current.started_ns) : undefined}>
-    {fmtElapsed(stepElapsedMs(row, serverNow))}
-  </span>;
+  return <span title={'no step pending; this step has ended, and the run\'s latest span arrived at ' + fmtTimeNs(row.last_activity_ns)}
+    style={{ color: 'var(--ink-faint)' }}>{fmtElapsed(idle)} ago</span>;
 }
 
 /** A row that just changed is marked for a moment, so the eye finds what
@@ -227,15 +253,29 @@ const GUARD = {
   warn: { tag: 'warn', label: 'warn' },
   stop: { tag: 'error', label: 'stop' },
   held: { tag: 'error', label: 'held' },
+  waiting: { tag: 'warn', label: 'waiting' },
 };
+
+/** What `waiting` means, in a sentence: the page knows the run asked, and
+    not what it was told. */
+function waitingSentence(row) {
+  const step = row.current ? `${row.current.kind}${row.current.name ? ':' + row.current.name : ''}` : 'its next step';
+  return `It asked the pre-call check about ${step} and has recorded nothing since. The listing's verdict, `
+    + `${row.verdict || 'continue'}, judges the path so far; the check judged the path with that step added, and its `
+    + 'answer is not in the listing. The step may still be running, or the check refused it — a predictive limit '
+    + 'judging that tool, a budget the step\'s estimate would cross, a block nudge — and which of the two cannot be '
+    + 'read from here.';
+}
 
 function GuardChip({ entry }) {
   const state = guardState(entry);
   const known = GUARD[state] || { tag: 'neutral', label: state };
   const reasons = state === 'held' ? (entry.held.doc.reasons || []) : (entry.row.reasons || []);
+  const title = state === 'waiting' ? waitingSentence(entry.row)
+    : reasons.length ? reasons.join('\n') : `the guard says ${state}`;
   // `continue` is the ordinary state: in ink, so the exceptions are what the
   // eye finds in a column of them.
-  return <span title={reasons.length ? reasons.join('\n') : `the guard says ${state}`}>
+  return <span title={title}>
     {state === 'continue'
       ? <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--ink-muted)' }}>continue</span>
       : <Tag status={known.tag} mono>{known.label}</Tag>}
@@ -259,6 +299,12 @@ function StepCell({ row }) {
   </div>;
 }
 
+/** A run's tape, in its own tenant — the address `go` opens, so a link
+    opened in a new tab lands in the same place. */
+function runHref(row) {
+  return hashFor(['run', row.run], tenantParams(row.tenant || ''));
+}
+
 const COLUMNS = 'minmax(140px, 1.1fr) minmax(190px, 1.35fr) 52px 66px 80px 84px minmax(180px, 1fr) 82px 222px';
 const HEADERS = ['run', 'now', 'steps', 'tokens', 'cost USD', 'guard', 'foresight', 'nudges', ''];
 
@@ -270,7 +316,12 @@ const LiveRow = React.memo(function LiveRow({ entry, idle, open, operator, write
   const guard = guardState(entry);
   return <div data-testid="live-row" data-run={row.run} data-guard={guard}>
     <div role="row" tabIndex={0} aria-expanded={open} onClick={() => onToggle(key)}
-      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(key); } }}
+      onKeyDown={(e) => {
+        // Keys pressed on the row's own controls — the run link, a button —
+        // are theirs: Enter on the link follows it.
+        if (e.target !== e.currentTarget) return;
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(key); }
+      }}
       style={{
         display: 'grid', gridTemplateColumns: COLUMNS, alignItems: 'center', cursor: 'pointer', position: 'relative', isolation: 'isolate',
         borderBottom: '1px solid var(--hairline)', minHeight: 'var(--row-h)', fontSize: 'var(--cell-fs)',
@@ -280,7 +331,7 @@ const LiveRow = React.memo(function LiveRow({ entry, idle, open, operator, write
       <Flash at={entry.flashAt} />
       <Cell>
         <div style={{ minWidth: 0 }}>
-          <a href={'#/run/' + encodeURIComponent(row.run)} onClick={(e) => { e.preventDefault(); e.stopPropagation(); onAction('open', entry); }}
+          <a href={runHref(row)} onClick={(e) => { e.preventDefault(); e.stopPropagation(); onAction('open', entry); }}
             style={{ fontFamily: 'var(--font-mono)', fontSize: 12, display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.run}</a>
           <div style={{ fontSize: 11, color: 'var(--ink-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {row.agent}{operator ? <span style={{ color: 'var(--ink-faint)' }}> · {row.tenant ? row.tenant : 'default'}</span> : null}
@@ -305,14 +356,16 @@ const LiveRow = React.memo(function LiveRow({ entry, idle, open, operator, write
 });
 
 /** The row's buttons. A kill switch for a running run, an approval for a
-    stopped or held one — both need `rw` — and the nudge. */
+    stopped or held one, or one waiting on a step it asked about (whose check
+    may have refused it) — both need `rw` — and the nudge. */
 function Actions({ entry, writer, onAction, wrap = false }) {
   const guard = guardState(entry);
   const act = (name) => (e) => { if (e && e.stopPropagation) e.stopPropagation(); onAction(name, entry); };
   return <span style={{ display: 'inline-flex', gap: 6, flexWrap: wrap ? 'wrap' : 'nowrap', justifyContent: 'flex-end' }}>
     {writer ? <Chip onClick={act('nudge')} title="Words for the agent, or a veto of its next step">Nudge</Chip> : null}
-    {writer && (guard === 'stop' || guard === 'held')
-      ? <Chip tone="primary" onClick={act('approve')} title="Reset the run, optionally granting higher limits or lower odds">Approve</Chip> : null}
+    {writer && (guard === 'stop' || guard === 'held' || guard === 'waiting')
+      ? <Chip tone={guard === 'waiting' ? undefined : 'primary'} onClick={act('approve')}
+        title="Reset the run, optionally granting higher limits or lower odds">Approve</Chip> : null}
     {writer && guard !== 'stop'
       ? <Chip onClick={act('kill')} title="Stop the run until it is reset, durably">Kill</Chip> : null}
     {!writer ? <Chip onClick={act('open')}>Tape</Chip> : null}
@@ -342,8 +395,12 @@ function RowDetail({ entry, writer, onAction }) {
           {reasons.map((reason, i) => <li key={i} style={{ color: 'var(--error)' }}><span style={{ color: 'var(--ink)' }}>{reason}</span></li>)}
         </ul> : null}
         {guardState(entry) === 'held' ? <div style={{ fontSize: 12, color: 'var(--ink-muted)', marginTop: 6, lineHeight: '18px' }}>
-          Held by a predictive limit: the run asked to take its next step and the check answered stop. The
-          listing never carries a foresight stop; this was read from the run's verdict.
+          Held: the run asked to take its next step, and its verdict for the path so far is stop — a predictive
+          limit, which the listing never carries, read from the run's verdict. That read judges the path without the
+          step the check was asked about, so a hold on that step alone cannot be read from here.
+        </div> : null}
+        {guardState(entry) === 'waiting' ? <div style={{ fontSize: 12, color: 'var(--ink-muted)', marginTop: 6, lineHeight: '18px' }}>
+          {waitingSentence(row)} Its verdict for the path so far was read and is not stop.
         </div> : null}
       </Section>
       <Section title="foresight">
@@ -390,7 +447,7 @@ const LiveCard = React.memo(function LiveCard({ entry, idle, operator, writer, o
   }}>
     <Flash at={entry.flashAt} />
     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-      <a href={'#/run/' + encodeURIComponent(row.run)} onClick={(e) => { e.preventDefault(); onAction('open', entry); }}
+      <a href={runHref(row)} onClick={(e) => { e.preventDefault(); onAction('open', entry); }}
         style={{ fontFamily: 'var(--font-mono)', fontSize: 13, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.run}</a>
       <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 6, alignItems: 'center', flex: 'none' }}>
         <ForesightChip foresight={row.foresight} />
@@ -439,16 +496,19 @@ function Tile({ label, value, note, tone, active, onClick, title }) {
 
 function StatusLine({ status, updatedAt, breaks }) {
   const dot = status.state === 'live' ? 'var(--ok)' : status.state === 'polling' ? 'var(--warn)'
-    : status.state === 'reconnecting' ? 'var(--warn)' : 'var(--ink-faint)';
+    : status.state === 'reconnecting' ? 'var(--warn)' : status.state === 'rejected' ? 'var(--error)' : 'var(--ink-faint)';
   let text;
   if (status.state === 'live') text = 'live';
   else if (status.state === 'reconnecting') text = `reconnecting in ${Math.round((status.inMs || 0) / 100) / 10} s`;
   else if (status.state === 'polling') text = 'polling every 5 s';
   else if (status.state === 'connecting') text = 'connecting';
+  else if (status.state === 'rejected') text = 'refused';
   else text = status.state;
   const asOf = status.state !== 'live' && updatedAt ? `rows as of ${new Date(updatedAt).toISOString().slice(11, 19)}Z` : null;
   return <span data-testid="live-status" data-state={status.state} role="status" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, fontSize: 12, color: 'var(--ink-muted)', whiteSpace: 'nowrap' }}
-    title={status.state === 'polling' && status.error ? `The stream was refused: ${status.error.what}` : breaks ? `${breaks} reconnect${breaks === 1 ? '' : 's'}, each healed by a fresh snapshot` : undefined}>
+    title={status.state === 'polling' && status.error ? `The stream was refused: ${status.error.what}`
+      : status.state === 'reconnecting' && status.error ? `The connection ended: ${status.error.what}`
+        : breaks ? `${breaks} reconnect${breaks === 1 ? '' : 's'}, each healed by a fresh snapshot` : undefined}>
     <LiveDot color={dot} />
     {text}
     {asOf ? <><span style={{ color: 'var(--ink-faint)' }}>·</span><span>{asOf}</span></> : null}
@@ -473,7 +533,11 @@ export function LiveScreen({ go, params, identity, pushToast }) {
   const live = useLiveRuns(tenantFilter);
   const now = useNow(1000);
   const serverNow = serverNowMs(live.state, now);
-  const held = useHeldProbe(live.state, serverNow);
+  const { held, forget } = useHeldProbe(live.state, serverNow);
+  // Which runs are waiting changes rarely; recomputing the entries only then
+  // keeps the rows' memo good while the clock ticks.
+  const waiting = waitingKeys(live.state.rows, serverNow);
+  const approveAsk = React.useRef(0);
 
   // A tenant is typed, not clicked: it waits for typing to settle before the
   // stream is re-opened under it.
@@ -489,10 +553,16 @@ export function LiveScreen({ go, params, identity, pushToast }) {
     navigate(['live'], Object.fromEntries(next), { replace: true });
   };
 
-  const entries = React.useMemo(() => [...live.state.rows.values()].map((entry) => {
-    const hold = held.get(rowKey(entry.row));
-    return hold && hold.activity === entry.row.last_activity_ns ? { ...entry, held: hold } : entry;
-  }), [live.state.rows, held]);
+  const entries = React.useMemo(() => {
+    const waits = new Set(waiting ? waiting.split('\u0001') : []);
+    return [...live.state.rows.values()].map((entry) => {
+      const key = rowKey(entry.row);
+      const hold = held.get(key);
+      const isHeld = hold && hold.activity === entry.row.last_activity_ns;
+      if (!isHeld && !waits.has(key)) return entry;
+      return { ...entry, ...(isHeld ? { held: hold } : {}), ...(waits.has(key) ? { waiting: true } : {}) };
+    });
+  }, [live.state.rows, held, waiting]);
   const totals = liveTotals(entries, serverNow);
   const agents = agentsOf(entries);
   const shown = sortEntries(entries.filter((entry) => matches(entry, { filter, agent, search }, serverNow)), sort, serverNow);
@@ -511,16 +581,22 @@ export function LiveScreen({ go, params, identity, pushToast }) {
     else if (name === 'approve') {
       // The reset dialog shows the limits in force as placeholders; the live
       // row does not carry them, the verdict does. A held run's verdict is
-      // already in hand.
-      if (entry.held) { setResetting(entry.held.doc); return; }
+      // already in hand. Only the latest click's answer opens the dialog:
+      // two verdicts in flight can land in either order.
+      const ask = ++approveAsk.current;
+      const waitingNote = !entry.held && entry.waiting ? waitingSentence(row) : null;
+      if (entry.held) { setResetting({ doc: entry.held.doc, note: null }); return; }
       api.fuseRun(row.run, tenantParams(row.tenant || '')).then(
-        (doc) => setResetting(doc),
-        () => setResetting({ run: row.run, tenant: row.tenant || '', reasons: row.reasons }),
+        (doc) => { if (ask === approveAsk.current) setResetting({ doc, note: waitingNote }); },
+        () => { if (ask === approveAsk.current) setResetting({ doc: { run: row.run, tenant: row.tenant || '', reasons: row.reasons }, note: waitingNote }); },
       );
     }
   }, [go]);
 
-  const afterControl = (doc, verb) => {
+  const afterControl = (doc, verb, target) => {
+    // What the probe knew about the run is out of date: a reset may have
+    // lifted the hold, a trip replaced it with the guard's own stop.
+    if (target) forget(rowKey({ run: target.run, tenant: target.tenant || '' }));
     if (doc && doc.verdict === 'stop' && verb === 'reset') {
       pushToast({
         status: 'warn', title: 'Reset, and stopped again',
@@ -544,7 +620,12 @@ export function LiveScreen({ go, params, identity, pushToast }) {
     return <ErrorState what={live.status.error?.what || 'The live view was refused.'} next={live.status.error?.next} />;
   }
 
-  const connecting = live.status.state === 'connecting' && !live.updatedAt;
+  // Nothing is said about the runs until a listing has been read in this
+  // scope: before that, "no run is live" would be a guess.
+  const rejected = live.status.state === 'rejected';
+  const connected = live.updatedAt != null && !rejected;
+  const lastFailure = live.status.state === 'reconnecting' ? live.status.error
+    : live.status.state === 'polling' ? live.status.failed : null;
 
   return <ClockContext.Provider value={serverNow}>
     <div style={{ display: 'grid', gap: 12, maxWidth: 1700 }}>
@@ -592,15 +673,21 @@ export function LiveScreen({ go, params, identity, pushToast }) {
         More runs are live than the snapshot holds (256, the most recently changed).{operator ? ' Filter by tenant to narrow it.' : ''}
       </div> : null}
 
-      {connecting ? <Skeleton height={180} /> : null}
-      {!connecting && !entries.length ? <EmptyState message={<span>
+      {rejected ? <ErrorState what={live.status.error?.what || 'The server refused the live view.'}
+        next={tenantFilter ? 'Change the tenant above: the server refused the view under it.' : live.status.error?.next}
+        onRetry={live.retry} /> : null}
+      {!connected && !rejected && lastFailure ? <ErrorState what={`Not connected yet: ${lastFailure.what || 'the server did not answer.'}`}
+        next={'No listing has been read in this scope yet, so this page cannot say whether any run is live. '
+          + (live.status.state === 'reconnecting' ? `Trying again in ${Math.round((live.status.inMs || 0) / 100) / 10} s.` : 'Reading again every five seconds.')} /> : null}
+      {!connected && !rejected && !lastFailure ? <Skeleton height={180} /> : null}
+      {connected && !entries.length ? <EmptyState message={<span>
         No run has had activity in the live window (15 minutes by default, <code>--live-window-seconds</code>). A run
         is live while its spans arrive, or while its agent asks the pre-call check before each step — the SDK
         guards and the Claude Code hook pack do — and it appears here within half a second.
       </span>} /> : null}
-      {!connecting && entries.length && !shown.length ? <EmptyState message="No live run matches this filter." /> : null}
+      {connected && entries.length && !shown.length ? <EmptyState message="No live run matches this filter." /> : null}
 
-      {shown.length ? (narrow
+      {connected && shown.length ? (narrow
         ? <div style={{ display: 'grid', gap: 8 }} aria-label="Live runs">
           {shown.map((entry) => <LiveCard key={rowKey(entry.row)} entry={entry} idle={isQuiet(entry.row, serverNow)}
             operator={operator} writer={writer} onAction={onAction} />)}
@@ -632,8 +719,8 @@ export function LiveScreen({ go, params, identity, pushToast }) {
 
     <NudgeModal target={nudging} onClose={() => setNudging(null)} />
     <TripModal run={tripping} onClose={() => setTripping(null)}
-      onDone={(doc) => { setTripping(null); afterControl(doc, 'trip'); }} />
-    <ResetModal run={resetting} onClose={() => setResetting(null)}
-      onDone={(doc) => { setResetting(null); afterControl(doc, 'reset'); }} />
+      onDone={(doc) => { const target = tripping; setTripping(null); afterControl(doc, 'trip', target); }} />
+    <ResetModal run={resetting ? resetting.doc : null} note={resetting ? resetting.note : null} onClose={() => setResetting(null)}
+      onDone={(doc) => { const target = resetting && resetting.doc; setResetting(null); afterControl(doc, 'reset', target); }} />
   </ClockContext.Provider>;
 }

@@ -31,6 +31,16 @@ export const ROW_CAP = 1000;
 export const IDLE_MS = 30_000;
 /** What the stream's snapshot holds, and what a poll asks for to match it. */
 export const SNAPSHOT_LIMIT = 256;
+/** How long a step a pre-call check named may stay pending — no span since —
+    before the run is shown as waiting rather than as the guard's verdict on
+    its path so far. Longer than an ordinary model call, so a run is not
+    flagged for a step that is merely running. */
+export const WAITING_MS = 10_000;
+/** How long a connection may send nothing at all — not even the heartbeat
+    the server sends after fifteen quiet seconds — before it is taken as dead
+    and replaced. A half-open connection (a laptop that slept, a balancer that
+    failed over without a reset) never ends a read by itself. */
+export const STALL_MS = 40_000;
 
 /** The identity of a live row: a run id is unique within its tenant only. */
 export function rowKey(row) {
@@ -79,17 +89,36 @@ function isRow(row) {
 //
 // `offsetMs` is the estimated server clock minus the client's. The server's
 // timestamps — last activity, a pending step's start — are its own clock,
-// and the stream carries no "now". A `run` frame that moved a run's last
-// activity arrives within about half a second of that activity (200 ms
-// polling plus 250 ms coalescing), so its timestamp is a reading of the
-// server's clock; the estimate follows those readings. Before the first,
-// the clocks are assumed to agree, unless a row's activity is already in
-// the client's future.
+// and nothing it sends carries a "now" (not even a Date header). So the
+// estimate is bounded by what the rows prove:
+//
+// - a run's activity is never in the server's future, so the newest activity
+//   listed is a floor on the server's now;
+// - every run listed is inside the live window by the server's own clock, so
+//   the oldest activity plus the window is a ceiling;
+// - a run whose activity moved since the client last looked moved within
+//   that time, so its activity plus the time since the last look is a
+//   ceiling too — within a poll interval of the truth while runs are busy;
+// - a `run` frame that moved a run's last activity arrives within about half
+//   a second of it (200 ms polling plus 250 ms coalescing), so its timestamp
+//   is itself a reading, which the estimate follows.
+//
+// Before any of that binds, the clocks are assumed to agree. The estimate
+// moves down as readily as up: a server whose clock is behind the browser's
+// must not read every run as long idle, nor age out runs it just listed.
 
 /** Fresh state: nothing held, the server's default window assumed. */
 export function newLiveState() {
-  return { rows: new Map(), windowNs: 900e9, truncated: false, snapshots: 0, offsetMs: null };
+  return { rows: new Map(), windowNs: 900e9, truncated: false, snapshots: 0, offsetMs: null, seenAtMs: null };
 }
+
+/** How recently the client must have looked for a moved row to bound the
+    server's clock: a poll's interval, with room. Past it — a reconnect after
+    a long break — a moved row says too little to lower the estimate. */
+const MOVED_WITHIN_MS = 10_000;
+/** Activity reaches a listing at most this long after it happens (200 ms
+    polling plus 250 ms coalescing, rounded up). */
+const ACTIVITY_LAG_MS = 500;
 
 function sameRow(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
@@ -99,21 +128,37 @@ function sameRow(a, b) {
 export function applySnapshot(state, snapshot, nowMs) {
   const rows = new Map();
   const first = state.snapshots === 0 && state.rows.size === 0;
-  let offset = state.offsetMs;
+  const windowNs = snapshot.windowNs || state.windowNs;
+  const recent = state.seenAtMs != null && nowMs - state.seenAtMs <= MOVED_WITHIN_MS;
+  let floor = -Infinity;
+  let ceiling = Infinity;
   for (const row of snapshot.runs) {
     const key = rowKey(row);
     const old = state.rows.get(key);
     rows.set(key, old && sameRow(old.row, row) ? old : { row, flashAt: first ? 0 : nowMs });
-    // Activity in the client's future proves the server's clock is ahead.
-    const ahead = activityMs(row) - nowMs;
-    if (ahead > 0 && (offset == null || ahead > offset)) offset = ahead;
+    const at = activityMs(row);
+    if (!at) continue;
+    floor = Math.max(floor, at - nowMs);
+    ceiling = Math.min(ceiling, at + windowNs / 1e6 - nowMs);
+    if (recent && (!old || at > activityMs(old.row))) {
+      ceiling = Math.min(ceiling, at - nowMs + (nowMs - state.seenAtMs) + ACTIVITY_LAG_MS);
+    }
+  }
+  let offset = state.offsetMs;
+  if (Number.isFinite(floor) || Number.isFinite(ceiling)) {
+    let estimate = offset == null ? 0 : offset;
+    if (estimate > ceiling) estimate = ceiling;
+    // The floor wins a conflict: activity really is never in the future.
+    if (estimate < floor) estimate = floor;
+    if (offset != null || estimate !== 0) offset = estimate;
   }
   return {
     rows: capRows(rows),
-    windowNs: snapshot.windowNs || state.windowNs,
+    windowNs,
     truncated: snapshot.truncated,
     snapshots: state.snapshots + 1,
     offsetMs: offset,
+    seenAtMs: nowMs,
   };
 }
 
@@ -130,7 +175,7 @@ export function applyRun(state, row, nowMs) {
     const reading = activityMs(row) - nowMs;
     offset = offset == null ? reading : offset * 0.5 + reading * 0.5;
   }
-  return { ...state, rows: capRows(rows), offsetMs: offset };
+  return { ...state, rows: capRows(rows), offsetMs: offset, seenAtMs: nowMs };
 }
 
 function activityMs(row) {
@@ -176,27 +221,79 @@ export function isQuiet(row, serverNow) {
   return idleMs(row, serverNow) > IDLE_MS && !(row.current && row.current.pending);
 }
 
-/** Milliseconds the current step has been running (or pending). A pending
-    step's start is the server's clock; a recorded step's is the span's. */
+/** Milliseconds a pending step has been waiting since the check that named
+    it (the server's clock), or null when the current step is not pending.
+
+    A recorded step has already ended — spans arrive when they end — so it
+    has no running time; how long ago its span arrived is `idleMs`. */
 export function stepElapsedMs(row, serverNow) {
-  const start = row.current && typeof row.current.started_ns === 'number' ? row.current.started_ns / 1e6 : null;
-  return start == null ? null : Math.max(0, serverNow - start);
+  const current = row.current;
+  if (!current || !current.pending || typeof current.started_ns !== 'number') return null;
+  return Math.max(0, serverNow - current.started_ns / 1e6);
+}
+
+/** Whether a run asked the pre-call check about its next step at least
+    `WAITING_MS` ago and has recorded nothing since.
+
+    The listing's verdict judges the path so far. The check judged the path
+    with that step added — the tool it named, the cost it estimated, a block
+    nudge queued for it — and its answer is not in the listing. A run in this
+    state is either running a long step or was refused it; the page cannot
+    tell which, so it says neither "continue" nor "stopped". */
+export function isWaiting(row, serverNow) {
+  const elapsed = stepElapsedMs(row, serverNow);
+  return elapsed != null && elapsed >= WAITING_MS;
+}
+
+/** The keys of the runs waiting now, as one string: a value that changes
+    only when a run starts or stops waiting, so the rows need not re-render
+    every tick of the clock to find out. */
+export function waitingKeys(rows, serverNow) {
+  const keys = [];
+  for (const [key, entry] of rows) if (isWaiting(entry.row, serverNow)) keys.push(key);
+  return keys.sort().join('\u0001');
+}
+
+/** The runs to ask the verdict route about this round: runs whose named
+    step has been pending at least `afterMs`, not stopped by the guard
+    already, and not asked within `ttlMs` of the same activity. Runs never
+    asked come first, then the ones asked longest ago; within each, the one
+    that has waited longest first. At most `batch`. */
+export function probeCandidates(rows, asked, serverNow, nowMs, { afterMs, ttlMs, batch }) {
+  const candidates = [];
+  for (const [key, entry] of rows) {
+    const row = entry.row;
+    if (row.verdict === 'stop') continue;
+    const elapsed = stepElapsedMs(row, serverNow);
+    if (elapsed == null || elapsed < afterMs) continue;
+    const last = asked.get(key);
+    if (last && last.activity === row.last_activity_ns && nowMs - last.at < ttlMs) continue;
+    candidates.push({ key, row, elapsed, lastAt: last ? last.at : -Infinity });
+  }
+  candidates.sort((a, b) => a.lastAt - b.lastAt || b.elapsed - a.elapsed || (a.key < b.key ? -1 : 1));
+  return candidates.slice(0, batch).map(({ key, row }) => ({ key, row }));
 }
 
 // ------------------------------------------------------------- reading rows
 
-/** The guard's verdict as the screen shows it: a run held by a predictive
-    stop (found by a verdict read; the listing is from memory and never
-    carries one) counts as stopped. */
+/** The guard's verdict as the screen shows it. `stop` is the guard's own.
+    `held` is a stop the verdict route found for the path so far — a
+    predictive stop, which the listing (from memory) never carries.
+    `waiting` is a run that asked about its next step a while ago and has
+    recorded nothing since (`entry.waiting`, from `isWaiting`): the check's
+    answer for that step is not in the listing, so the listing's `continue`
+    would claim more than the page knows. */
 export function guardState(entry) {
   if (entry.row.verdict === 'stop') return 'stop';
   if (entry.held) return 'held';
+  if (entry.waiting) return 'waiting';
   return entry.row.verdict || 'continue';
 }
 
 /** How urgently a run wants a person, lowest first: stopped or held, then
-    foresight's likely failures and at-risk runs, guard warnings, novel
-    paths, runs with nudges waiting, then everything else. */
+    foresight's likely failures and at-risk runs, guard warnings, runs
+    waiting on a step they asked about, novel paths, runs with nudges
+    waiting, then everything else. */
 export function riskRank(entry) {
   const row = entry.row;
   if (row.verdict === 'stop' || entry.held) return 0;
@@ -204,14 +301,15 @@ export function riskRank(entry) {
   if (verdict === 'likely_failure') return 1;
   if (verdict === 'at_risk') return 2;
   if (row.verdict === 'warn') return 3;
-  if (verdict === 'novel') return 4;
-  if (row.pending_nudges > 0) return 5;
-  return 6;
+  if (entry.waiting) return 4;
+  if (verdict === 'novel') return 5;
+  if (row.pending_nudges > 0) return 6;
+  return 7;
 }
 
 /** Whether a run is in one of the states someone should look at. */
 export function needsAttention(entry) {
-  return riskRank(entry) <= 4;
+  return riskRank(entry) <= 5;
 }
 
 export const SORTS = [
@@ -390,34 +488,50 @@ const defaultSleep = (ms) => new Promise((done) => setTimeout(done, ms));
     change until the credential does), `missing` (404: a server that
     predates the live view), `disabled` (409 from a store started with
     --no-fuses), `refused` (409: every stream slot of the scope is taken —
-    poll instead), or `broken` (anything else: reconnect). */
+    poll instead), `rejected` (any other 4xx but 408 and 429: the request
+    itself is wrong — a tenant typed into the filter that is not a tenant
+    name — and asking again will not change the answer), or `broken`
+    (anything else, a 5xx or no answer at all: reconnect). */
 export function classifyFailure(error) {
   const status = error && error.status;
   if (status === 401 || status === 403) return 'denied';
   if (status === 404) return 'missing';
   if (status === 409) return /fuses/.test((error && error.what) || '') && /disabled/.test(error.what || '') ? 'disabled' : 'refused';
+  if (status >= 400 && status < 500 && status !== 408 && status !== 429) return 'rejected';
   return 'broken';
 }
 
+/** Failures after which the runner stops for good. */
+const TERMINAL = new Set(['denied', 'disabled', 'missing', 'rejected']);
+
 /** Follows the live view until `signal` aborts.
 
-    `open(params)` resolves an async iterable of text chunks (the stream);
-    `poll(params)` resolves a `GET /v1/runs/live` document. Both are
-    injected, so a test drives this with generators rather than sockets.
+    `open(params, signal)` resolves an async iterable of text chunks (the
+    stream), and should stop reading when `signal` aborts; `poll(params)`
+    resolves a `GET /v1/runs/live` document. Both are injected, so a test
+    drives this with generators rather than sockets.
 
     `onSnapshot(snapshot, {source})` replaces everything; `onRun(row)`
     upserts one row; `onStatus({state, …})` reports `live`, `reconnecting`
-    (with `inMs`), `polling` (with the refusal), `disabled`, `missing` or
-    `denied`.
+    (with `inMs`, and the `error` that ended the last connection when one
+    did), `polling` (with the refusal, and `failed` when the last read
+    failed), or — for good — `disabled`, `missing`, `denied` or `rejected`
+    (with the server's `error`).
 
     Backoff resets on progress — a frame, the heartbeat included — never on
     a connection merely being accepted, for the reason lib/tail.js gives: a
     server that accepts and at once closes must not be reconnected to every
-    half second forever. */
+    half second forever.
+
+    A connection that sends nothing for `stallMs` (`STALL_MS`) is aborted and
+    replaced like any broken one: the server's heartbeat comes after fifteen
+    quiet seconds, so silence that long means the connection is gone even
+    though no read has said so. */
 export async function runLiveStream(options) {
   const {
     open, poll, params = {}, onSnapshot, onRun, onStatus = () => {}, signal,
-    sleep = defaultSleep, now = Date.now,
+    sleep = defaultSleep, now = Date.now, stallMs = STALL_MS,
+    setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = (id) => clearTimeout(id),
   } = options;
   const aborted = () => Boolean(signal && signal.aborted);
   let attempt = 0;
@@ -438,43 +552,81 @@ export async function runLiveStream(options) {
       } catch (error) {
         if (aborted()) return;
         const kind = classifyFailure(error);
-        if (kind === 'denied' || kind === 'disabled' || kind === 'missing') { onStatus({ state: kind, error }); return; }
+        if (TERMINAL.has(kind)) { onStatus({ state: kind, error }); return; }
+        onStatus({ state: 'polling', error: refusal, failed: error });
       }
       await sleep(LIVE_POLL_MS);
       continue;
     }
 
+    let failure = null;
+    // Each connection has its own controller, so the watchdog can let one go
+    // without ending the whole follow.
+    const connection = new AbortController();
+    const onAbort = () => connection.abort();
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    let timer = null;
+    let fire = () => {};
+    const stall = new Promise((_, reject) => { fire = reject; });
+    stall.catch(() => {});
+    const arm = () => {
+      if (timer != null) clearTimer(timer);
+      timer = setTimer(() => {
+        fire(Object.assign(new Error('stalled'), {
+          status: 0,
+          what: `The stream sent nothing for ${Math.round(stallMs / 1000)} s, not even its heartbeat, so the connection was taken as dead.`,
+        }));
+        connection.abort();
+      }, stallMs);
+    };
     try {
-      const chunks = await open(params);
+      arm();
+      const chunks = await Promise.race([open(params, connection.signal), stall]);
+      const iterator = chunks[Symbol.asyncIterator]();
       const framer = createFramer();
-      for await (const chunk of chunks) {
-        if (aborted()) return;
-        for (const raw of framer(chunk)) {
-          attempt = 0;
-          const frame = parseLiveFrame(raw);
-          if (!frame) continue;
-          if (frame.type === 'snapshot') {
-            onSnapshot(frame, { source: 'stream' });
-            onStatus({ state: 'live' });
-          } else if (frame.type === 'run') {
-            onRun(frame.row);
+      try {
+        for (;;) {
+          // Raced with the watchdog: a read on a half-open socket never ends.
+          const next = await Promise.race([iterator.next(), stall]);
+          if (aborted()) return;
+          if (next.done) break;
+          arm();
+          for (const raw of framer(next.value)) {
+            attempt = 0;
+            const frame = parseLiveFrame(raw);
+            if (!frame) continue;
+            if (frame.type === 'snapshot') {
+              onSnapshot(frame, { source: 'stream' });
+              onStatus({ state: 'live' });
+            } else if (frame.type === 'run') {
+              onRun(frame.row);
+            }
           }
         }
+      } finally {
+        // Not awaited: a read still pending on a dead socket would hold the
+        // return until it ends, which is never.
+        if (typeof iterator.return === 'function') Promise.resolve(iterator.return()).catch(() => {});
       }
     } catch (error) {
       if (aborted()) return;
       const kind = classifyFailure(error);
-      if (kind === 'denied' || kind === 'disabled' || kind === 'missing') { onStatus({ state: kind, error }); return; }
+      if (TERMINAL.has(kind)) { onStatus({ state: kind, error }); return; }
       if (kind === 'refused') {
         refusal = error;
         pollUntil = now() + STREAM_RETRY_MS;
         onStatus({ state: 'polling', error });
         continue;
       }
+      failure = error;
+    } finally {
+      if (timer != null) clearTimer(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      connection.abort();
     }
     if (aborted()) return;
     const wait = backoffMs(attempt);
-    onStatus({ state: 'reconnecting', inMs: wait });
+    onStatus(failure ? { state: 'reconnecting', inMs: wait, error: failure } : { state: 'reconnecting', inMs: wait });
     await sleep(wait);
     attempt += 1;
   }

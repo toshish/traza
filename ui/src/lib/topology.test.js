@@ -6,6 +6,10 @@
 import { describe, it, expect } from 'vitest';
 import pingPong from '../test/fixtures/topology_pingpong.json';
 import single from '../test/fixtures/topology_single.json';
+// A supervisor handing a ticket to three workers in turn (supervisor,
+// refunds, supervisor, shipping, supervisor, billing, supervisor), posted to
+// a 0.28.0 server and its topology read back.
+import fanout from '../test/fixtures/topology_fanout.json';
 import { cyclePairs, layoutTopology, nodeLabel, sequenceStrip, worthDrawing } from './topology.js';
 
 describe('the ping-pong run', () => {
@@ -78,5 +82,25 @@ describe('a swarm', () => {
   it('cuts a long agent name, and keeps it whole in the data', () => {
     expect(nodeLabel('a-very-long-agent-name-indeed')).toBe('a-very-long-age…');
     expect(nodeLabel('triage')).toBe('triage');
+  });
+});
+
+describe('a supervisor fanning out', () => {
+  it('is not ping-pong: each worker hands back once, and no worker ever gets control straight back', () => {
+    const pairs = cyclePairs(fanout);
+    expect(pairs.map((pair) => pair.agents[1]).sort()).toEqual(['billing', 'refunds', 'shipping']);
+    expect(pairs.every((pair) => pair.pingPong === false)).toBe(true);
+    const layout = layoutTopology(fanout, { width: 400, height: 200 });
+    expect(layout.edges.filter((e) => e.kind === 'handoff')).toHaveLength(fanout.handoffs.length);
+    expect(layout.edges.some((e) => e.cycle)).toBe(false);
+  });
+
+  it('calls a pair ping-pong once control has come back both ways, or twice one way', () => {
+    expect(cyclePairs(pingPong)[0].pingPong).toBe(true);
+    // a, b, a, b: one return each way.
+    expect(cyclePairs({ cycles: [{ agents: ['a', 'b'], count: 1 }, { agents: ['b', 'a'], count: 1 }] })[0].pingPong).toBe(true);
+    // s, w, s, w, s: twice back to s, as max_handoff_cycles 2 counts it.
+    expect(cyclePairs({ cycles: [{ agents: ['s', 'w'], count: 2 }, { agents: ['w', 's'], count: 1 }] })[0].pingPong).toBe(true);
+    expect(cyclePairs({ cycles: [{ agents: ['s', 'w'], count: 1 }] })[0].pingPong).toBe(false);
   });
 });

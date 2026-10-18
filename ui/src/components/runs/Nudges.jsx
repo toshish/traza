@@ -21,12 +21,25 @@ import { ForesightBar, ForesightChip } from './Foresight.jsx';
 const POLL_PENDING_MS = 1500;
 
 /** A run's nudges, re-read while any is pending (and `poll` is on), so a
-    delivery shows up without anyone pressing anything. */
-export function useNudges(run, tenant, { enabled = true, poll = true } = {}) {
+    delivery shows up without anyone pressing anything — and, with `follow`
+    naming a nudge, until that one is delivered or expired, whether or not
+    the last read listed it.
+
+    A read that fails keeps the last list it had (`error` says the refresh
+    failed): one dropped connection must neither blank the history nor stop
+    the polling that would see the delivery. */
+export function useNudges(run, tenant, { enabled = true, poll = true, follow = null } = {}) {
   const read = useRead((signal) => api.nudges(run, tenantParams(tenant), signal), [run, tenant], { skip: !enabled });
-  const pending = (read.data?.nudges || []).some((nudge) => nudge.status === 'pending');
-  usePoll(read.reload, POLL_PENDING_MS, enabled && poll && pending);
-  return read;
+  const kept = React.useRef({ scope: null, data: null });
+  const scope = enabled ? `${run}\u0000${tenant === undefined ? '\u0001' : tenant}` : null;
+  if (kept.current.scope !== scope) kept.current = { scope, data: null };
+  if (read.data) kept.current.data = read.data;
+  const data = read.data || kept.current.data;
+  const nudges = (data && data.nudges) || [];
+  const pending = nudges.some((nudge) => nudge.status === 'pending');
+  const settled = !follow || nudges.some((nudge) => nudge.id === follow && nudge.status !== 'pending');
+  usePoll(read.reload, POLL_PENDING_MS, enabled && poll && (pending || !settled));
+  return { ...read, data };
 }
 
 /** Whether an error says the store runs with --no-fuses. */
@@ -113,12 +126,16 @@ export function NudgeModal({ target, onClose, onSent }) {
   const [error, setError] = React.useState(null);
   const [sent, setSent] = React.useState(null);
   const [touched, setTouched] = React.useState(false);
+  // Held in a ref as well as in state: two presses of Cmd+Enter in one tick
+  // both see the state from before the first, and would queue the nudge twice.
+  const sending = React.useRef(false);
 
   React.useEffect(() => {
     setKind('advice'); setMessage(''); setTtl('3600'); setBusy(false); setError(null); setSent(null); setTouched(false);
+    sending.current = false;
   }, [run, tenant, open]);
 
-  const history = useNudges(run || '', tenant, { enabled: open });
+  const history = useNudges(run || '', tenant, { enabled: open, follow: sent ? sent.id : null });
   const fate = useRead((signal) => api.fateRun(run, tenantParams(tenant), signal).catch(() => null),
     [run, tenant], { skip: !open || !target?.foresight || target.foresight.verdict === 'insufficient_history' });
 
@@ -129,8 +146,10 @@ export function NudgeModal({ target, onClose, onSent }) {
   const latest = sent ? nudges.find((n) => n.id === sent.id) || sent : null;
 
   const send = async () => {
+    if (sending.current) return;
     setTouched(true);
     if (problem) return;
+    sending.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -143,7 +162,7 @@ export function NudgeModal({ target, onClose, onSent }) {
       onSent?.(doc);
     } catch (e) {
       setError(e);
-    } finally { setBusy(false); }
+    } finally { sending.current = false; setBusy(false); }
   };
 
   return <Modal open title={`Nudge ${run}`} width={640} onClose={onClose} footer={<>

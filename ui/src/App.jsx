@@ -306,8 +306,18 @@ export function App() {
   // the secret would otherwise appear over another credential's session,
   // with an offer to adopt it. Adopting the first token is the one switch
   // the display follows, so it moves to the new generation explicitly.
+  //
+  // Except the first mint on an open store: that answer closed the store and
+  // is its only admin credential, so dropping it would lock everyone out
+  // until a recovery on the server. An open store had no credential to keep
+  // it from — anyone who could reach the page could mint — so it is shown
+  // under the credential the tab holds now, not adopted, and marked as what
+  // closed the store.
   const onMinted = (doc, { adopt = false, asked = credentialGeneration() } = {}) => {
-    if (asked !== credentialGeneration()) return;
+    if (asked !== credentialGeneration()) {
+      if (adopt) setMinted({ doc: { ...doc, closedStore: true }, generation: credentialGeneration() });
+      return;
+    }
     if (adopt) {
       changeToken(doc.token);
       setMinted({ doc: { ...doc, adopted: true }, generation: credentialGeneration() });

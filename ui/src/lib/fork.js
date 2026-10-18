@@ -8,7 +8,7 @@
 // model; the editor's job is to build the request precisely and say what
 // happens next, in the words the server's own refusals use.
 
-import { pyLiteral, replayEnv } from './runs.js';
+import { pyLiteral } from './runs.js';
 
 /** What a step's answer editor opens with: the recorded answer, as text
     when it is plain text, else as the JSON it was recorded as.
@@ -82,21 +82,48 @@ export function buildForkRequest({ run, tenant, step, change, kind, format, text
 }
 
 /** The environment a harness of your own runs a fork under: the replay's
-    base URLs and keys (as for any replay — the token is never printed), and
-    the four values its spans must carry so the fork is found again: its own
-    session id and the `traza.fork.*` attributes. */
+    base URLs and its key, and the four values the forked run's spans must
+    carry so the fork is found again — its own session id and the
+    `traza.fork.*` attributes.
+
+    Every value is stored or server-made text, so each is written as a shell
+    word that cannot end its line (`shellLine`): a run id is telemetry, and
+    one holding a newline must not become a command when the block is pasted
+    into a terminal. The comment lines name variables, never stored text.
+
+    The key is not the Traza token. A fork's live half talks to the real
+    provider, and a harness that swaps only the base URL at the live point —
+    or a library that reads the key but ignores the base URL — would send it
+    there. `TRAZA_REPLAY_KEY` is the replay key the clients' test runners use
+    (docs/guide/fork.md, "The agent's key"): a `ro` credential bound to the
+    run's tenant, which the shell refuses to expand when unset. */
 export function forkEnv(replay, base, auth) {
   const fork = replay.fork || {};
-  const lines = [replayEnv(replay, base, auth)];
+  const open = auth === 'open';
+  const key = open
+    ? 'unused  # an open server accepts any non-empty key'
+    : '"${TRAZA_REPLAY_KEY:?a ro credential bound to the run tenant}"';
+  const lines = [];
+  if (!open) {
+    lines.push(
+      "# The replay's key is TRAZA_REPLAY_KEY: a ro credential bound to the run's tenant. Never the real",
+      '# provider key, and never an operator token, which reads every tenant. At the live point the',
+      "# harness must swap both the base URL and the key to the real provider's.",
+    );
+  }
   lines.push(
+    `export OPENAI_BASE_URL=${shellLine(base + replay.base_urls.openai)}`,
+    `export OPENAI_API_KEY=${key}`,
+    `export ANTHROPIC_BASE_URL=${shellLine(base + replay.base_urls.anthropic)}`,
+    `export ANTHROPIC_API_KEY=${key}`,
     '# Give the forked run its own session id, and stamp these on every span:',
-    `#   traza.fork.parent=${fork.parent}  traza.fork.step=${fork.step}  traza.fork.id=${fork.id}`,
-    `export TRAZA_FORK_ID=${fork.id}`,
-    `export TRAZA_FORK_PARENT=${shellWord(fork.parent || '')}`,
-    `export TRAZA_FORK_STEP=${fork.step}`,
-    `export TRAZA_FORK_RUN=${fork.id}`,
+    '#   traza.fork.parent=$TRAZA_FORK_PARENT  traza.fork.step=$TRAZA_FORK_STEP  traza.fork.id=$TRAZA_FORK_ID',
+    `export TRAZA_FORK_ID=${shellLine(fork.id || '')}`,
+    `export TRAZA_FORK_PARENT=${shellLine(fork.parent || '')}`,
+    `export TRAZA_FORK_STEP=${shellLine(fork.step == null ? '' : String(fork.step))}`,
+    `export TRAZA_FORK_RUN=${shellLine(fork.id || '')}`,
   );
-  if (fork.live_after != null) {
+  if (Number.isInteger(fork.live_after)) {
     lines.push(`# Past step ${fork.live_after} every model call answers 409 replay_live: send it, and every later one, to the real provider.`);
   }
   return lines.join('\n');
@@ -104,27 +131,43 @@ export function forkEnv(replay, base, auth) {
 
 /** The same fork from Python, where `traza.fork` does the switching and the
     span tagging. It makes a fork of its own with the same edit — the replay
-    above is for a harness that does those itself. */
-export function forkPython({ run, step, change, kind, value, live, mode }) {
+    above is for a harness that does those itself. A known `tenant` is named
+    on the client (`''`, the default tenant, included): without it an
+    unbound credential's fork would fork the default tenant's run of that id. */
+export function forkPython({ run, tenant, step, change, kind, value, live, mode }) {
   const args = [JSON.stringify(run), `at_step=${step}`];
   if (change !== 'rewind') {
     args.push(`${kind === 'llm' ? 'response' : 'tool_result'}=${pyLiteral(value)}`);
     if (!live) args.push('live=False');
   }
   if (mode === 'loose') args.push('mode="loose"');
+  const named = typeof tenant === 'string';
+  const head = named
+    ? [
+      'import os',
+      'import traza',
+      '',
+      'client = traza.Client(os.environ.get("TRAZA_URL", "http://127.0.0.1:8080"), token=os.environ.get("TRAZA_TOKEN"),',
+      `                      tenant=${pyLiteral(tenant)})  # the run's tenant`,
+      `with client.fork(${args.join(', ')}) as fork:`,
+    ]
+    : ['import traza', '', `with traza.fork(${args.join(', ')}) as fork:`];
   return [
-    'import traza',
-    '',
-    `with traza.fork(${args.join(', ')}) as fork:`,
+    ...head,
     '    run_agent()  # build the OpenAI / Anthropic client inside the block',
     'print(fork.id, fork.final_status.fork.live_calls)',
     'print(fork.diff().first_divergence.explanation)',
   ].join('\n');
 }
 
-/** The same fork as one shell command, around any agent command. */
-export function forkCli({ run, step, change, kind, value, live, format }) {
-  const parts = ['traza fork', shellWord(run), '--at', String(step)];
+/** The same fork as one shell command, around any agent command — or null
+    for a loose fork, which `traza fork` cannot make (it has no mode
+    option, and would make a strict one). */
+export function forkCli({ run, tenant, step, change, kind, value, live, format, mode }) {
+  if (mode === 'loose') return null;
+  const parts = ['traza fork', shellLine(run)];
+  if (typeof tenant === 'string') parts.push('--tenant', shellWord(tenant));
+  parts.push('--at', String(step));
   if (change !== 'rewind') {
     if (kind === 'llm') {
       if (format === 'text' && typeof value === 'string') parts.push('--response', shellWord(value));
@@ -144,6 +187,20 @@ export function shellWord(text) {
   const value = String(text);
   if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
   return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
+/** A shell word that stays on its line: `shellWord`, unless the text holds a
+    control character — a newline in a stored run id — when it is written
+    ANSI-C quoted (`$'…'`, which bash, zsh and ksh read), so the value is
+    still exact but can neither end the line nor start a command. */
+export function shellLine(text) {
+  const value = String(text);
+  // eslint-disable-next-line no-control-regex
+  if (!/[\u0000-\u001f\u007f]/.test(value)) return shellWord(value);
+  const named = { '\n': '\\n', '\r': '\\r', '\t': '\\t' };
+  // eslint-disable-next-line no-control-regex
+  return "$'" + value.replace(/[\\']/g, (c) => '\\' + c).replace(/[\u0000-\u001f\u007f]/g,
+    (c) => named[c] || '\\x' + c.charCodeAt(0).toString(16).padStart(2, '0')) + "'";
 }
 
 /** One fork of the listing, read for display: how it ended against its

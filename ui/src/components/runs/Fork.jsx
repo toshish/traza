@@ -1,7 +1,7 @@
 import React from 'react';
 import { api } from '../../lib/api.js';
 import { publicBase } from '../../lib/base.js';
-import { useRead } from '../../lib/route.js';
+import { hashFor, useRead } from '../../lib/route.js';
 import { fmtDurationNs, fmtNum, fmtTimeNs } from '../../lib/format.js';
 import { fmtMoney, tenantParams } from '../../lib/runs.js';
 import {
@@ -184,7 +184,11 @@ function ForkCreated({ created, identity, status, onCheck, error }) {
         Or let the Python client do the switching and the tagging — it makes a fork of its own with the same edit:
       </div>
       <CodeBlock language="python" code={forkPython(request)} />
-      <div style={{ marginTop: 6 }}><CodeBlock language="sh" code={forkCli(request)} /></div>
+      {forkCli(request) != null
+        ? <div style={{ marginTop: 6 }}><CodeBlock language="sh" code={forkCli(request)} /></div>
+        : <div style={{ marginTop: 6, fontSize: 12, color: 'var(--ink-muted)' }}>
+          The <code>traza fork</code> command has no matching option, so it cannot make a loose fork; the Python client can.
+        </div>}
     </div>
     <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', fontSize: 12, color: 'var(--ink-muted)' }}>
       <Chip onClick={onCheck}>What has it served?</Chip>
@@ -219,11 +223,11 @@ export function ForksCard({ run, tenant, go, nonce = 0 }) {
         border: '1px solid var(--hairline)', borderRadius: 'var(--radius-card)', padding: '8px 10px', display: 'grid', gap: 5,
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <a href={'#/run/' + encodeURIComponent(fork.run)} title={fork.run} onClick={(e) => { e.preventDefault(); go(['run', fork.run], tenantParams(fork.tenant)); }}
+          <a href={hashFor(['run', fork.run], tenantParams(fork.tenant))} title={fork.run} onClick={(e) => { e.preventDefault(); go(['run', fork.run], tenantParams(fork.tenant)); }}
             style={{ fontFamily: 'var(--font-mono)', fontSize: 12, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'inline-block' }}>{fork.run}</a>
           {fork.step != null ? <span style={{ fontSize: 12, color: 'var(--ink-muted)' }}>cut at step <Mono>{fork.step}</Mono></span> : null}
           {fork.outcome ? <Tag status={OUTCOME_TAG[fork.outcome] || 'neutral'} mono>{fork.outcome}</Tag> : null}
-          {fork.diffed ? <a href="#/diff" onClick={(e) => { e.preventDefault(); go(['diff'], { a: run, b: fork.run, ...tenantParams(fork.tenant) }); }}
+          {fork.diffed ? <a href={hashFor(['diff'], { a: run, b: fork.run, ...tenantParams(fork.tenant) })} onClick={(e) => { e.preventDefault(); go(['diff'], { a: run, b: fork.run, ...tenantParams(fork.tenant) }); }}
             style={{ marginLeft: 'auto', fontSize: 12 }}>diff against the parent</a> : null}
         </div>
         {fork.diffed ? <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12, color: 'var(--ink-muted)' }}>

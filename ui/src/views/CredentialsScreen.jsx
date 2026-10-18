@@ -187,7 +187,9 @@ function CredentialTable({ credentials, self, onRevoke }) {
 }
 
 /** A minted token, shown once. `doc.adopted` marks the first token on an
-    open store, which this tab switched to when it was minted. */
+    open store, which this tab switched to when it was minted;
+    `doc.closedStore` marks one that closed an open store while the tab had
+    switched to another token, so it was not adopted. */
 export function TokenOnce({ doc, onClose, onUse }) {
   if (!doc) return null;
   return <Modal open title="Credential minted" width={600} onClose={onClose} footer={<>
@@ -202,6 +204,11 @@ export function TokenOnce({ doc, onClose, onUse }) {
         {doc.adopted ? <> The store was open until now, so this tab has switched to this token to keep
           working; it stays in this tab's session storage only.</> : null}
       </div>
+      {doc.closedStore ? <div role="alert" style={{ color: 'var(--ink)', lineHeight: '19px', padding: '8px 10px', border: '1px solid var(--warn)', background: 'var(--warn-tint)', borderRadius: 'var(--radius-card)' }}>
+        Minting this credential closed the store: it was open, and this is now its only admin credential. The tab
+        switched to another token before the answer arrived, so it has not switched to this one. Use it in this tab,
+        or keep it somewhere safe now — without it, reopening the store needs a recovery on the server.
+      </div> : null}
       <div data-testid="minted-token" style={{
         display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', background: 'var(--bg-sunken)',
         border: '1px solid var(--hairline)', borderRadius: 'var(--radius-control)', minWidth: 0,

@@ -12,9 +12,10 @@ import listing from '../test/fixtures/live_runs.json';
 import noHistory from '../test/fixtures/live_row_no_history.json';
 import { createFramer } from './tail.js';
 import {
-  IDLE_MS, LIVE_POLL_MS, ROW_CAP, STREAM_RETRY_MS, ageOut, agentsOf, applyRun, applySnapshot, classifyFailure,
-  deliveryWaitMs, fmtInterval, fmtPct, foresightMarks, foresightSentence, guardState, isQuiet, liveTotals, matches,
-  newLiveState, nudgeProblem, parseLiveFrame, riskRank, rowKey, runLiveStream, serverNowMs, sortEntries, utf8Bytes,
+  IDLE_MS, LIVE_POLL_MS, ROW_CAP, STALL_MS, STREAM_RETRY_MS, WAITING_MS, ageOut, agentsOf, applyRun, applySnapshot,
+  classifyFailure, deliveryWaitMs, fmtInterval, fmtPct, foresightMarks, foresightSentence, guardState, isQuiet,
+  isWaiting, liveTotals, matches, needsAttention, newLiveState, nudgeProblem, parseLiveFrame, probeCandidates,
+  riskRank, rowKey, runLiveStream, serverNowMs, sortEntries, utf8Bytes,
 } from './live.js';
 
 const frames = () => createFramer()(streamText).map(parseLiveFrame).filter(Boolean);
@@ -110,7 +111,7 @@ describe('what the screen states about a run', () => {
   it('ranks a stopped run, then foresight\'s likely failures, then the ordinary', () => {
     expect(riskRank(entry('conv-82febb'))).toBe(0); // the guard stopped it
     expect(riskRank(entry('tkt-4162'))).toBe(1); // likely failure
-    expect(riskRank(entry('tkt-4173'))).toBe(6); // on track
+    expect(riskRank(entry('tkt-4173'))).toBe(7); // on track: the last rank
     expect(riskRank(entry('tkt-4173', { held: { doc: { verdict: 'stop' } } }))).toBe(0);
   });
 
@@ -287,5 +288,200 @@ describe('following the stream', () => {
       expect(statuses).toEqual([state]);
     }
     expect(classifyFailure(failing(503, 'busy'))).toBe('broken');
+  });
+});
+
+
+// ------------------------------------------------------------ review fixes
+
+describe('a step asked about and not taken', () => {
+  // tkt-4162 asked to run search_orders 58 s before the capture, and no span
+  // has arrived since: the listing says continue for the path so far, but
+  // the check's answer for the step itself is not in the listing.
+  const asked = byRun('tkt-4162');
+  const askedAt = asked.current.started_ns / 1e6;
+
+  it('stops being called continue once the step has been pending a while', () => {
+    expect(isWaiting(asked, askedAt + WAITING_MS - 1)).toBe(false);
+    expect(isWaiting(asked, askedAt + WAITING_MS)).toBe(true);
+    expect(guardState({ row: asked, waiting: true })).toBe('waiting');
+    // A recorded step never waits, however old.
+    expect(isWaiting(byRun('tkt-4173'), CAPTURE_MS + 3_600_000)).toBe(false);
+    // A stop the verdict read found for the path so far is still held, and
+    // the guard's own stop is still stop.
+    expect(guardState({ row: asked, waiting: true, held: { doc: { verdict: 'stop' } } })).toBe('held');
+    expect(guardState({ row: byRun('conv-82febb'), waiting: true })).toBe('stop');
+  });
+
+  it('ranks a waiting run for attention, after the guard\'s warnings and before novel paths', () => {
+    const onTrack = { row: byRun('tkt-4174'), flashAt: 0 };
+    expect(needsAttention(onTrack)).toBe(false);
+    const waiting = { ...onTrack, waiting: true };
+    expect(needsAttention(waiting)).toBe(true);
+    expect(riskRank(waiting)).toBeGreaterThan(riskRank({ row: { ...byRun('tkt-4174'), verdict: 'warn' } }));
+    expect(riskRank(waiting)).toBeLessThan(riskRank({ row: byRun('conv-c36f2e') }));
+    // Not a stop: the stopped filter leaves it out, the attention filter keeps it.
+    expect(matches(waiting, { filter: 'stopped' }, CAPTURE_MS)).toBe(false);
+    expect(matches(waiting, { filter: 'attention' }, CAPTURE_MS)).toBe(true);
+  });
+
+  it('asks about the runs never asked first, the longest pending first, and each at most once per answer\'s life', () => {
+    const rows = new Map(listing.runs.map((row) => [rowKey(row), { row, flashAt: 0 }]));
+    const now = CAPTURE_MS + 5000;
+    const opts = { afterMs: 4000, ttlMs: 10_000, batch: 4 };
+    const names = (asked, nowMs = 1e6) => probeCandidates(rows, asked, now, nowMs, opts).map((c) => c.row.run);
+    // The guard's stops are not asked about; tkt-4162 has waited longest.
+    expect(names(new Map())).toEqual(['tkt-4162', 'tkt-4176', 'tkt-4174']);
+    const key = rowKey(asked);
+    expect(names(new Map([[key, { activity: asked.last_activity_ns, at: 1e6 - 2000 }]]))).toEqual(['tkt-4176', 'tkt-4174']);
+    // An answer past its life is asked again — after every run never asked.
+    expect(names(new Map([[key, { activity: asked.last_activity_ns, at: 1e6 - 11_000 }]]))).toEqual(['tkt-4176', 'tkt-4174', 'tkt-4162']);
+    expect(probeCandidates(rows, new Map(), now, 1e6, { ...opts, batch: 2 })).toHaveLength(2);
+  });
+});
+
+describe('the server\'s clock, from the listing alone', () => {
+  const doc = (runs) => ({ runs, truncated: false, windowNs: 900e9 });
+
+  it('follows a server clock behind the browser\'s down, as polling must: a run that moved between two reads moved within them', () => {
+    const behind = 60_000;
+    const first = CAPTURE_MS + behind;
+    let state = applySnapshot(newLiveState(), doc(listing.runs), first);
+    const before = byRun('tkt-4173');
+    const moved = { ...before, steps: before.steps + 1, last_activity_ns: (CAPTURE_MS + 4000) * 1e6 };
+    state = applySnapshot(state, doc(listing.runs.map((row) => (row.run === moved.run ? moved : row))), first + 5000);
+    const server = serverNowMs(state, first + 5000);
+    expect(Math.abs(server - (CAPTURE_MS + 5000))).toBeLessThan(6000);
+    expect(isQuiet(moved, server)).toBe(false);
+  });
+
+  it('never ages out a run the server has just listed, however far behind its clock is', () => {
+    const behind = 20 * 60_000;
+    let state = applySnapshot(newLiveState(), doc(listing.runs), CAPTURE_MS + behind);
+    state = ageOut(state, CAPTURE_MS + behind + 1000);
+    expect(state.rows.size).toBe(listing.runs.length);
+  });
+});
+
+describe('failures the stream must not retry, and ones it must say', () => {
+  const chunks = (...texts) => ({ async *[Symbol.asyncIterator]() { for (const t of texts) yield t; } });
+  const failing = (status, what) => Object.assign(new Error(what), { status, what });
+
+  it('stops on a request the server refuses as malformed, and keeps its words: a 400 is not a broken connection', async () => {
+    // As a 0.28.0 server answered a tenant typed into the filter.
+    const error = failing(400, 'tenant must be lowercase [a-z0-9][a-z0-9._-], at most 64 bytes');
+    const statuses = [];
+    const open = vi.fn(async () => { throw error; });
+    // Bounded, so a runner that retries forever fails here instead of spinning.
+    const controller = new AbortController();
+    let slept = 0;
+    await runLiveStream({
+      open, poll: vi.fn(), signal: controller.signal, onSnapshot: () => {}, onRun: () => {},
+      onStatus: (s) => statuses.push(s), sleep: async () => { slept += 1; if (slept > 3) controller.abort(); },
+    });
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(statuses).toEqual([{ state: 'rejected', error }]);
+    expect(classifyFailure(failing(400, 'x'))).toBe('rejected');
+    expect(classifyFailure(failing(422, 'x'))).toBe('rejected');
+    // Busy and rate-limited answers are worth retrying.
+    expect(classifyFailure(failing(429, 'slow down'))).toBe('broken');
+    expect(classifyFailure(failing(503, 'busy'))).toBe('broken');
+  });
+
+  it('says what failed while it reconnects', async () => {
+    const controller = new AbortController();
+    const statuses = [];
+    let opens = 0;
+    await runLiveStream({
+      open: async () => {
+        opens += 1;
+        if (opens === 1) throw failing(503, 'the store is warming up');
+        controller.abort();
+        return chunks('');
+      },
+      poll: vi.fn(),
+      signal: controller.signal,
+      onSnapshot: () => {},
+      onRun: () => {},
+      onStatus: (s) => statuses.push(s),
+      sleep: async () => {},
+    });
+    expect(statuses[0]).toEqual(expect.objectContaining({ state: 'reconnecting', error: expect.objectContaining({ what: 'the store is warming up' }) }));
+  });
+
+  it('takes a stream that goes silent without closing as dead — not even the heartbeat came — and reconnects', async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const statuses = [];
+      const signals = [];
+      let opens = 0;
+      const done = runLiveStream({
+        // A snapshot, then nothing: a half-open connection after a laptop
+        // slept, which no read will ever end.
+        open: async (params, signal) => {
+          opens += 1;
+          signals.push(signal);
+          if (opens === 1) return { async *[Symbol.asyncIterator]() { yield streamText; await new Promise(() => {}); } };
+          controller.abort();
+          return chunks('');
+        },
+        poll: vi.fn(),
+        signal: controller.signal,
+        onSnapshot: () => {},
+        onRun: () => {},
+        onStatus: (s) => statuses.push(s),
+        sleep: async () => {},
+      });
+      await vi.advanceTimersByTimeAsync(STALL_MS - 100);
+      expect(opens).toBe(1);
+      expect(statuses.map((s) => s.state)).toEqual(['live']);
+      await vi.advanceTimersByTimeAsync(200);
+      await done;
+      expect(opens).toBe(2);
+      expect(statuses.map((s) => s.state)).toEqual(['live', 'reconnecting']);
+      expect(statuses[1].error.what).toMatch(/nothing for 40 s/);
+      // The dead connection is let go, not left holding a socket.
+      expect(signals[0].aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('counts the heartbeat as life: a tick inside the window keeps the connection', async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      let opens = 0;
+      const done = runLiveStream({
+        open: async () => {
+          opens += 1;
+          if (opens === 1) {
+            return {
+              async *[Symbol.asyncIterator]() {
+                yield streamText;
+                await new Promise((wake) => setTimeout(wake, 15_000));
+                yield ': tick\n\n';
+                await new Promise(() => {});
+              },
+            };
+          }
+          controller.abort();
+          return chunks('');
+        },
+        poll: vi.fn(),
+        signal: controller.signal,
+        onSnapshot: () => {},
+        onRun: () => {},
+        sleep: async () => {},
+      });
+      await vi.advanceTimersByTimeAsync(STALL_MS + 5000);
+      expect(opens).toBe(1);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await done;
+      expect(opens).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

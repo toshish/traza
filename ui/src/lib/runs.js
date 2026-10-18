@@ -13,7 +13,10 @@ import { fmtDurationNs, fmtNum } from './format.js';
     `min_success_odds` is the one limit that is not usage: a predictive fuse
     on how runs like this one have ended, a fraction in (0, 1] — so it draws
     no bar (`bar: false`) and takes a decimal (`decimal`, `max`). It is here
-    because a grant of lower odds is how a foresight stop is lifted. */
+    because a grant of lower odds is how a foresight stop is lifted. Its two
+    companions — the support it needs, the steps a run must have — are whole
+    numbers with no bar either, and a policy may set them only beside it
+    (`requires`), as the server insists; a grant may raise one alone. */
 export const LIMITS = [
   { key: 'max_cost_usd', label: 'cost', used: (u) => u.cost_usd, fmt: (v) => '$' + fmtMoney(v) },
   { key: 'max_tokens', label: 'tokens', used: (u) => u.tokens, fmt: fmtNum },
@@ -33,6 +36,14 @@ export const LIMITS = [
   {
     key: 'min_success_odds', label: 'success odds', used: () => 0, fmt: (v) => String(v),
     bar: false, decimal: true, max: 1,
+  },
+  {
+    key: 'foresight_min_support', label: 'foresight support', used: () => 0, fmt: fmtNum,
+    bar: false, requires: 'min_success_odds',
+  },
+  {
+    key: 'foresight_after_steps', label: 'foresight after steps', used: () => 0, fmt: fmtNum,
+    bar: false, requires: 'min_success_odds',
   },
 ];
 

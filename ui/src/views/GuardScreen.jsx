@@ -387,11 +387,22 @@ export function TripModal({ run, onClose, onDone }) {
   </Modal>;
 }
 
+/** The limits the editor shows: every one it knows, then any other the
+    loaded policy carries — a limit from a newer server is kept, and shown,
+    rather than dropped from the policy by a save. */
+function limitSpecs(fields) {
+  const known = new Set(LIMITS.map((limit) => limit.key));
+  const extra = Object.keys(fields || {}).filter((key) => !known.has(key)).sort();
+  return [...LIMITS, ...extra.map((key) => ({ key, decimal: true }))];
+}
+
 /** Turns the editor's text fields into limit values, dropping blanks.
-    Returns `{limits, error}`. */
-export function parseLimits(fields) {
+    Returns `{limits, error}`. With `policy`, a limit that only tunes another
+    (`requires`) is refused without it, as the server refuses it; a grant is
+    merged over the policy's limits, so there it may stand alone. */
+export function parseLimits(fields, { policy = false } = {}) {
   const limits = {};
-  for (const limit of LIMITS) {
+  for (const limit of limitSpecs(fields)) {
     const text = (fields[limit.key] || '').trim();
     if (!text) continue;
     const value = Number(text);
@@ -400,12 +411,19 @@ export function parseLimits(fields) {
     if (limit.key !== 'max_cost_usd' && !limit.decimal && !Number.isInteger(value)) return { error: `${limit.key} must be a whole number` };
     limits[limit.key] = value;
   }
+  if (policy) {
+    for (const limit of LIMITS) {
+      if (limit.requires && limits[limit.key] != null && limits[limit.requires] == null) {
+        return { error: `${limit.key} tunes ${limit.requires}: set ${limit.requires} too, or leave ${limit.key} empty` };
+      }
+    }
+  }
   return { limits };
 }
 
 function LimitFields({ fields, setFields, placeholders }) {
   return <div className="tz-reflow-1" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
-    {LIMITS.map((limit) => <label key={limit.key} style={{ display: 'grid', gap: 3, fontSize: 12, color: 'var(--ink-muted)' }}>
+    {limitSpecs(fields).map((limit) => <label key={limit.key} style={{ display: 'grid', gap: 3, fontSize: 12, color: 'var(--ink-muted)' }}>
       <Mono color="var(--ink-muted)">{limit.key}</Mono>
       <Input size="sm" mono inputMode="decimal" value={fields[limit.key] || ''} ariaLabel={limit.key}
         placeholder={placeholders?.[limit.key] != null ? String(placeholders[limit.key]) : 'unbounded'}
@@ -414,7 +432,10 @@ function LimitFields({ fields, setFields, placeholders }) {
   </div>;
 }
 
-export function ResetModal({ run, onClose, onDone }) {
+/** The reset dialog. `note` is a sentence the caller adds about why the run
+    is being approved — the Live screen's account of a run waiting on a step
+    whose check's answer it cannot read. */
+export function ResetModal({ run, note, onClose, onDone }) {
   const [fields, setFields] = React.useState({});
   const [invalid, setInvalid] = React.useState('');
   const action = useAction();
@@ -439,6 +460,7 @@ export function ResetModal({ run, onClose, onDone }) {
         for this run only, kept across restarts. Leave a field empty to keep the current limit.
       </div>
       {run.reasons?.length ? <div style={{ fontSize: 12, color: 'var(--error)' }}>{run.reasons.join('; ')}</div> : null}
+      {note ? <div style={{ fontSize: 12, color: 'var(--ink-muted)', lineHeight: '18px' }}>{note}</div> : null}
       {(run.reasons || []).some((reason) => reason.startsWith('foresight:')) ? <div style={{ fontSize: 12, color: 'var(--ink-muted)', lineHeight: '18px' }}>
         A foresight stop is a prediction made again at every check, so a reset alone does not lift it. To let the
         run go on against its history, grant it lower odds: <code>min_success_odds</code> below the upper bound
@@ -472,7 +494,7 @@ function PolicyEditor({ policy, operator, onClose, onSaved }) {
   if (!policy) return null;
   const isDefault = name.trim() === 'default';
   const submit = async () => {
-    const { limits, error } = parseLimits(fields);
+    const { limits, error } = parseLimits(fields, { policy: true });
     if (error) { setInvalid(error); return; }
     if (!name.trim()) { setInvalid('a policy needs a name'); return; }
     if (!isDefault && !service.trim()) { setInvalid('a policy other than "default" must match a service'); return; }

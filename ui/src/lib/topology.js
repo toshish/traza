@@ -20,8 +20,19 @@ export function nodeLabel(name) {
   return text.length > MAX_LABEL ? text.slice(0, MAX_LABEL - 1) + '…' : text;
 }
 
-/** The pairs control bounced between, as unordered pairs with the larger of
-    the two directions' counts: `(A, B)` and `(B, A)` are one ping-pong. */
+/** How many returns one way make a pair ping-pong on their own: the count a
+    `max_handoff_cycles` of 2 stops at. */
+export const PING_PONG_RETURNS = 2;
+
+/** The pairs control came straight back between, as unordered pairs with
+    the larger of the two directions' counts: `(A, B)` and `(B, A)` are one
+    pair.
+
+    A return is not by itself a bounce (docs/guide/steer.md): a supervisor
+    fanning out — S, A, S, B, S — gets control back once from each worker,
+    and no worker ever gets it straight back. A pair is `pingPong` when
+    control came back both ways (A, B, A, B), or came back to one agent
+    `PING_PONG_RETURNS` times. */
 export function cyclePairs(doc) {
   const pairs = new Map();
   for (const cycle of (doc && doc.cycles) || []) {
@@ -29,9 +40,16 @@ export function cyclePairs(doc) {
     if (!a || !b) continue;
     const key = [a, b].sort().join('\u0000');
     const seen = pairs.get(key);
-    if (!seen || cycle.count > seen.count) pairs.set(key, { agents: [a, b], count: cycle.count, example: cycle.example });
+    if (!seen) {
+      pairs.set(key, { agents: [a, b], count: cycle.count, example: cycle.example, directions: new Set([a]) });
+      continue;
+    }
+    seen.directions.add(a);
+    if (cycle.count > seen.count) Object.assign(seen, { agents: [a, b], count: cycle.count, example: cycle.example });
   }
-  return [...pairs.values()].sort((x, y) => y.count - x.count);
+  return [...pairs.values()]
+    .map(({ directions, ...pair }) => ({ ...pair, pingPong: directions.size > 1 || pair.count >= PING_PONG_RETURNS }))
+    .sort((x, y) => Number(y.pingPong) - Number(x.pingPong) || y.count - x.count);
 }
 
 function pairKey(a, b) {
@@ -43,7 +61,8 @@ function pairKey(a, b) {
     Returns `{nodes, edges, cycles, hidden, width, height}`: nodes with their
     centre and pill width; edges as quadratic curves (`from`, `to`, the
     control point and where the count goes), each flagged `cycle` when its
-    two agents ping-ponged; `hidden` agents not drawn. A run with one agent
+    two agents ping-ponged; `cycles`, every pair control came straight back
+    between, ping-pong or not; `hidden` agents not drawn. A run with one agent
     and no edges is drawn as that one node. */
 export function layoutTopology(doc, { width = 360, height = 220, maxDrawn = MAX_DRAWN } = {}) {
   const all = ((doc && doc.nodes) || []).slice();
@@ -99,7 +118,7 @@ export function layoutTopology(doc, { width = 360, height = 220, maxDrawn = MAX_
     for (const node of nodes) { node.x += dx; node.y += dy; }
   }
   const at = new Map(nodes.map((node) => [node.id, node]));
-  const pingPong = new Set(cyclePairs(doc).map((pair) => pairKey(pair.agents[0], pair.agents[1])));
+  const pingPong = new Set(cyclePairs(doc).filter((pair) => pair.pingPong).map((pair) => pairKey(pair.agents[0], pair.agents[1])));
 
   const edges = [];
   const add = (from, to, count, kind, errors = 0) => {

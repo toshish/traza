@@ -292,8 +292,10 @@ async function streamChunks(path, signal) {
         }
       } finally {
         // Releasing matters on the abort path: without it the response body
-        // stays locked and the connection is held until GC gets to it.
-        try { reader.cancel(); } catch (e) { /* already closed */ }
+        // stays locked and the connection is held until GC gets to it. On
+        // that path the cancel's promise rejects with the abort's reason;
+        // left unhandled, leaving the screen threw it as a page error.
+        try { Promise.resolve(reader.cancel()).catch(() => {}); } catch (e) { /* already closed */ }
       }
     },
   };

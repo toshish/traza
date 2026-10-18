@@ -19,6 +19,7 @@ import resetDoc from '../test/fixtures/reset_grant.json';
 import nudgesDoc from '../test/fixtures/nudges.json';
 import nudgeCreated from '../test/fixtures/nudge_created.json';
 import fateRun from '../test/fixtures/fate_run_held.json';
+import badTenant from '../test/fixtures/live_bad_tenant.json';
 import { setToken } from '../lib/api.js';
 import { setIdentity } from '../lib/session.js';
 import { LiveScreen } from './LiveScreen.jsx';
@@ -47,6 +48,9 @@ function serve({ streamStatus = 200, streamError } = {}) {
     const method = init.method || 'GET';
     const call = { href, path, query, method, headers: init.headers || {}, body: init.body ? JSON.parse(init.body) : undefined };
     server.calls.push(call);
+    // A test may hold a request until it says so.
+    const gate = server.gate && server.gate(call);
+    if (gate) await gate;
     if (path === '/v1/runs/live/stream') {
       if (streamStatus !== 200) return json(streamStatus, { error: streamError });
       const stream = sse();
@@ -71,6 +75,7 @@ function serve({ streamStatus = 200, streamError } = {}) {
         server.nudges.push(doc);
         return json(201, doc);
       }
+      if (server.failReads > 0) { server.failReads -= 1; return json(503, { error: 'the store could not serve this' }); }
       return json(200, { nudges: server.nudges.filter((n) => n.run === run), run, tenant: '' });
     }
     if (/^\/v1\/fate\/runs\//.test(path)) return json(200, fateRun);
@@ -88,10 +93,18 @@ async function settle(ms = 0) {
 
 async function show(identity = RW, params = new URLSearchParams()) {
   const pushToast = vi.fn();
-  render(<LiveScreen go={vi.fn()} params={params} identity={identity} pushToast={pushToast} />);
+  const go = vi.fn();
+  render(<LiveScreen go={go} params={params} identity={identity} pushToast={pushToast} />);
   await settle(10);
   await settle(10);
-  return { pushToast };
+  return { pushToast, go };
+}
+
+/** A promise and the function that settles it. */
+function deferred() {
+  let release;
+  const promise = new Promise((done) => { release = done; });
+  return { promise, release };
 }
 
 const rows = () => screen.queryAllByTestId('live-row');
@@ -165,7 +178,8 @@ describe('the live view', () => {
   it('finds a run a predictive limit holds, which the listing cannot say, and offers to approve it', async () => {
     const server = serve();
     await show();
-    expect(row('tkt-4162').dataset.guard).toBe('continue');
+    // Asked about search_orders a minute ago, no span since: not "continue".
+    expect(row('tkt-4162').dataset.guard).toBe('waiting');
     await settle(3100);
     await settle(10);
     expect(server.calls.some((c) => c.path === '/v1/fuses/runs/tkt-4162' && c.query === 'tenant=')).toBe(true);
@@ -298,5 +312,168 @@ describe('when the stream is not there', () => {
     expect(server.streams).toHaveLength(2);
     expect(screen.getByTestId('live-status').dataset.state).toBe('live');
     expect(document.body.textContent).toMatch(/rebuilt from a fresh snapshot/);
+  });
+});
+
+
+describe('review follow-ups', () => {
+  it('calls a long-pending run waiting, not continue, and says a hold on the step alone cannot be read from here', async () => {
+    serve();
+    await show();
+    const waiting = row('tkt-4174');
+    expect(waiting.dataset.guard).toBe('continue');
+    await settle(10_000);
+    // The probe found no stop for the path so far: the run asked, and has
+    // not taken its step.
+    expect(row('tkt-4174').dataset.guard).toBe('waiting');
+    fireEvent.click(row('tkt-4174').querySelector('[role="row"]'));
+    expect(screen.getByTestId('live-detail').textContent).toMatch(/cannot be read from here/);
+  });
+
+  it('marks held only for the path so far, and says so', async () => {
+    serve();
+    await show();
+    await settle(3100);
+    await settle(10);
+    fireEvent.click(row('tkt-4162').querySelector('[role="row"]'));
+    const detail = screen.getByTestId('live-detail').textContent;
+    expect(detail).toMatch(/the path so far/);
+    expect(detail).toMatch(/cannot be read from here/);
+  });
+
+  it('says the server refused the view, in its words, instead of claiming no run is live', async () => {
+    const server = serve({ streamStatus: 400, streamError: badTenant.error });
+    await show(RW, new URLSearchParams('tenant=Acme Corp'));
+    await settle(20_000);
+    expect(document.body.textContent).toContain('tenant must be lowercase');
+    expect(document.body.textContent).not.toMatch(/No run has had activity/);
+    expect(screen.getByTestId('live-status').dataset.state).toBe('rejected');
+    // Refused, not broken: asked once, and the field to fix it is still there.
+    expect(server.calls.filter((c) => c.path === '/v1/runs/live/stream')).toHaveLength(1);
+    expect(screen.getByLabelText('Filter by tenant')).toBeTruthy();
+  });
+
+  it('says it is not connected yet, and why, while a server that never answered is retried', async () => {
+    serve({ streamStatus: 503, streamError: 'the store is warming up' });
+    await show();
+    await settle(20_000);
+    expect(document.body.textContent).not.toMatch(/No run has had activity/);
+    expect(document.body.textContent).toMatch(/Not connected yet/);
+    expect(document.body.textContent).toContain('the store is warming up');
+  });
+
+  it('takes a stream that goes silent without closing as dead, and reconnects from a fresh snapshot', async () => {
+    const server = serve();
+    await show();
+    await settle(39_000);
+    expect(server.streams).toHaveLength(1);
+    expect(screen.getByTestId('live-status').dataset.state).toBe('live');
+    await settle(1_500);
+    await settle(600);
+    await settle(10);
+    expect(server.streams).toHaveLength(2);
+    expect(document.body.textContent).toMatch(/rebuilt from a fresh snapshot/);
+  });
+
+  it('shows how many runs stand behind a rate, and marks a novel run\'s rate as the one before it left the path', async () => {
+    serve();
+    await show();
+    expect(row('tkt-4162').textContent).toMatch(/n\s*60/);
+    const novel = row('conv-c36f2e').textContent;
+    expect(novel).toMatch(/before\s*0%/);
+    cleanup();
+    window.matchMedia = (query) => ({ matches: query.includes('max-width: 699px'), media: query, addEventListener() {}, removeEventListener() {} });
+    serve();
+    await show();
+    const card = screen.getAllByTestId('live-card').find((c) => c.dataset.run === 'tkt-4162');
+    expect(card.textContent).toMatch(/n\s*60/);
+  });
+
+  it('keeps following a nudge through a failed read, and sends it once however fast the keys are pressed', async () => {
+    const server = serve();
+    await show();
+    fireEvent.click(within(row('tkt-4173')).getByText('Nudge'));
+    const dialog = screen.getByRole('dialog', { name: 'Nudge tkt-4173' });
+    const box = within(dialog).getByLabelText('Nudge message');
+    fireEvent.change(box, { target: { value: 'Stop searching; issue the refund.' } });
+    const post = deferred();
+    server.gate = (c) => (c.method === 'POST' ? post.promise : null);
+    await act(async () => {
+      fireEvent.keyDown(box, { key: 'Enter', metaKey: true });
+      fireEvent.keyDown(box, { key: 'Enter', metaKey: true });
+    });
+    server.gate = null;
+    await act(async () => { post.release(); });
+    await settle(10);
+    expect(server.calls.filter((c) => c.method === 'POST')).toHaveLength(1);
+    expect(within(dialog).getByTestId('nudge-delivery').textContent).toMatch(/pending\s*waiting for the run's next pre-call check/);
+    // One read fails while the dialog follows the nudge…
+    server.failReads = 1;
+    await settle(1600);
+    await settle(10);
+    // …and the run's check delivers it meanwhile.
+    server.nudges[0] = { ...server.nudges[0], status: 'delivered', delivered_at_ns: server.nudges[0].created_at_ns + 2_670_000_000 };
+    await settle(1600);
+    await settle(10);
+    expect(within(dialog).getByTestId('nudge-delivery').textContent).toMatch(/delivered\s*after 2\.67 s/);
+  });
+
+  it('clears the held mark once Approve has reset the run', async () => {
+    const server = serve();
+    await show();
+    await settle(3100);
+    await settle(10);
+    expect(row('tkt-4162').dataset.guard).toBe('held');
+    // The grant of lower odds lifts the foresight stop.
+    server.heldRuns.delete('tkt-4162');
+    fireEvent.click(within(row('tkt-4162')).getByText('Approve'));
+    const dialog = screen.getByRole('dialog', { name: 'Approve to continue' });
+    fireEvent.change(within(dialog).getByLabelText('min_success_odds'), { target: { value: '0.05' } });
+    await act(async () => { fireEvent.click(within(dialog).getByText('Reset the run')); });
+    await settle(10);
+    expect(row('tkt-4162').dataset.guard).not.toBe('held');
+  });
+
+  it('opens Approve on the run last asked about, whatever order the verdicts land in', async () => {
+    const server = serve();
+    await show();
+    const first = deferred();
+    const second = deferred();
+    server.gate = (c) => (c.path === '/v1/fuses/runs/conv-82febb' ? first.promise
+      : c.path === '/v1/fuses/runs/conv-872843' ? second.promise : null);
+    fireEvent.click(within(row('conv-82febb')).getByText('Approve'));
+    fireEvent.click(within(row('conv-872843')).getByText('Approve'));
+    await act(async () => { second.release(); });
+    await settle(10);
+    await act(async () => { first.release(); });
+    await settle(10);
+    const dialog = screen.getByRole('dialog', { name: 'Approve to continue' });
+    expect(dialog.textContent).toContain('conv-872843');
+    expect(dialog.textContent).not.toContain('conv-82febb');
+  });
+
+  it('counts a recorded step\'s age from its span, not as a step still running', async () => {
+    serve();
+    await show();
+    // tkt-4173's gpt-4o call ended when its span arrived — with the stream's
+    // last frame for it — and started seconds before that.
+    expect(row('tkt-4173').textContent).toMatch(/0 s ago/);
+    await settle(3000);
+    const cell = row('tkt-4173').textContent;
+    expect(cell).toMatch(/3 s ago/);
+    // Not a running time counted from the call's start.
+    const started = listing.runs.find((r) => r.run === 'tkt-4173').current.started_ns;
+    expect(cell).not.toMatch(/\b(6|7|8|9) s\b/);
+    expect(started).toBeLessThan(CAPTURE_NS - 3e9);
+  });
+
+  it('follows the run link from the keyboard, and the link carries the run\'s tenant', async () => {
+    serve();
+    await show();
+    const link = within(row('tkt-4173')).getByRole('link', { name: 'tkt-4173' });
+    expect(link.getAttribute('href')).toBe('#/run/tkt-4173?tenant=');
+    // Enter on the link is the link's: not cancelled, and the row stays shut.
+    expect(fireEvent.keyDown(link, { key: 'Enter' })).toBe(true);
+    expect(row('tkt-4173').querySelector('[role="row"]').getAttribute('aria-expanded')).toBe('false');
   });
 });
