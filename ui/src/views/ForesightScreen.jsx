@@ -93,9 +93,13 @@ export function ForesightScreen({ go, params, identity }) {
   const mapRead = useRead((signal) => api.fateMap({
     agent: shownAgent, task: task || undefined, since, depth, min_support: minSupport,
     ...tenantParams(shownTenant),
-  }, signal).then((body) => ({ body, key: mapKey })), [mapKey], { skip: !shownAgent || !ready });
+  }, signal).then((body) => ({ body, key: mapKey, tenant: shownTenant })), [mapKey], { skip: !shownAgent || !ready });
   const map = { ...mapRead, data: mapRead.data ? mapRead.data.body : null };
   const mapCurrent = Boolean(mapRead.data && mapRead.data.key === mapKey);
+  // The tenant the map on screen was asked in. Its example runs and diffs
+  // are that tenant's: while another tenant's map loads, the one still drawn
+  // must not open its run ids under the tenant the route has moved to.
+  const mapTenant = mapRead.data ? mapRead.data.tenant : shownTenant;
 
   const [collapsed, setCollapsed] = React.useState(() => new Set());
   React.useEffect(() => { setCollapsed(new Set()); }, [shownAgent, task, since, depth, minSupport]);
@@ -166,7 +170,7 @@ export function ForesightScreen({ go, params, identity }) {
 
     <MapBody map={map} data={data} shownAgent={shownAgent} task={task} windowId={windowId} cohorts={list}
       highlight={highlight} activeKey={activeKey} activeNode={activeNode} collapsed={collapsed} onToggle={toggle}
-      onSelect={(key) => set({ node: key })} go={go} tenant={shownTenant} />
+      onSelect={(key) => set({ node: key })} go={go} tenant={mapTenant} />
   </div>;
 }
 

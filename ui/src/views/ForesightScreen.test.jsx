@@ -294,6 +294,31 @@ describe('when the route moves on while an answer is on its way', () => {
     expect(banner).toContain('on track');
   });
 
+  it("opens the runs of the map still drawn in that map's tenant, not the tenant whose map is loading", async () => {
+    const loop = encodeURIComponent('llm:gpt-4o\u0001tool:search_orders×3-5');
+    const go = vi.fn();
+    const view = render(<ForesightScreen go={go} params={new URLSearchParams('agent=support-agent&tenant=acme&node=' + loop)}
+      identity={OPEN} pushToast={vi.fn()} />);
+    await act(async () => { for (let i = 0; i < 6; i += 1) await Promise.resolve(); });
+    expect(api.fateMap).toHaveBeenLastCalledWith(expect.objectContaining({ tenant: 'acme' }), expect.anything());
+    let arrive;
+    api.fateMap.mockImplementationOnce(() => new Promise((resolve) => { arrive = resolve; }));
+    view.rerender(<ForesightScreen go={go} params={new URLSearchParams('agent=support-agent&tenant=beta&node=' + loop)}
+      identity={OPEN} pushToast={vi.fn()} />);
+    await act(async () => { for (let i = 0; i < 6; i += 1) await Promise.resolve(); });
+    expect(api.fateMap).toHaveBeenLastCalledWith(expect.objectContaining({ tenant: 'beta' }), expect.anything());
+    // acme's map is still drawn while beta's loads: its runs are acme's.
+    expect(screen.getByTestId('node-panel').textContent).toContain('search_loop-0');
+    fireEvent.click(screen.getByText('search_loop-0'));
+    expect(go).toHaveBeenLastCalledWith(['run', 'search_loop-0'], { tenant: 'acme' });
+    fireEvent.click(screen.getByText('Diff success vs failure'));
+    expect(go).toHaveBeenLastCalledWith(['diff'], { a: 'search_loop-9', b: 'search_loop-0', tenant: 'acme' });
+    // Once beta's map arrives, its runs are beta's.
+    await act(async () => { arrive(supportMap); for (let i = 0; i < 6; i += 1) await Promise.resolve(); });
+    fireEvent.click(screen.getByText('search_loop-0'));
+    expect(go).toHaveBeenLastCalledWith(['run', 'search_loop-0'], { tenant: 'beta' });
+  });
+
   it('reads the map\'s skill only off the build the run was judged against, not the one still drawn', async () => {
     const { view } = await show('run=live-doomed-0&tenant=&window=7d');
     // A 7-day map is not the build foresight judged the run against.
