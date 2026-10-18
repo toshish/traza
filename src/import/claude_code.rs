@@ -248,8 +248,8 @@ impl ClaudeCode {
     fn open_turn(&mut self, key: &str, at: u64, end: u64, prompt: Option<&str>) {
         let id = span_id(SOURCE, self.session(), "turn", key);
         let (tenant, trace, base) = (self.tenant.clone(), self.trace.clone(), self.base.clone());
-        let goal = match (prompt, self.goal_set) {
-            (Some(prompt), false) => Some(preview(prompt, 200)),
+        let goal = match (prompt.and_then(goal_text), self.goal_set) {
+            (Some(text), false) => Some(preview(text, 200)),
             _ => None,
         };
         let created = self
@@ -866,6 +866,23 @@ fn classify(path: &Path) -> (String, Mode, Option<String>) {
 }
 
 /// A prompt as a span event.
+/// What of a prompt states the session's goal: the prompt without the
+/// `<system-reminder>` blocks a harness (a worktree launcher, a workflow)
+/// puts ahead of the person's words, or `None` when nothing else is left.
+fn goal_text(prompt: &str) -> Option<&str> {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut rest = prompt.trim_start();
+    while let Some(inside) = rest.strip_prefix(OPEN) {
+        match inside.find(CLOSE) {
+            Some(end) => rest = inside[end + CLOSE.len()..].trim_start(),
+            // Unclosed: not a block this rule knows; keep it all.
+            None => return Some(prompt),
+        }
+    }
+    (!rest.trim().is_empty()).then_some(rest)
+}
+
 fn prompt_event(prompt: &str, at: u64) -> Event {
     let mut attributes = serde_json::Map::new();
     attributes.insert("content".into(), json!(bounded(prompt, MAX_FIELD_BYTES)));

@@ -543,6 +543,13 @@ before deploying over an existing setup.
   before those spans is rebuilt from its first compaction inside them (a
   delta call before that says its conversation began before the read).
   `xray_step` reaches any step of a run, not only those in its first read.
+- **An imported session's goal is what the person asked.** A harness that
+  opens a Claude Code session's first prompt with a `<system-reminder>`
+  block (a worktree launcher, a workflow) made that boilerplate the
+  session's `session.goal` — the text every run surface shows, and the
+  value the Fate Map hashes into a task, so every such session joined one
+  task. The goal now skips leading reminder blocks, and a prompt that is
+  nothing else sets none.
 
 ### Upgrade
 

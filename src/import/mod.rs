@@ -150,7 +150,8 @@
 //! working directory), `service.version` (the tool's version) and, when
 //! known, `vcs.ref.head.name`. The service is `claude-code` or `codex`.
 //! - a **turn** span per user prompt (`gen_ai.user.message` event carrying
-//!   the prompt; the session's first prompt, cut to 200 characters, is also
+//!   the prompt; the session's first prompt, cut to 200 characters and
+//!   without a harness's leading `<system-reminder>` blocks, is also
 //!   `session.goal`); its status is that of its last model call;
 //! - an **llm** step per model response (`gen_ai.operation.name=chat`,
 //!   request model, provider, token usage including cache counters,

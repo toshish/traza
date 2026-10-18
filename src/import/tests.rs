@@ -244,6 +244,53 @@ fn a_claude_code_session_becomes_turns_llm_steps_and_tool_steps() {
 }
 
 #[test]
+fn a_goal_is_what_the_person_asked_not_what_the_harness_injected() {
+    // A harness (a worktree launcher, a workflow) opens the session's first
+    // prompt with a `<system-reminder>` block. The goal — which the Fate Map
+    // hashes into a task key, and every run surface shows — is the person's
+    // words after it, not boilerplate every such session shares.
+    let dir = scratch("goal-reminder");
+    let path = dir.join(format!("{S1}.jsonl"));
+    let reminder = "<system-reminder>\nYou are operating in a git worktree.\n</system-reminder>\n";
+    let text = std::fs::read_to_string(cc_main())
+        .expect("fixture")
+        .replacen(
+            "\"content\": \"Add a total",
+            &format!(
+                "\"content\": {}Add a total",
+                json!(reminder).to_string().trim_end_matches('"')
+            ),
+            1,
+        );
+    std::fs::write(&path, text).expect("writes");
+    let (spans, _) = claude(&path);
+    let first_turn = turns(&spans)[0].clone();
+    assert_eq!(
+        attr(&first_turn, "session.goal"),
+        &json!("Add a total to the cart summary")
+    );
+    // The prompt itself is kept as it was written.
+    assert!(first_turn.events[0].attributes["content"]
+        .as_str()
+        .is_some_and(|content| content.starts_with("<system-reminder>")));
+
+    // A prompt that is only a reminder sets no goal; the next one does.
+    let text = std::fs::read_to_string(cc_main())
+        .expect("fixture")
+        .replacen(
+            "\"content\": \"Add a total to the cart summary\"",
+            &format!("\"content\": {}", json!(reminder)),
+            1,
+        );
+    std::fs::write(&path, text).expect("writes");
+    let (spans, _) = claude(&path);
+    let turns = turns(&spans);
+    assert_eq!(attr(turns[0], "session.goal"), &Value::Null);
+    assert!(attr(turns[1], "session.goal").is_string());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_subagent_transcript_is_an_agent_span_under_the_call_that_spawned_it() {
     let (spans, _) = claude(&cc_agent());
     let agent = spans
