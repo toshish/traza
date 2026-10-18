@@ -45,12 +45,19 @@
 //! Fisher exact test puts the difference at p < 0.05 — so three unlucky runs
 //! are not a fatal fork. Each map also reports its own **calibration**:
 //! cross-validated predictions at several depths scored against what
-//! happened (Brier score and skill over the base rate), so a reader can see
-//! how much the map's foresight is worth before trusting it.
+//! happened (Brier score and skill over the base rate), each run predicted
+//! only from what it had done by then, so a reader can see how much the
+//! map's foresight is worth before trusting it.
 //!
 //! # Foresight for one run
 //!
-//! A run's path is walked down its cohort's map. The run itself is taken out
+//! A run's path is walked down its cohort's map. A run that may still go on
+//! is read with its **last group open**: having called a tool twice, it may
+//! yet call it a third time, so it is compared with every run that called
+//! it at least twice at that point — the sibling tokens of that step in the
+//! same bucket or a longer one, pooled — and never with only the runs that
+//! stopped at two, which would be knowing what it does next. A completed
+//! run is judged at its own node. The run itself is taken out
 //! of the statistics it is judged by (leave-one-out), and the verdict is:
 //! `novel` when the run took a step no earlier run took at that point;
 //! `insufficient_history` when fewer than `min_support` runs share its path;
@@ -582,6 +589,12 @@ pub struct NodeStats {
     pub lift: Option<f64>,
     /// Mean run cost through here, USD.
     pub cost_usd_avg: Option<f64>,
+    /// For a live run, whose last step may repeat again: the sibling tokens
+    /// of that step pooled into these counts — its own bucket and every
+    /// longer one (`x` pools `x`, `x×2`, `x×3-5` and `x×6+`). Empty for a
+    /// completed run, judged at its own node.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pooled: Vec<String>,
 }
 
 /// Where a run left the known paths.
@@ -606,6 +619,14 @@ pub struct NextOption {
     pub success_rate: f64,
     /// Its 95% Wilson interval.
     pub ci95: [f64; 2],
+    /// Whether this is the run's last step again — runs that went on
+    /// repeating it — rather than a different step.
+    #[serde(skip_serializing_if = "is_false")]
+    pub repeat: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Foresight for one run.
@@ -655,6 +676,11 @@ pub struct Foresight {
     pub excluded_self: bool,
     /// Whether the run was read from its earliest spans only.
     pub partial: bool,
+    /// Whether the path's last token was judged open: the run may still go
+    /// on, so its last step may repeat again, and the runs it is compared
+    /// with are every run that repeated that step at least as often
+    /// (`node.pooled`).
+    pub last_open: bool,
     /// The support a verdict needed.
     pub min_support: u64,
     /// When the map was built.
@@ -789,26 +815,70 @@ fn groups<T: PartialEq + Clone>(items: impl IntoIterator<Item = T>) -> Vec<(T, u
     out
 }
 
-/// The behaviour path of run-length `groups` of signature stems, at most
-/// [`MAX_DEPTH`] tokens then [`FOLD_TOKEN`]. `complete` is whether the
-/// groups cover the whole run: when they do not, the last group may be
-/// longer than it looks, so it is dropped (unless it is already `×6+`,
-/// which cannot change) and the path ends in [`FOLD_TOKEN`].
-pub(crate) fn path_of(groups: &[(String, usize)], complete: bool) -> Vec<String> {
+/// The repeat bucket of `count` consecutive occurrences, as an index: 0 one,
+/// 1 two, 2 three to five, 3 six or more. [`FOLD_BUCKET`] is the fold
+/// token's.
+fn bucket_of(count: usize) -> u8 {
+    match count {
+        0 | 1 => 0,
+        2 => 1,
+        3..=5 => 2,
+        _ => 3,
+    }
+}
+
+/// The bucket of [`FOLD_TOKEN`], which has no stem.
+const FOLD_BUCKET: u8 = 4;
+
+/// The fewest and the most occurrences a bucket holds.
+fn bucket_range(bucket: u8) -> (usize, usize) {
+    match bucket {
+        0 => (1, 1),
+        1 => (2, 2),
+        2 => (3, 5),
+        3 => (6, usize::MAX),
+        _ => (0, 0),
+    }
+}
+
+/// The key a stem (a step signature or an agent name, already cut by
+/// [`stem`]) is matched by: 64 bits of Traza's hash of its text, never zero.
+/// A build matches path tokens and cohorts by key, so a reader that keeps
+/// keys only — the run guard's live path — reads the same map.
+pub(crate) fn stem_key(stem: &str) -> u64 {
+    let digest = crate::hash::hash128(stem.as_bytes());
+    let mut low = [0_u8; 8];
+    low.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(low).max(1)
+}
+
+/// The groups a path is made of, and whether it ends in [`FOLD_TOKEN`]:
+/// at most [`MAX_DEPTH`] groups. `complete` is whether the groups cover the
+/// whole run: when they do not, the last group may be longer than it looks,
+/// so it is dropped (unless it is already `×6+`, which cannot change) and
+/// the path ends in the fold token.
+fn shape<T>(groups: &[T], complete: bool, count: impl Fn(&T) -> usize) -> (&[T], bool) {
     let mut usable = groups;
     if !complete {
-        if let Some((_, count)) = groups.last() {
-            if *count < 6 {
+        if let Some(last) = groups.last() {
+            if count(last) < 6 {
                 usable = &groups[..groups.len() - 1];
             }
         }
     }
+    let folded = usable.len() > MAX_DEPTH || !complete;
+    (&usable[..usable.len().min(MAX_DEPTH)], folded)
+}
+
+/// The behaviour path of run-length `groups` of signature stems, at most
+/// [`MAX_DEPTH`] tokens then [`FOLD_TOKEN`] (see [`shape`]).
+pub(crate) fn path_of(groups: &[(String, usize)], complete: bool) -> Vec<String> {
+    let (usable, folded) = shape(groups, complete, |(_, count)| *count);
     let mut path: Vec<String> = usable
         .iter()
-        .take(MAX_DEPTH)
         .map(|(stem, count)| format!("{stem}{}", bucket(*count)))
         .collect();
-    if usable.len() > MAX_DEPTH || !complete {
+    if folded {
         path.push(FOLD_TOKEN.to_owned());
     }
     path
@@ -879,12 +949,58 @@ impl Interner {
         Some(id)
     }
 
-    fn get(&self, name: &str) -> Option<u32> {
-        self.ids.get(name).copied()
+    fn name(&self, id: u32) -> &str {
+        self.names.get(id as usize).map_or("", |name| name)
+    }
+}
+
+/// A build's path tokens, each identified by its stem's key and its repeat
+/// bucket — never by its text, which two different pairs could share (a
+/// tool named `x×2` called once, and `x` called twice).
+struct Tokens {
+    ids: HashMap<(u64, u8), u32>,
+    parts: Vec<(u64, u8)>,
+    names: Vec<String>,
+}
+
+impl Tokens {
+    fn new() -> Self {
+        Self {
+            ids: HashMap::new(),
+            parts: Vec::new(),
+            names: Vec::new(),
+        }
+    }
+
+    /// The id of `(key, bucket)`, interning it — named by `name` — when
+    /// there is room; `None` past [`MAX_SIGNATURES`].
+    fn intern(&mut self, key: u64, bucket: u8, name: impl FnOnce() -> String) -> Option<u32> {
+        if let Some(id) = self.ids.get(&(key, bucket)) {
+            return Some(*id);
+        }
+        if self.parts.len() >= MAX_SIGNATURES {
+            return None;
+        }
+        let id = self.parts.len() as u32;
+        self.ids.insert((key, bucket), id);
+        self.parts.push((key, bucket));
+        self.names.push(name());
+        Some(id)
+    }
+
+    fn get(&self, key: u64, bucket: u8) -> Option<u32> {
+        self.ids.get(&(key, bucket)).copied()
+    }
+
+    fn parts(&self, id: u32) -> (u64, u8) {
+        self.parts
+            .get(id as usize)
+            .copied()
+            .unwrap_or((0, FOLD_BUCKET))
     }
 
     fn name(&self, id: u32) -> &str {
-        self.names.get(id as usize).map_or("", |name| name)
+        self.names.get(id as usize).map_or("", String::as_str)
     }
 }
 
@@ -1306,6 +1422,15 @@ impl Counts {
     fn rate(&self) -> Option<f64> {
         (self.visits > 0).then(|| self.success as f64 / self.visits as f64)
     }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            visits: self.visits + other.visits,
+            success: self.success + other.success,
+            failure: self.failure + other.failure,
+            abandoned: self.abandoned + other.abandoned,
+        }
+    }
 }
 
 /// A run's membership in its cohort's map: how it ended, and the deepest
@@ -1425,7 +1550,16 @@ fn grow(runs: &[RunFinal], budget: &mut usize, bounds: &mut Bounds) -> (Vec<Node
 
 /// Scores cross-validated predictions against outcomes; see
 /// [`CalibrationPoint`].
-fn calibrate(nodes: &[Node], runs: &[RunFinal], deepest: &[u32]) -> Calibration {
+///
+/// A run is predicted at depth `d` as foresight would have seen it live at
+/// the last step of its `d`-th token: its first `d − 1` tokens are closed,
+/// but whether the `d`-th one's step repeats again is not known yet. So the
+/// prediction pools the runs that reached the same point with that step
+/// repeated at least as often — the sibling tokens of the same step in the
+/// same bucket or a longer one ([`Tokens::parts`]) — exactly as a live
+/// run's open last group is judged. Predicting each run from its own
+/// bucket's node instead would use what it did next, and overstate skill.
+fn calibrate(nodes: &[Node], runs: &[RunFinal], deepest: &[u32], tokens: &Tokens) -> Calibration {
     if runs.len() < 2 {
         return Calibration::default();
     }
@@ -1474,10 +1608,30 @@ fn calibrate(nodes: &[Node], runs: &[RunFinal], deepest: &[u32]) -> Calibration 
                 0.0
             };
             let base = rate(counts[0][other]);
-            let node = chains[index]
-                .get(depth)
-                .map(|&id| counts[id as usize][other])
-                .filter(|(visits, _)| *visits >= CALIBRATION_SUPPORT);
+            let (key, bucket) = tokens.parts(run.path[depth - 1]);
+            let pooled = if bucket == FOLD_BUCKET {
+                chains[index]
+                    .get(depth)
+                    .map(|&id| counts[id as usize][other])
+            } else {
+                chains[index].get(depth - 1).map(|&parent| {
+                    nodes[parent as usize]
+                        .children
+                        .iter()
+                        .filter(|&&child| {
+                            let (child_key, child_bucket) =
+                                tokens.parts(nodes[child as usize].token);
+                            child_key == key
+                                && child_bucket != FOLD_BUCKET
+                                && child_bucket >= bucket
+                        })
+                        .fold((0, 0), |(visits, success), &child| {
+                            let slot = counts[child as usize][other];
+                            (visits + slot.0, success + slot.1)
+                        })
+                })
+            };
+            let node = pooled.filter(|(visits, _)| *visits >= CALIBRATION_SUPPORT);
             let predicted = match node {
                 Some(node) => {
                     covered += 1;
@@ -1572,9 +1726,12 @@ impl BuildKey {
 pub(crate) struct Build {
     built_at_ns: u64,
     window: WindowDoc,
-    tokens: Interner,
+    tokens: Tokens,
     cohorts: Vec<Cohort>,
     index: HashMap<(String, String), usize>,
+    /// The same cohorts by tenant and [`stem_key`] of the agent, for a
+    /// reader that keeps keys only.
+    by_key: HashMap<(String, u64), usize>,
     bounds: Bounds,
 }
 
@@ -1582,6 +1739,12 @@ impl Build {
     fn cohort(&self, tenant: &str, agent: &str) -> Option<&Cohort> {
         self.index
             .get(&(tenant.to_owned(), agent.to_owned()))
+            .and_then(|index| self.cohorts.get(*index))
+    }
+
+    fn cohort_by_key(&self, tenant: &str, agent: u64) -> Option<&Cohort> {
+        self.by_key
+            .get(&(tenant.to_owned(), agent))
             .and_then(|index| self.cohorts.get(*index))
     }
 
@@ -1648,7 +1811,10 @@ fn build(
     bounds.window_narrowed = narrowed;
 
     // Runs, finalized: outcome, cohort, path.
-    let mut tokens = Interner::new(MAX_SIGNATURES);
+    let mut tokens = Tokens::new();
+    // The fold token first, so a full table can still end a path with it.
+    tokens.intern(0, FOLD_BUCKET, || FOLD_TOKEN.to_owned());
+    let signature_keys: Vec<u64> = signatures.names.iter().map(|name| stem_key(name)).collect();
     let mut finals: Vec<RunFinal> = Vec::with_capacity(tracked);
     let mut seen = 0_usize;
     let mut tenants: Vec<(String, HashMap<String, RunAcc>)> = accs.into_iter().collect();
@@ -1680,22 +1846,27 @@ fn build(
             if !complete {
                 bounds.runs_partial += 1;
             }
-            let grouped: Vec<(String, usize)> =
-                groups(ordered.iter().map(|record| record.signature))
-                    .into_iter()
-                    .map(|(signature, count)| (signatures.name(signature).to_owned(), count))
-                    .collect();
-            let mut path = Vec::new();
-            for token in path_of(&grouped, complete) {
-                match tokens.intern(&token) {
+            let grouped = groups(ordered.iter().map(|record| record.signature));
+            let (usable, folded) = shape(&grouped, complete, |(_, count)| *count);
+            let mut path = Vec::with_capacity(usable.len() + 1);
+            let mut capped = false;
+            for &(signature, count) in usable {
+                let key = signature_keys[signature as usize];
+                let interned = tokens.intern(key, bucket_of(count), || {
+                    format!("{}{}", signatures.name(signature), bucket(count))
+                });
+                match interned {
                     Some(id) => path.push(id),
                     None => {
                         bounds.signature_cap = true;
-                        if let Some(fold_id) = tokens.intern(FOLD_TOKEN) {
-                            path.push(fold_id);
-                        }
+                        capped = true;
                         break;
                     }
+                }
+            }
+            if folded || capped {
+                if let Some(fold_id) = tokens.intern(0, FOLD_BUCKET, || FOLD_TOKEN.to_owned()) {
+                    path.push(fold_id);
                 }
             }
             finals.push(RunFinal {
@@ -1736,6 +1907,7 @@ fn build(
     let mut budget = config.max_nodes.max(1);
     let mut cohorts = Vec::with_capacity(cohorts_in.len());
     let mut index = HashMap::new();
+    let mut by_key = HashMap::new();
     for ((tenant, agent), runs) in cohorts_in {
         Deadline::check(deadline, 0)?;
         let mut unknown = 0_u64;
@@ -1778,7 +1950,7 @@ fn build(
             known.truncate(max_runs);
         }
         let (nodes, deepest) = grow(&known, &mut budget, &mut bounds);
-        let calibration = calibrate(&nodes, &known, &deepest);
+        let calibration = calibrate(&nodes, &known, &deepest, &tokens);
         let mut tasks: Vec<CohortSummary> = task_counts
             .into_iter()
             .filter(|(_, counts)| counts[0] + counts[1] + counts[2] >= MIN_TASK_RUNS)
@@ -1827,6 +1999,10 @@ fn build(
             members,
             calibration,
         };
+        by_key.insert(
+            (cohort.tenant.clone(), stem_key(&cohort.agent)),
+            cohorts.len(),
+        );
         index.insert((cohort.tenant.clone(), cohort.agent.clone()), cohorts.len());
         cohorts.push(cohort);
     }
@@ -1837,6 +2013,7 @@ fn build(
         tokens,
         cohorts,
         index,
+        by_key,
         bounds,
     })
 }
@@ -2321,17 +2498,117 @@ fn render_map(build: &Build, cohort: &Cohort, request: &MapRequest) -> FateMap {
 
 // ------------------------------------------------------------- foresight
 
-/// A run as foresight reads it.
-struct RunPath {
-    agent: String,
-    groups: Vec<(String, usize)>,
-    complete: bool,
-    steps: u64,
-    outcome: Outcome,
+/// One run-length group of a run's steps, as foresight reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadGroup {
+    /// [`stem_key`] of the step's signature stem.
+    pub(crate) key: u64,
+    /// Steps in a row.
+    pub(crate) count: usize,
+    /// The stem itself, when the reader has it: a read of the store does;
+    /// the run guard's live path keeps keys only.
+    pub(crate) name: Option<String>,
 }
 
-/// The behaviour of a run's stored spans, read the way a build reads them.
-fn run_path(spans: &[Span], truncated: bool, now_ns: u64) -> RunPath {
+/// A run's behaviour as foresight reads it: from its stored spans, or from
+/// the run guard's live path ([`LivePath`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Reading {
+    /// [`stem_key`] of the run's agent: its first step's agent, else its
+    /// earliest span's service.
+    pub(crate) agent_key: u64,
+    /// The agent's name, when the reader has it.
+    pub(crate) agent: Option<String>,
+    /// Run-length groups of its steps, in step order.
+    pub(crate) groups: Vec<ReadGroup>,
+    /// Whether the groups cover the whole run.
+    pub(crate) complete: bool,
+    /// Whether the run may still go on, which leaves its last group open:
+    /// a step it has repeated twice may yet repeat a third time.
+    pub(crate) live: bool,
+    /// Steps recorded.
+    pub(crate) steps: u64,
+}
+
+/// An open last group: the step, and how many times in a row so far.
+struct OpenGroup {
+    key: u64,
+    count: usize,
+    name: Option<String>,
+}
+
+/// What a reading walks down a map: tokens matched exactly — `(key,
+/// bucket, label)` — then, for a live run, its last group, still open.
+struct Probe {
+    closed: Vec<(u64, u8, Option<String>)>,
+    open: Option<OpenGroup>,
+}
+
+impl Reading {
+    fn probe(&self) -> Probe {
+        let (usable, folded) = shape(&self.groups, self.complete, |group| group.count);
+        let mut closed: Vec<(u64, u8, Option<String>)> = usable
+            .iter()
+            .map(|group| {
+                (
+                    group.key,
+                    bucket_of(group.count),
+                    group
+                        .name
+                        .as_ref()
+                        .map(|name| format!("{name}{}", bucket(group.count))),
+                )
+            })
+            .collect();
+        let mut open = None;
+        if folded {
+            closed.push((0, FOLD_BUCKET, Some(FOLD_TOKEN.to_owned())));
+        } else if self.live {
+            if let Some(last) = usable.last() {
+                closed.pop();
+                open = Some(OpenGroup {
+                    key: last.key,
+                    count: last.count,
+                    name: last.name.clone(),
+                });
+            }
+        }
+        Probe { closed, open }
+    }
+
+    /// The reading with `tool` called next: one more of the last group when
+    /// it is the same step, else a new group — still open.
+    fn with_next_tool(&self, tool: &str) -> Self {
+        let mut extended = self.clone();
+        let name = stem(&format!("tool:{tool}"));
+        let key = stem_key(&name);
+        match extended.groups.last_mut() {
+            Some(last) if last.key == key => last.count += 1,
+            _ => extended.groups.push(ReadGroup {
+                key,
+                count: 1,
+                name: Some(name),
+            }),
+        }
+        extended.live = true;
+        extended.steps += 1;
+        extended
+    }
+
+    /// The path's tokens by name, for a reading that has every name.
+    fn path(&self) -> Vec<String> {
+        let named: Vec<(String, usize)> = self
+            .groups
+            .iter()
+            .map(|group| (group.name.clone().unwrap_or_default(), group.count))
+            .collect();
+        path_of(&named, self.complete)
+    }
+}
+
+/// A run's stored spans read the way a build reads them, and how the run
+/// has ended so far (`unknown` while it may go on).
+fn read_spans(spans: &[Span], truncated: bool, now_ns: u64) -> (Reading, Outcome) {
     let mut steps: Vec<(OrderKey, String, Option<String>)> = Vec::new();
     let mut earliest: Option<(OrderKey, &str)> = None;
     for span in spans {
@@ -2346,29 +2623,108 @@ fn run_path(spans: &[Span], truncated: bool, now_ns: u64) -> RunPath {
         }
     }
     steps.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    let agent = steps
-        .first()
-        .and_then(|(_, _, agent)| agent.clone())
-        .or_else(|| earliest.map(|(_, service)| service.to_owned()))
-        .unwrap_or_default();
+    let agent = stem(
+        &steps
+            .first()
+            .and_then(|(_, _, agent)| agent.clone())
+            .or_else(|| earliest.map(|(_, service)| service.to_owned()))
+            .unwrap_or_default(),
+    );
     let total = steps.len();
     let complete = !truncated && total <= RUN_STEP_WINDOW;
     steps.truncate(RUN_STEP_WINDOW);
-    let mut outcome =
-        attribution::session_outcome(spans, now_ns, crate::mcp::SESSION_IDLE_NS).outcome;
-    if truncated {
-        outcome = Outcome::Unknown;
-    }
-    RunPath {
-        agent: stem(&agent),
-        groups: groups(steps.into_iter().map(|(_, signature, _)| signature)),
+    let outcome = if truncated {
+        Outcome::Unknown
+    } else {
+        attribution::session_outcome(spans, now_ns, crate::mcp::SESSION_IDLE_NS).outcome
+    };
+    let groups = groups(steps.into_iter().map(|(_, signature, _)| signature))
+        .into_iter()
+        .map(|(name, count)| ReadGroup {
+            key: stem_key(&name),
+            count,
+            name: Some(name),
+        })
+        .collect();
+    let reading = Reading {
+        agent_key: stem_key(&agent),
+        agent: Some(agent),
+        groups,
         complete,
+        live: outcome == Outcome::Unknown,
         steps: total as u64,
-        outcome,
+    };
+    (reading, outcome)
+}
+
+/// A cohort's counts as one run sees them: the run itself left out of
+/// every node on its own path, when it is in the map.
+struct View<'c> {
+    cohort: &'c Cohort,
+    left_out: Option<(Vec<u32>, Outcome)>,
+}
+
+impl<'c> View<'c> {
+    fn of(cohort: &'c Cohort, run: &str) -> Self {
+        let left_out = cohort
+            .members
+            .get(run)
+            .map(|member| (cohort.chain(member.deepest), member.outcome));
+        Self { cohort, left_out }
+    }
+
+    fn counts(&self, id: u32) -> Counts {
+        let counts = self.cohort.nodes[id as usize].counts();
+        match &self.left_out {
+            Some((chain, outcome)) if chain.contains(&id) => counts.without(*outcome),
+            _ => counts,
+        }
+    }
+
+    /// The children of `id` some run (the reader left out) went through,
+    /// most visited first.
+    fn children(&self, build: &Build, id: u32) -> Vec<(u32, Counts)> {
+        let nodes = &self.cohort.nodes;
+        let mut children: Vec<(u32, Counts)> = nodes[id as usize]
+            .children
+            .iter()
+            .map(|&child| (child, self.counts(child)))
+            .filter(|(_, counts)| counts.visits > 0)
+            .collect();
+        children.sort_by(|left, right| {
+            right.1.visits.cmp(&left.1.visits).then_with(|| {
+                build
+                    .token(nodes[left.0 as usize].token)
+                    .cmp(build.token(nodes[right.0 as usize].token))
+            })
+        });
+        children
     }
 }
 
-/// A path walked down a cohort's tree, with one run left out.
+/// How a token reads in an explanation: the reader's own name for it when
+/// it has one, else the map's, else a placeholder for a step the map has
+/// never seen.
+fn label(build: &Build, key: u64, bucket: u8, name: Option<&str>) -> String {
+    match name {
+        Some(name) => name.to_owned(),
+        None => build.tokens.get(key, bucket).map_or_else(
+            || "a step new to this map".to_owned(),
+            |id| build.tokens.name(id).to_owned(),
+        ),
+    }
+}
+
+/// A token's stem as text: its name without the repeat bucket.
+fn stem_label(build: &Build, token: u32) -> String {
+    let (_, bucket) = build.tokens.parts(token);
+    let name = build.tokens.name(token);
+    name.strip_suffix(self::bucket(bucket_range(bucket).0))
+        .unwrap_or(name)
+        .to_owned()
+}
+
+/// A path walked down a cohort's tree.
 struct Walked {
     /// Node ids matched, the root first.
     matched: Vec<u32>,
@@ -2377,38 +2733,27 @@ struct Walked {
     stopped: Option<(String, bool)>,
 }
 
-fn walk(
-    build: &Build,
-    cohort: &Cohort,
-    path: &[String],
-    left_out: Option<(&[u32], Outcome)>,
-) -> Walked {
-    let counts = |id: u32| -> Counts {
-        let counts = cohort.nodes[id as usize].counts();
-        match left_out {
-            Some((chain, outcome)) if chain.contains(&id) => counts.without(outcome),
-            _ => counts,
-        }
-    };
+fn walk(build: &Build, view: &View<'_>, closed: &[(u64, u8, Option<String>)]) -> Walked {
+    let nodes = &view.cohort.nodes;
     let mut matched = vec![0_u32];
-    for token in path {
+    for (key, bucket, name) in closed {
         let at = *matched.last().unwrap_or(&0);
-        let node = &cohort.nodes[at as usize];
-        let next = build.tokens.get(token).and_then(|token_id| {
+        let node = &nodes[at as usize];
+        let next = build.tokens.get(*key, *bucket).and_then(|token| {
             node.children
                 .iter()
                 .copied()
-                .find(|&child| cohort.nodes[child as usize].token == token_id)
+                .find(|&child| nodes[child as usize].token == token)
         });
-        match next.filter(|&child| counts(child).visits > 0) {
+        match next.filter(|&child| view.counts(child).visits > 0) {
             Some(child) => matched.push(child),
             // A path read only in part ends in the fold token: what follows
             // is unknown, not new, so the walk ends where the reading did.
-            None if token == FOLD_TOKEN => break,
+            None if *bucket == FOLD_BUCKET => break,
             None => {
                 return Walked {
                     matched,
-                    stopped: Some((token.clone(), node.cut > 0)),
+                    stopped: Some((label(build, *key, *bucket, name.as_deref()), node.cut > 0)),
                 }
             }
         }
@@ -2419,11 +2764,22 @@ fn walk(
     }
 }
 
+/// Where a run is in its cohort's map: one node, or — for a live run's open
+/// last group — every sibling token of the same step it may still turn
+/// out to be, pooled.
+struct Here {
+    ids: Vec<u32>,
+    counts: Counts,
+    token: String,
+    depth: usize,
+    pooled: Vec<String>,
+}
+
 /// Everything a verdict is made of, for the route and the fuse alike.
 struct Judged {
     verdict: ForesightVerdict,
     explanation: String,
-    node: Option<(u32, Counts)>,
+    here: Option<Here>,
     base: Counts,
     divergence: Option<Divergence>,
     next: Vec<NextOption>,
@@ -2441,103 +2797,143 @@ fn percent(value: f64) -> String {
     format!("{:.1}%", value * 100.0)
 }
 
-fn judge(
-    build: &Build,
-    cohort: &Cohort,
-    path: &[String],
-    left_out: Option<(&[u32], Outcome)>,
-    min_support: u64,
-) -> Judged {
-    let counts = |id: u32| -> Counts {
-        let counts = cohort.nodes[id as usize].counts();
-        match left_out {
-            Some((chain, outcome)) if chain.contains(&id) => counts.without(outcome),
-            _ => counts,
-        }
-    };
-    let base = counts(0);
-    let walked = walk(build, cohort, path, left_out);
+fn judge(build: &Build, view: &View<'_>, probe: &Probe, min_support: u64) -> Judged {
+    let cohort = view.cohort;
+    let base = view.counts(0);
+    let walked = walk(build, view, &probe.closed);
     let deepest = *walked.matched.last().unwrap_or(&0);
-    let here = counts(deepest);
-    let matched_depth = walked.matched.len() - 1;
-    let mut children: Vec<(u32, Counts)> = cohort.nodes[deepest as usize]
-        .children
-        .iter()
-        .map(|&child| (child, counts(child)))
-        .filter(|(_, counts)| counts.visits > 0)
-        .collect();
-    children.sort_by(|left, right| {
-        right.1.visits.cmp(&left.1.visits).then_with(|| {
-            build
-                .token(cohort.nodes[left.0 as usize].token)
-                .cmp(build.token(cohort.nodes[right.0 as usize].token))
-        })
-    });
     let token_of = |id: u32| build.token(cohort.nodes[id as usize].token).to_owned();
-    let next: Vec<NextOption> = children
-        .iter()
-        .filter(|(_, counts)| counts.visits >= DEFAULT_MIN_SUPPORT)
-        .take(NEXT_OPTIONS)
-        .map(|(id, counts)| {
-            let (low, high) = stats::wilson(counts.success, counts.visits);
-            NextOption {
-                token: token_of(*id),
-                visits: counts.visits,
-                success_rate: stats::round4(counts.rate().unwrap_or(0.0)),
-                ci95: [stats::round4(low), stats::round4(high)],
-            }
-        })
-        .collect();
-    let recommended = children
-        .iter()
-        .filter(|(_, counts)| counts.visits >= min_support)
-        .map(|(id, counts)| (*id, stats::wilson(counts.success, counts.visits).0))
-        .filter(|(_, low)| here.rate().is_some_and(|rate| *low > rate))
-        .max_by(|left, right| left.1.total_cmp(&right.1))
-        .map(|(id, _)| token_of(id));
+    let deepest_node = &cohort.nodes[deepest as usize];
+    // The deepest node matched exactly, and what runs did from it: (token,
+    // counts, whether it is the same step again).
+    let closed_here = || Here {
+        ids: vec![deepest],
+        counts: view.counts(deepest),
+        token: build.token(deepest_node.token).to_owned(),
+        depth: usize::from(deepest_node.depth),
+        pooled: Vec::new(),
+    };
+    let closed_options = || -> Vec<(String, Counts, bool)> {
+        view.children(build, deepest)
+            .into_iter()
+            .map(|(id, counts)| (token_of(id), counts, false))
+            .collect()
+    };
     let mut judged = Judged {
         verdict: ForesightVerdict::InsufficientHistory,
         explanation: String::new(),
-        node: Some((deepest, here)),
+        here: None,
         base,
         divergence: None,
-        next,
-        recommended,
-        matched_depth,
+        next: Vec::new(),
+        recommended: None,
+        matched_depth: walked.matched.len() - 1,
     };
     if base.visits == 0 {
-        judged.node = None;
         judged.explanation = format!(
             "no completed runs of agent `{}` in the window to compare with",
             cohort.agent
         );
         return judged;
     }
-    if let Some((took, cut)) = walked.stopped {
+    // Where the walk could not follow the run: the step the run took there
+    // is new (or the node bound hid the branch). The deepest node matched
+    // still says what earlier runs did from that point.
+    let stopped = match (walked.stopped, &probe.open) {
+        (Some(stopped), _) => Some((stopped, closed_here(), closed_options())),
+        (None, None) => None,
+        (None, Some(open)) => {
+            let own_bucket = bucket_of(open.count);
+            let own = label(
+                build,
+                open.key,
+                own_bucket,
+                open.name
+                    .as_ref()
+                    .map(|name| format!("{name}{}", bucket(open.count)))
+                    .as_deref(),
+            );
+            // The step may repeat again: every sibling token of the same
+            // step whose bucket can hold at least this many in a row.
+            let bucket_of_node = |id: u32| build.tokens.parts(cohort.nodes[id as usize].token);
+            let compatible: Vec<(u32, Counts)> = view
+                .children(build, deepest)
+                .into_iter()
+                .filter(|(id, _)| {
+                    let (key, bucket) = bucket_of_node(*id);
+                    key == open.key && bucket != FOLD_BUCKET && bucket_range(bucket).1 >= open.count
+                })
+                .collect();
+            if compatible.is_empty() {
+                Some(((own, deepest_node.cut > 0), closed_here(), closed_options()))
+            } else {
+                judged.matched_depth += 1;
+                let counts = compatible
+                    .iter()
+                    .fold(Counts::default(), |sum, (_, counts)| sum.plus(*counts));
+                // What runs did next: runs that stopped repeating at exactly
+                // this bucket went on to its children; runs in a longer
+                // bucket made the same call again.
+                let mut options: Vec<(String, Counts, bool)> = compatible
+                    .iter()
+                    .find(|(id, _)| bucket_of_node(*id).1 == own_bucket)
+                    .map(|(id, _)| {
+                        view.children(build, *id)
+                            .into_iter()
+                            .map(|(child, counts)| (token_of(child), counts, false))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let again = compatible
+                    .iter()
+                    .filter(|(id, _)| bucket_range(bucket_of_node(*id).1).0 > open.count)
+                    .fold(Counts::default(), |sum, (_, counts)| sum.plus(*counts));
+                if again.visits > 0 {
+                    let name = open.name.clone().unwrap_or_else(|| {
+                        stem_label(build, cohort.nodes[compatible[0].0 as usize].token)
+                    });
+                    options.push((name, again, true));
+                }
+                judged.here = Some(Here {
+                    ids: compatible.iter().map(|(id, _)| *id).collect(),
+                    counts,
+                    token: own,
+                    depth: usize::from(deepest_node.depth) + 1,
+                    pooled: compatible.iter().map(|(id, _)| token_of(*id)).collect(),
+                });
+                offer(&mut judged, options, min_support);
+                None
+            }
+        }
+    };
+    if let Some(((took, cut), here, options)) = stopped {
+        judged.here = Some(here);
+        offer(&mut judged, options, min_support);
         if cut {
             judged.explanation = format!(
-                "the map was cut short after {matched_depth} tokens of this path by its node \
-                 bound (--fate-max-nodes), so `{took}` cannot be judged"
+                "the map was cut short after {} tokens of this path by its node bound \
+                 (--fate-max-nodes), so `{took}` cannot be judged",
+                judged.matched_depth
             );
             return judged;
         }
-        let common: Vec<String> = children
-            .iter()
+        let common: Vec<String> = view
+            .children(build, deepest)
+            .into_iter()
             .take(3)
-            .map(|(id, _)| token_of(*id))
+            .map(|(id, _)| token_of(id))
             .collect();
+        let reached = view.counts(deepest).visits;
         judged.verdict = ForesightVerdict::Novel;
         judged.explanation = if common.is_empty() {
             format!(
-                "no earlier run of this agent went on past this point ({} runs ended here); \
-                 this one did, with `{took}`",
-                here.visits
+                "no earlier run of this agent went on past this point ({reached} runs ended \
+                 here); this one did, with `{took}`"
             )
         } else {
             format!(
-                "no earlier run of this agent took `{took}` at this point; the {} runs that \
-                 got here went on with {}",
-                here.visits,
+                "no earlier run of this agent took `{took}` at this point; the {reached} runs \
+                 that got here went on with {}",
                 common
                     .iter()
                     .map(|token| format!("`{token}`"))
@@ -2546,12 +2942,21 @@ fn judge(
             )
         };
         judged.divergence = Some(Divergence {
-            depth: matched_depth,
+            depth: judged.matched_depth,
             common_next: common,
             took,
         });
         return judged;
     }
+    if judged.here.is_none() {
+        judged.here = Some(closed_here());
+        offer(&mut judged, closed_options(), min_support);
+    }
+    let here = judged
+        .here
+        .as_ref()
+        .map(|here| here.counts)
+        .unwrap_or_default();
     let base_rate = base.rate().unwrap_or(0.0);
     if here.visits < min_support {
         judged.explanation = format!(
@@ -2563,7 +2968,7 @@ fn judge(
     }
     let (low, high) = stats::wilson(here.success, here.visits);
     let rate = here.rate().unwrap_or(0.0);
-    let subject = if matched_depth == 0 {
+    let subject = if judged.matched_depth == 0 {
         "runs of this agent (this one has taken no steps yet)"
     } else {
         "runs that took this path"
@@ -2586,6 +2991,45 @@ fn judge(
         base_rate * 100.0
     );
     judged
+}
+
+/// Fills what earlier runs did next from where the run is (`judged.here`),
+/// and the option whose runs did best, when it beats staying the course.
+fn offer(judged: &mut Judged, mut options: Vec<(String, Counts, bool)>, min_support: u64) {
+    options.sort_by(|left, right| {
+        right
+            .1
+            .visits
+            .cmp(&left.1.visits)
+            .then(left.0.cmp(&right.0))
+    });
+    let here = judged
+        .here
+        .as_ref()
+        .map(|here| here.counts)
+        .unwrap_or_default();
+    judged.next = options
+        .iter()
+        .filter(|(_, counts, _)| counts.visits >= DEFAULT_MIN_SUPPORT)
+        .take(NEXT_OPTIONS)
+        .map(|(token, counts, repeat)| {
+            let (low, high) = stats::wilson(counts.success, counts.visits);
+            NextOption {
+                token: token.clone(),
+                visits: counts.visits,
+                success_rate: stats::round4(counts.rate().unwrap_or(0.0)),
+                ci95: [stats::round4(low), stats::round4(high)],
+                repeat: *repeat,
+            }
+        })
+        .collect();
+    judged.recommended = options
+        .iter()
+        .filter(|(_, counts, _)| counts.visits >= min_support)
+        .map(|(token, counts, _)| (token, stats::wilson(counts.success, counts.visits).0))
+        .filter(|(_, low)| here.rate().is_some_and(|rate| *low > rate))
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(token, _)| token.clone());
 }
 
 impl Store {
@@ -2651,14 +3095,14 @@ impl Store {
         }
         let key = BuildKey::of(Some(tenant), None, None);
         let build = self.fate.get_or_build(self, &key, now_ns, deadline)?;
-        let read_path = run_path(&read.spans, read.truncated, now_ns);
-        let path = path_of(&read_path.groups, read_path.complete);
+        let (reading, outcome) = read_spans(&read.spans, read.truncated, now_ns);
+        let agent = reading.agent.clone().unwrap_or_default();
         let mut foresight = Foresight {
             run: run.to_owned(),
             tenant: tenant.to_owned(),
-            agent: read_path.agent.clone(),
-            path: path.clone(),
-            steps: read_path.steps,
+            agent: agent.clone(),
+            path: reading.path(),
+            steps: reading.steps,
             matched_depth: 0,
             node: None,
             p_success: None,
@@ -2670,29 +3114,25 @@ impl Store {
             divergence: None,
             next: Vec::new(),
             recommended_next: None,
-            outcome: read_path.outcome,
+            outcome,
             cohort_runs: 0,
             excluded_self: false,
             partial: read.truncated,
+            last_open: false,
             min_support,
             map_built_at_ns: Some(build.built_at_ns),
         };
-        let Some(cohort) = build.cohort(tenant, &read_path.agent) else {
-            foresight.explanation = format!(
-                "no completed runs of agent `{}` in the window to compare with",
-                read_path.agent
-            );
+        let Some(cohort) = build.cohort(tenant, &agent) else {
+            foresight.explanation =
+                format!("no completed runs of agent `{agent}` in the window to compare with");
             return Ok(Some(foresight));
         };
-        let member = cohort.members.get(run).copied();
-        let chain = member.map(|member| cohort.chain(member.deepest));
-        let left_out = match (&chain, member) {
-            (Some(chain), Some(member)) => Some((chain.as_slice(), member.outcome)),
-            _ => None,
-        };
-        foresight.excluded_self = left_out.is_some();
-        let judged = judge(&build, cohort, &path, left_out, min_support);
-        fill(&mut foresight, &build, cohort, &judged);
+        let view = View::of(cohort, run);
+        foresight.excluded_self = view.left_out.is_some();
+        let probe = reading.probe();
+        foresight.last_open = probe.open.is_some();
+        let judged = judge(&build, &view, &probe, min_support);
+        fill(&mut foresight, cohort, &judged);
         Ok(Some(foresight))
     }
 
@@ -2739,7 +3179,9 @@ impl Store {
     }
 
     /// Foresight for a fuse verdict: read only from a cached map, never
-    /// building one. `started` anchors the request's one budget.
+    /// building one. `started` anchors the request's one budget. The run is
+    /// read as still going — the fuse asks about its next step — so its
+    /// last group is open.
     fn fate_for_guard(
         &self,
         tenant: &str,
@@ -2781,37 +3223,30 @@ impl Store {
             out.explanation = "the run has no recorded steps yet".to_owned();
             return out;
         }
-        let read_path = run_path(&read.spans, read.truncated, crate::mcp::unix_nanos_now());
-        let Some(cohort) = build.cohort(tenant, &read_path.agent) else {
-            out.explanation = format!(
-                "no completed runs of agent `{}` in the window to compare with",
-                read_path.agent
-            );
+        let (mut reading, _) =
+            read_spans(&read.spans, read.truncated, crate::mcp::unix_nanos_now());
+        reading.live = true;
+        let Some(cohort) = build.cohort_by_key(tenant, reading.agent_key) else {
+            out.explanation = match &reading.agent {
+                Some(agent) => {
+                    format!("no completed runs of agent `{agent}` in the window to compare with")
+                }
+                None => {
+                    "no completed runs of this run's agent in the window to compare with".to_owned()
+                }
+            };
             return out;
         };
-        let member = cohort.members.get(run).copied();
-        let chain = member.map(|member| cohort.chain(member.deepest));
-        let left_out = match (&chain, member) {
-            (Some(chain), Some(member)) => Some((chain.as_slice(), member.outcome)),
-            _ => None,
-        };
-        let current = path_of(&read_path.groups, read_path.complete);
-        let mut judged = judge(&build, cohort, &current, left_out, min_support);
+        let view = View::of(cohort, run);
+        let mut judged = judge(&build, &view, &reading.probe(), min_support);
         // The step about to be taken, when the check names its tool: judged
         // with it appended, if runs that took it are known; otherwise it adds
         // no evidence and the path so far is what is judged.
-        if let Some(tool) = next_tool.filter(|_| read_path.complete) {
-            let mut extended = read_path.groups.clone();
-            let next = stem(&format!("tool:{tool}"));
-            match extended.last_mut() {
-                Some((last, count)) if *last == next => *count += 1,
-                _ => extended.push((next, 1)),
-            }
+        if let Some(tool) = next_tool.filter(|_| reading.complete) {
             let hypothetical = judge(
                 &build,
-                cohort,
-                &path_of(&extended, true),
-                left_out,
+                &view,
+                &reading.with_next_tool(tool).probe(),
                 min_support,
             );
             if matches!(
@@ -2830,7 +3265,8 @@ impl Store {
         out.explanation = judged.explanation.clone();
         out.matched_depth = judged.matched_depth;
         out.base_rate = judged.base.rate().map(stats::round4);
-        if let Some((_, here)) = judged.node {
+        if let Some(here) = &judged.here {
+            let here = here.counts;
             out.support = here.visits;
             out.successes = here.success;
             out.p_success = here.rate().map(stats::round4);
@@ -2842,7 +3278,7 @@ impl Store {
 }
 
 /// Copies a judgement into a foresight document.
-fn fill(foresight: &mut Foresight, build: &Build, cohort: &Cohort, judged: &Judged) {
+fn fill(foresight: &mut Foresight, cohort: &Cohort, judged: &Judged) {
     foresight.verdict = judged.verdict;
     foresight.explanation = judged.explanation.clone();
     foresight.matched_depth = judged.matched_depth;
@@ -2852,32 +3288,36 @@ fn fill(foresight: &mut Foresight, build: &Build, cohort: &Cohort, judged: &Judg
     foresight.cohort_runs = judged.base.visits;
     let base_rate = judged.base.rate();
     foresight.base_rate = base_rate.map(stats::round4);
-    if let Some((id, here)) = judged.node {
-        let node = &cohort.nodes[id as usize];
-        let (low, high) = stats::wilson(here.success, here.visits);
-        let rate = here.rate();
-        foresight.support = here.visits;
+    if let Some(here) = &judged.here {
+        let counts = here.counts;
+        let (low, high) = stats::wilson(counts.success, counts.visits);
+        let rate = counts.rate();
+        foresight.support = counts.visits;
         foresight.p_success = rate.map(stats::round4);
-        foresight.ci95 = (here.visits > 0).then(|| [stats::round4(low), stats::round4(high)]);
-        // The node's cost is summed over every run through it; the run
+        foresight.ci95 = (counts.visits > 0).then(|| [stats::round4(low), stats::round4(high)]);
+        // The nodes' cost is summed over every run through them; the run
         // itself is not taken out of it (its share is one run's cost).
+        let (cost, visits) = here.ids.iter().fold((0.0, 0_u64), |(cost, visits), &id| {
+            let node = &cohort.nodes[id as usize];
+            (cost + node.cost_usd_sum, visits + u64::from(node.visits))
+        });
         foresight.node = Some(NodeStats {
-            token: build.token(node.token).to_owned(),
-            depth: usize::from(node.depth),
-            visits: here.visits,
-            success: here.success,
-            failure: here.failure,
-            abandoned: here.abandoned,
+            token: here.token.clone(),
+            depth: here.depth,
+            visits: counts.visits,
+            success: counts.success,
+            failure: counts.failure,
+            abandoned: counts.abandoned,
             success_rate: rate.map(stats::round4),
             ci95: [stats::round4(low), stats::round4(high)],
-            p_fail_given_here: (here.visits > 0)
-                .then(|| stats::round4(here.failure as f64 / here.visits as f64)),
+            p_fail_given_here: (counts.visits > 0)
+                .then(|| stats::round4(counts.failure as f64 / counts.visits as f64)),
             lift: match (rate, base_rate) {
                 (Some(rate), Some(base)) if base > 0.0 => Some(stats::round4(rate / base)),
                 _ => None,
             },
-            cost_usd_avg: (node.visits > 0)
-                .then(|| round_usd(node.cost_usd_sum / f64::from(node.visits))),
+            cost_usd_avg: (visits > 0).then(|| round_usd(cost / visits as f64)),
+            pooled: here.pooled.clone(),
         });
     }
 }

@@ -81,6 +81,25 @@ fn repeats_fold_into_buckets_and_paths_stop_at_their_depth() {
     assert!(path_of(&[], true).is_empty());
 }
 
+/// A reading of `groups` (`(stem, count)`, names known) by agent `agent`.
+fn reading(agent: &str, groups: &[(&str, usize)], complete: bool, live: bool) -> Reading {
+    Reading {
+        agent_key: stem_key(agent),
+        agent: Some(agent.to_owned()),
+        groups: groups
+            .iter()
+            .map(|(name, count)| ReadGroup {
+                key: stem_key(name),
+                count: *count,
+                name: Some((*name).to_owned()),
+            })
+            .collect(),
+        complete,
+        live,
+        steps: groups.iter().map(|(_, count)| *count as u64).sum(),
+    }
+}
+
 #[test]
 fn a_path_read_in_part_is_judged_on_what_was_read_never_called_novel() {
     let (fixture, now) = seeded("fold-token", crate::Config::default(), false);
@@ -90,19 +109,38 @@ fn a_path_read_in_part_is_judged_on_what_was_read_never_called_novel() {
         .get_or_build(store, &BuildKey::of(Some(""), None, None), now, None)
         .expect("builds");
     let cohort = build.cohort("", "support-agent").expect("cohort");
-    let partial = ["llm:gpt-4o".to_owned(), FOLD_TOKEN.to_owned()];
-    let walked = walk(&build, cohort, &partial, None);
+    let view = View {
+        cohort,
+        left_out: None,
+    };
+    // Read in part: the open search group is dropped, the path folds.
+    let partial = reading(
+        "support-agent",
+        &[("llm:gpt-4o", 1), ("tool:search_orders", 1)],
+        false,
+        true,
+    );
+    assert_eq!(partial.path(), ["llm:gpt-4o", FOLD_TOKEN]);
+    let probe = partial.probe();
+    let walked = walk(&build, &view, &probe.closed);
     assert_eq!(walked.matched.len(), 2);
     assert!(walked.stopped.is_none());
-    let judged = judge(&build, cohort, &partial, None, DEFAULT_VERDICT_SUPPORT);
+    let judged = judge(&build, &view, &probe, DEFAULT_VERDICT_SUPPORT);
     assert_eq!(judged.verdict, ForesightVerdict::OnTrack);
-    assert_eq!(judged.node.map(|(_, counts)| counts.visits), Some(180));
-    // A token no run took at that point is new, though.
-    let novel = ["llm:gpt-4o".to_owned(), "tool:summon".to_owned()];
-    assert_eq!(
-        judge(&build, cohort, &novel, None, DEFAULT_VERDICT_SUPPORT).verdict,
-        ForesightVerdict::Novel
-    );
+    assert_eq!(judged.here.map(|here| here.counts.visits), Some(180));
+    // A token no run took at that point is new, though — open or closed.
+    for live in [true, false] {
+        let novel = reading(
+            "support-agent",
+            &[("llm:gpt-4o", 1), ("tool:summon", 1)],
+            true,
+            live,
+        );
+        assert_eq!(
+            judge(&build, &view, &novel.probe(), DEFAULT_VERDICT_SUPPORT).verdict,
+            ForesightVerdict::Novel
+        );
+    }
 }
 
 #[test]
@@ -369,9 +407,24 @@ fn foresight_gives_every_verdict_its_case() {
     }
     let healthy = foresee("live-healthy-0");
     assert_eq!(healthy.verdict, ForesightVerdict::OnTrack);
+    // One refund so far, and it may be followed by another: the runs that
+    // stopped at one (54 of 60) pooled with the runs that issued a second
+    // (15 of 30).
+    assert!(healthy.last_open);
+    let node = healthy.node.as_ref().expect("a node");
+    assert_eq!((healthy.support, node.success), (90, 69));
+    assert_eq!(node.token, "tool:issue_refund");
+    assert_eq!(node.pooled, ["tool:issue_refund", "tool:issue_refund×2"]);
+    // What they did next: the 60 that stopped refunding went back to the
+    // model; the 30 that refunded again are the same step repeated.
+    let next: Vec<(&str, u64, bool)> = healthy
+        .next
+        .iter()
+        .map(|option| (option.token.as_str(), option.visits, option.repeat))
+        .collect();
     assert_eq!(
-        (healthy.support, healthy.node.as_ref().map(|n| n.success)),
-        (60, Some(54))
+        next,
+        [("llm:gpt-4o", 60, false), ("tool:issue_refund", 30, true)]
     );
     let novel = foresee("live-novel-0");
     assert_eq!(novel.verdict, ForesightVerdict::Novel);
@@ -782,10 +835,16 @@ fn a_map_reports_how_good_its_foresight_has_been() {
         "{:?}",
         at(1)
     );
-    // The branch is chosen at depth 2, and it decides most of the outcome.
+    // The branch is chosen at depth 2, and it decides most of the outcome —
+    // but only partly at the moment it is chosen: a run's first search
+    // cannot tell whether it will loop (the 50 that did are pooled with the
+    // 90 that searched once), while its fourth can. By depth 3 the search
+    // group is closed and the map knows which branch the run is on.
     let branch = at(2);
     assert_eq!((branch.runs, branch.covered), (180, 180));
-    assert!(branch.skill.is_some_and(|skill| skill > 0.2), "{branch:?}");
+    let skill = |depth: usize| at(depth).skill.unwrap_or(f64::NAN);
+    assert!((0.15..0.3).contains(&skill(2)), "{branch:?}");
+    assert!(skill(3) > skill(2), "{:?}", map.calibration);
     assert!(branch.brier < branch.baseline_brier);
     assert!(!map.calibration.reliability.is_empty());
     let total: u64 = map.calibration.reliability.iter().map(|bin| bin.runs).sum();
@@ -1106,4 +1165,138 @@ fn fate_build_timing() {
         .foresee("", "search_loop-3", 30, now)
         .expect("foresees");
     println!("foresight from the cached map in {:?}", started.elapsed());
+}
+
+/// The spans of one run of `service`: `steps` in order (`tool:name` or
+/// `llm:model`), one second apart from `start`, the last one failed when
+/// `failed`.
+fn synthetic_run(run: &str, service: &str, steps: &[&str], start: u64, failed: bool) -> Vec<Span> {
+    steps
+        .iter()
+        .enumerate()
+        .map(|(position, step)| {
+            let (kind, name) = step.split_once(':').expect("kind:name");
+            let attributes = if kind == "llm" {
+                json!({"session.id": run, "gen_ai.operation.name": "chat",
+                       "gen_ai.request.model": name})
+            } else {
+                json!({"session.id": run, "gen_ai.operation.name": "execute_tool",
+                       "gen_ai.tool.name": name})
+            };
+            let mut span = span(
+                &format!("{run}-trace"),
+                &format!("{run}-{position}"),
+                start + position as u64 * 1_000_000_000,
+                attributes,
+            );
+            span.service = service.to_owned();
+            if failed && position + 1 == steps.len() {
+                span.status = "error".into();
+            }
+            span
+        })
+        .collect()
+}
+
+#[test]
+fn a_live_runs_last_step_is_still_open_so_longer_repeats_are_pooled() {
+    let (fixture, now) = seeded("open-group", crate::Config::default(), true);
+    let store = fixture.store();
+    // A run that has just made its first search: it cannot know yet
+    // whether it will search again, so the runs it is compared with are
+    // every run that searched at least once here — the 90 that searched
+    // once (69 succeeded) AND the 50 that went on to loop (5 did).
+    store
+        .ingest_batch(synthetic_run(
+            "live-searching",
+            "support-agent",
+            &["llm:gpt-4o", "tool:search_orders"],
+            now - 20_000_000_000,
+            false,
+        ))
+        .expect("ingests");
+    let searching = store
+        .foresee("", "live-searching", DEFAULT_VERDICT_SUPPORT, now)
+        .expect("reads")
+        .expect("exists");
+    assert_eq!(searching.outcome, Outcome::Unknown);
+    assert_eq!(
+        (
+            searching.support,
+            searching.node.as_ref().map(|node| node.success)
+        ),
+        (140, Some(74)),
+        "{}",
+        searching.explanation
+    );
+    // One refund issued so far: the 60 that stopped at one (54 succeeded)
+    // and the 30 that issued a second (15 did).
+    let healthy = store
+        .foresee("", "live-healthy-0", DEFAULT_VERDICT_SUPPORT, now)
+        .expect("reads")
+        .expect("exists");
+    assert_eq!(
+        (
+            healthy.support,
+            healthy.node.as_ref().map(|node| node.success)
+        ),
+        (90, Some(69))
+    );
+    // A completed run is closed: it is compared with runs that stopped
+    // where it stopped.
+    let finished = store
+        .foresee("", "refund_happy-3", DEFAULT_VERDICT_SUPPORT, now)
+        .expect("reads")
+        .expect("exists");
+    assert_ne!(finished.outcome, Outcome::Unknown);
+    assert_eq!(finished.support, 59, "its own branch, itself left out");
+}
+
+#[test]
+fn calibration_scores_a_run_only_on_what_it_had_done_by_then() {
+    // Two branches that part on whether the one tool is called again:
+    // every run that called it once succeeded, every run that called it
+    // twice failed. At the moment of its first call no run can tell which
+    // it is on, so foresight at depth 1 must not look perfect.
+    let fixture = TempStore::open("calibration-honest", crate::Config::default());
+    let store = fixture.store();
+    let now = now();
+    let mut spans = Vec::new();
+    for index in 0..60_u64 {
+        let start = now - 3 * 3_600_000_000_000 - index * 60_000_000_000;
+        spans.extend(synthetic_run(
+            &format!("once-{index}"),
+            "checker",
+            &["tool:probe"],
+            start,
+            false,
+        ));
+        spans.extend(synthetic_run(
+            &format!("twice-{index}"),
+            "checker",
+            &["tool:probe", "tool:probe"],
+            start - 30_000_000_000,
+            true,
+        ));
+    }
+    store.ingest_batch(spans).expect("ingests");
+    let map = store
+        .fate_map("", &MapRequest::new("checker"), now)
+        .expect("builds")
+        .expect("exists");
+    assert_eq!((map.runs, map.success), (120, 60));
+    let depth1 = map
+        .calibration
+        .depths
+        .iter()
+        .find(|point| point.depth == 1)
+        .expect("depth 1");
+    // A run that stopped at one call is predicted, at that call, from the
+    // runs that made at least one (half succeeded); a run that made two is
+    // predicted, at its second, from the runs that made at least two (none
+    // did). Brier 0.25 for half the runs and 0 for the rest, against a
+    // base-rate Brier of 0.25: skill one half, not the 1.0 a look at how
+    // each run's repeats ended would claim.
+    let skill = depth1.skill.expect("a skill");
+    assert!((0.4..0.6).contains(&skill), "{depth1:?}");
 }

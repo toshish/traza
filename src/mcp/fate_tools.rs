@@ -167,8 +167,9 @@ fn render(foresight: &Foresight, max_bytes: usize) -> Value {
     }
     for option in &foresight.next {
         rows.push(format!(
-            "next: {} — {} runs, {:.0}% succeeded (95% CI {:.0}–{:.0}%)",
+            "next: {}{} — {} runs, {:.0}% succeeded (95% CI {:.0}–{:.0}%)",
             sanitize(&option.token),
+            if option.repeat { " again" } else { "" },
             option.visits,
             option.success_rate * 100.0,
             option.ci95[0] * 100.0,
@@ -187,6 +188,13 @@ fn render(foresight: &Foresight, max_bytes: usize) -> Value {
          buckets (×2, ×3-5, ×6+). A completed run is left out of the counts it is judged by."
             .to_owned(),
     ];
+    if foresight.last_open {
+        notes.push(
+            "The run is still going, so its last step may repeat: it is compared with every \
+             earlier run that repeated that step at least as often here."
+                .to_owned(),
+        );
+    }
     if foresight.partial {
         notes.push(
             "The run is longer than foresight reads; its path is its beginning, and its outcome \
@@ -235,6 +243,13 @@ fn structured(foresight: &Foresight) -> Value {
         if let Some(Value::Object(node)) = object.get_mut("node") {
             if let Some(Value::String(text)) = node.get_mut("token") {
                 *text = json_safe(text);
+            }
+            if let Some(Value::Array(pooled)) = node.get_mut("pooled") {
+                for token in pooled.iter_mut() {
+                    if let Value::String(text) = token {
+                        *text = json_safe(text);
+                    }
+                }
             }
         }
         if let Some(Value::Object(divergence)) = object.get_mut("divergence") {

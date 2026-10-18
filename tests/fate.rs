@@ -134,14 +134,21 @@ fn the_map_learns_every_branch_and_names_the_fork_that_kills_runs() {
         json!(["llm:gpt-4o", "tool:search_orders×3-5"])
     );
     assert_eq!(map["hotspots"][0]["path"], json!(["llm:gpt-4o"]));
-    // The map scores itself: the branch decides most of the outcome.
-    let depth2 = map["calibration"]["depths"]
-        .as_array()
-        .expect("depths")
-        .iter()
-        .find(|point| point["depth"] == 2)
-        .expect("depth 2");
-    assert!(depth2["skill"].as_f64().expect("skill") > 0.2, "{depth2}");
+    // The map scores itself, each run only on what it had done by the
+    // moment it is scored: the branch shows partly at depth 2 (a first
+    // search cannot tell a loop from a single one) and fully at depth 3.
+    let skill = |depth: u64| {
+        map["calibration"]["depths"]
+            .as_array()
+            .expect("depths")
+            .iter()
+            .find(|point| point["depth"] == depth)
+            .and_then(|point| point["skill"].as_f64())
+            .unwrap_or_else(|| panic!("depth {depth}: {}", map["calibration"]))
+    };
+    assert!(skill(1).abs() < 0.02, "{}", map["calibration"]);
+    assert!((0.15..0.3).contains(&skill(2)), "{}", map["calibration"]);
+    assert!(skill(3) > skill(2), "{}", map["calibration"]);
 
     // The researcher's small bad branch: 27 points worse, ten runs, not
     // significant — so not a fatal fork. Its 1-in-10 branch is.
@@ -215,9 +222,27 @@ fn foresight_reads_a_live_run_against_its_agents_history() {
         "{explanation}"
     );
 
+    // One refund issued so far, and the run is still going: it may yet
+    // issue a second. It is compared with every run that issued at least
+    // one here — 54 of 60 stopped at one and succeeded, 15 of 30 issued a
+    // second — never with only the runs that stopped at one, which would
+    // be knowing what it does next.
     let healthy = ok(&server, "/v1/fate/runs/live-healthy-0");
     assert_eq!(healthy["verdict"], "on_track");
-    assert_eq!(healthy["support"], 60);
+    assert_eq!(healthy["last_open"], true);
+    assert_eq!(
+        (&healthy["support"], &healthy["node"]["success"]),
+        (&json!(90), &json!(69))
+    );
+    assert_eq!(
+        healthy["node"]["pooled"],
+        json!(["tool:issue_refund", "tool:issue_refund×2"])
+    );
+    assert_eq!(
+        healthy["next"][1],
+        json!({"token": "tool:issue_refund", "visits": 30, "success_rate": 0.5,
+               "ci95": [0.3315, 0.6685], "repeat": true})
+    );
 
     let novel = ok(&server, "/v1/fate/runs/live-novel-0");
     assert_eq!(novel["verdict"], "novel");
