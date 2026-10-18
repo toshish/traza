@@ -93,6 +93,15 @@
 
 @keyframes tzload { 0% { left: -30%; } 100% { left: 100%; } }
 @keyframes tzpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@keyframes tzflash { from { opacity: 1; } to { opacity: 0; } }
+
+/* A live row that just changed: a tint that fades, under the row's content
+   (its parent isolates a stacking context, so z-index -1 lands between the
+   parent's background and its text). */
+.tz-flash {
+  position: absolute; inset: 0; z-index: -1; pointer-events: none; background: var(--accent-tint);
+  animation: tzflash 1.4s var(--ease-out) forwards;
+}
 
 /* ------------------------------------------------ base */
 * { box-sizing: border-box; }

@@ -142,7 +142,7 @@ rail and the header's controls are real buttons, reachable by keyboard.
 | Group | Screens |
 |---|---|
 | **explore** | Overview `#/overview` · Traces `#/traces` · Sessions `#/sessions` · Live tail `#/tail` |
-| **runs** | Guard `#/guard` · Diff `#/diff` |
+| **runs** | Live `#/live` · Guard `#/guard` · Diff `#/diff` |
 | **measure** | Analytics `#/analytics` · Latency `#/latency` · Failures `#/failures` |
 | **evaluate** | Scores `#/scores` · Experiments `#/experiments` · Datasets `#/datasets` |
 | **operate** | Server `#/server`\* · Store `#/store`\* · Ledger `#/ledger` · Credentials `#/credentials`\* · Connect `#/connect` · MCP `#/mcp` |
@@ -152,6 +152,14 @@ rail and the header's controls are real buttons, reachable by keyboard.
 Detail screens hang off those: `#/trace/<id>`, `#/sessions/<id>`,
 `#/run/<run>`, `#/conversation/traces/<id>`, `#/compare?a=…&b=…`,
 `#/diff?a=…&b=…`.
+
+**Where the page lands.** An address that names no screen opens **Live** when
+runs are working right now, and the **Overview** otherwise. The page decides
+once per credential, from one read of
+[`GET /v1/runs/live?limit=1`](http-api.md#get-v1runslive) made after
+`/v1/whoami` has answered, and does not change its mind while you read; a
+store started with `--no-fuses` lands on the Overview. An address that names
+a screen always opens that screen.
 
 **A run's tenant travels in its route.** Links from Guard, a session or a
 trace to a run, from a run to its diff, and from a diff step to its tape carry
@@ -201,8 +209,9 @@ Below 900px the rail leaves the layout and opens as a drawer from **Menu** in
 the header; choosing a screen closes it. Below 700px stat tiles drop to two
 columns, side-by-side panels stack, and wide tables (the waterfall, the tape,
 the aligned diff, the ledger) scroll sideways inside their cards rather than
-widening the page. The trace detail stacks its waterfall above its inspector
-below 1150px, where the pair no longer fits side by side.
+widening the page. Live lists its runs as cards below 700px. The trace detail
+stacks its waterfall above its inspector below 1150px, where the pair no
+longer fits side by side.
 
 ## Overview
 
@@ -299,6 +308,122 @@ the per-trace breakdown, and **Run** opens it as a run: a session id is a run
 id. A session is one tenant's (`(tenant, session_id)` is its identity), so
 the list opens each in its own tenant and **Run** keeps it there.
 
+## Live
+
+`#/live` — the runs working right now, what each is doing, what it has spent,
+what the guard says and how runs like it have ended; and the controls to steer
+them. It follows
+[`GET /v1/runs/live/stream`](http-api.md#get-v1runslivestream) over one held
+connection, read with `fetch` so the bearer token travels as a header and
+never in the URL: the snapshot fills the screen, and each `run` event updates
+its row in place, marked for a moment so the eye finds what moved. Each run
+is keyed by tenant and id.
+
+**When the stream is not there.** A dropped connection is retried with
+backoff (half a second, doubling to ten), reset by any frame including the
+heartbeat. A connection that sends nothing at all for 40 seconds — the server
+sends its heartbeat after 15 quiet ones — is taken as dead and replaced the
+same way, so a connection left half-open by a laptop's sleep or a failover
+does not go on showing `live`. While it is down the status says
+`reconnecting` (its tooltip says what ended the connection) and the rows are
+labelled with the time they are as of. The stream has no resume cursor, so a
+reconnect starts from a snapshot that replaces everything, and the page says
+the view was rebuilt; a snapshot the server sends mid-stream (more than 256
+runs changed at once, or an erasure swept the view) is noted the same way.
+When the stream is refused because the scope's eight streams are taken, the
+page reads the listing every five seconds instead, says so, and tries the
+stream again after half a minute. A store started with `--no-fuses` gets a
+sentence saying so.
+
+Nothing is said about the runs until a listing has been read in the scope on
+screen: until then the page shows a placeholder, or — when the server has not
+answered — `Not connected yet` with the error and when it tries again, never
+"no run is live". A request the server refuses outright (any other `4xx`
+than `408` and `429`, such as a tenant typed into the filter that is not a
+tenant name) is not retried: the page shows the server's message, keeps the
+filter to correct, and offers **Retry**.
+
+The stream sends nothing when a run goes quiet, so a row leaves once its last
+activity is older than the live window. The server's timestamps are its own
+clock, and nothing it sends says what time it is there, so the page bounds
+its estimate with what the rows prove: no activity is in the server's future,
+every run listed is inside the live window, and a run whose activity moved
+since the page last looked moved within that time. The estimate follows a
+server clock behind the browser's as readily as one ahead of it.
+
+**Each run** shows its id (a link to its tape, in its tenant), its agent, its
+tenant to an operator, the step it is on — kind and name; when a pre-call
+check named it and no span has arrived since, it is marked pending with how
+long since the check, and otherwise the step has ended and the page says how
+long ago the run's latest span arrived — its steps, tokens and cost (the
+cost counts up to a new value rather than jumping, unless the system asks for
+reduced motion), the guard's verdict with its reasons on hover,
+**foresight**, and the nudges waiting for its next check. Foresight is the
+server's: a chip (`on track`, `at risk`, `likely failure`, `novel path`), the
+success rate with its 95% interval and the number of earlier runs behind it
+(`n 60`), and a track drawing the rate, the interval and the agent's base
+rate. For a run on a novel path the rate is the path's before the run left
+it, labelled `before` and drawn faded: it is not the run's odds. A run with
+fewer than 30 earlier runs on its path shows how many it has
+(`no history n 6/30`). On a phone the card shows the same figures, the count
+included. Opening a row shows the reasons in full, the foresight in a
+sentence, the run's policy, service and start, and its nudges.
+
+**Held and waiting runs.** A [predictive fuse](foresight.md#predictive-fuses)
+is evaluated on the pre-call check and the verdict route only, never into the
+listing, so a run it holds shows nothing but a pending step. When a named
+step has been pending for four seconds the page asks the run's verdict
+([`GET /v1/fuses/runs/{run}`](http-api.md#get-v1fusesrunsrun), a read from
+memory that is neither activity nor a change, and never takes the run's
+nudges), at most four runs every three seconds — runs never asked first, then
+the longest waiting — and each at most once per ten seconds or per move it
+makes. A run whose verdict is `stop` is shown as **held**, with the verdict's
+reasons.
+
+That verdict judges the path so far. The check judged the path with the
+named step added — the tool it names, the cost it estimates, a block nudge
+queued for it — so a hold on that step alone (a predictive limit judging the
+tool, a budget the step would cross) cannot be read from here. A run whose
+named step has been pending for ten seconds without being found held is
+therefore shown as **waiting**, not as the listing's `continue`: it is
+running a long step, or its check refused it, and the page says it cannot
+tell which. Waiting runs count as needing attention, and offer **Approve**.
+
+**Order and filters.** By default runs that need a person come first: stopped
+or held, then foresight's likely failures and at-risk runs, guard warnings,
+waiting runs, novel paths, runs with nudges waiting, then the rest; runs that have gone
+quiet (no activity for 30 seconds and no step pending) come after the active
+ones and are dimmed. Ties keep their start order, so a row moves only when its
+risk does. `recent` and `cost` sort by those instead. Chips filter to runs
+needing attention, active runs, stopped or held runs, and runs with nudges
+waiting; the tiles above — live runs, spend, tokens, needing attention,
+stopped or held, nudges waiting — are those filters too. An agent menu, a run
+search and, for an operator, a tenant field narrow it further. The filter and
+sort live in the URL.
+
+To a credential with `rw`:
+
+- **Nudge** opens a composer for [a nudge](steer.md#nudges): `advice` or
+  `block` (a veto of the next step, with what that does spelled out), the
+  message with its size in UTF-8 bytes against the server's 4,096, and an
+  expiry (10 minutes to 7 days; an hour by default). Above it, the run's
+  foresight and — from
+  [`GET /v1/fate/runs/{run}`](http-api.md#get-v1faterunsrun) — the server's
+  explanation and what earlier runs did next from here, with their rates.
+  After sending, the dialog follows the nudge: pending until the run's next
+  pre-call check, then delivered (with how long it waited) or expired — through
+  a failed read, which keeps the list it had. A send in flight is not sent
+  again by a second press.
+- **Kill** pulls the kill switch, with an optional reason.
+- **Approve** resets a stopped, held or waiting run, optionally with a grant;
+  for a waiting run the dialog says why the page cannot tell whether it was
+  refused. For a foresight stop the dialog says that a reset alone does not
+  lift it and a grant of lower `min_success_odds` does. After a reset or a
+  trip, what the page had read about the run's hold is dropped and read
+  again.
+
+A read-only credential sees everything and none of the controls.
+
 ## Guard
 
 `#/guard` — the runs the [run guard](guard.md) holds, from
@@ -319,7 +444,7 @@ a run it is not following appears once something asks about it.
 Each run shows its verdict, its tenant (to an operator), the policy it is held
 to, when and how a stop tripped, any grant, and the reasons in the server's
 words. Below them, **one bar per limit in force** — cost, tokens, steps, LLM
-and tool calls, duration, repeats, error streak — drawn against the limit with
+and tool calls, duration, repeats, error streak, handoff cycles — drawn against the limit with
 a mark at 80%, where the guard starts to warn; a limit the policy does not set
 is unbounded and gets no bar. The most repeated step's fingerprint and the
 span that tripped a stop are linked as evidence.
@@ -332,9 +457,17 @@ To a credential with `rw`:
   higher limits, as absolute values, for that run only
   ([reset](http-api.md#post-v1fusesrunsrunreset)). A reset does not refill
   cumulative usage; a run still past a cost, token, step or duration limit is
-  stopped again at once, and the page says so and points at the grant.
+  stopped again at once, and the page says so and points at the grant. A
+  grant may also lower `min_success_odds`, which is how a foresight stop is
+  lifted, or raise `foresight_min_support` or `foresight_after_steps`.
 - **Policies** can be created, edited and deleted: name, the service whose
-  runs it holds (none for `default`), the eight limits, and `warn` or `stop`.
+  runs it holds (none for `default`), the limits — the eight usage limits,
+  `max_handoff_cycles`, the predictive `min_success_odds` (a fraction up to
+  1) and its two companions `foresight_min_support` and
+  `foresight_after_steps` (whole numbers, refused without `min_success_odds`,
+  as the server refuses them) — and `warn` or `stop`. A limit the editor does
+  not know, from a newer server, is shown as its own field and saved as it
+  was, never dropped.
 
 The **global default** — the server's `--fuse-*` flags, which every run with
 no matching or `default` policy gets — is shown above the runs. A
@@ -376,6 +509,58 @@ divergence. The panel belongs to the tape on screen: when the tape is read in
 another tenant (**Scope**, or a changed `?tenant=`), the panel starts over as
 the new tape arrives, and a replay of the old recording — made, or still being
 made — is dropped rather than shown beside the new one.
+
+**Fork from here.** An opened model or tool step offers a [fork](fork.md).
+The editor starts from the step's recorded answer — a model answer holding
+only text as that text, anything else (tool calls, several messages) as JSON,
+a tool result as JSON — and creates the replay with the edit
+([`POST /v1/replays`](http-api.md#post-v1replays) with `edits`), going live
+after the step unless told to let the recording play on. **Rewind** instead
+replays the steps before this one exactly and goes live from it (a live point
+alone). Matching before the cut is `strict` or `loose`. JSON that does not
+parse is refused before anything is sent; the server's own refusals are shown
+as it words them. The answer carries the fork's id, its cut and its live
+point, the environment for a harness of your own — the replay's base URLs,
+its key, and the `TRAZA_FORK_*` values and `traza.fork.*` attributes the
+forked run's spans must carry under a session id of their own — then the same
+fork for the Python client (`traza.fork(…)`, which makes a fork of its own
+with the same edit and does the switching and tagging) and as a
+`traza fork` command. The key is written as
+[`TRAZA_REPLAY_KEY`](fork.md#the-agents-key), a `ro` credential bound to the
+run's tenant, never the Traza token: a fork's live half talks to the real
+provider, and a harness that swaps only the base URL there would send it the
+key. Every value in the environment is one shell word on its own line, a run
+id holding a newline included, so pasting the block runs nothing but the
+exports. When the run's tenant is known both snippets name it (`tenant=` and
+`--tenant`, the default tenant as `''`). The command has no matching option
+for a loose fork, so for one the page says so and gives the Python form
+only. **What has it served?** reads the
+replay's status: what it served, when it went live and how many live calls,
+which edits were served.
+
+**Forks** lists the run's forks from
+[`GET /v1/forks`](http-api.md#get-v1forks): each fork's run (a link to its
+tape), where it was cut, how it ended, its steps, cost and duration against
+the parent's, the parent's outcome, the first divergence in the differ's
+words (marked when the fork parted before its cut), and a link to the
+parent-vs-fork diff. A fork the server did not compare says why; spans that
+joined the parent run, and a partial listing, are noted. The listing reads
+again after a fork is made here, and on **Refresh**.
+
+**Agents** draws the run's agent graph from
+[`GET /v1/runs/{run}/topology`](http-api.md#get-v1runsruntopology): agents
+on a ring with their step counts (a service standing in for an agent is
+dashed), handoffs as arrows with their counts, delegations dashed, and pairs
+that bounced control back and forth in the error colour; below, each pair
+control came straight back between, with its count and a link to an example
+return, and the turns in step order. A pair is ping-pong when control came
+back both ways, or came back to one agent twice; a supervisor handing work to
+each worker in turn gets control back once from each, which is listed as
+plain `returns`, never as ping-pong. The ten busiest agents are drawn and the rest counted; a run
+with one agent and no handoffs gets a sentence instead of a picture.
+**Nudges** lists the run's nudges, newest first, each with its kind, message
+and how it ended, and opens the composer for a writer. Both are one tenant's,
+so like the guard verdict they are shown only when the run's tenant is known.
 
 **Compare with…** takes another run id, with recent sessions offered as
 suggestions, and opens the diff.
@@ -525,6 +710,16 @@ next poll would answer `401` over the one-time display — and says so. Adopting
 it is a token change like any other: the one-time display stays up while the
 page asks `/v1/whoami` about the new token, and the list is read with it once
 the server has confirmed an operator.
+
+A minted secret belongs to the credential that minted it. A mint still in
+flight when the page switches to another credential — a handoff link followed
+before the answer — is dropped unseen, and a token on display is cleared by a
+switch. Adopting the first token on an open store is the one switch the
+display follows. The first mint on an open store is never dropped: it closed
+the store and is its only admin credential, so if the page switched tokens
+while it was in flight it is shown anyway — an open store kept it from no
+one — with a note that it closed the store, and offered for the tab rather
+than adopted.
 
 ## Connect
 

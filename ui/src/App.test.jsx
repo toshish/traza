@@ -18,6 +18,8 @@ import { isOperatorPath } from './lib/session.js';
 import whoamiBound from './test/fixtures/whoami_bound.json';
 import whoamiOpen from './test/fixtures/whoami_open.json';
 import usageBound from './test/fixtures/usage_bound.json';
+import liveRuns from './test/fixtures/live_runs.json';
+import liveStream from './test/fixtures/live_stream.txt?raw';
 
 const json = (status, body) => new Response(JSON.stringify(body), {
   status, headers: { 'Content-Type': 'application/json' },
@@ -120,6 +122,57 @@ describe('an operator', () => {
     const nav = Array.from(document.querySelectorAll('nav[aria-label="Screens"] button')).map((b) => b.textContent);
     expect(nav).toEqual(expect.arrayContaining(['Server', 'Store', 'Credentials', 'Ledger', 'Guard', 'Diff']));
     expect(screen.getByTestId('rail-scope').textContent).toContain('open store');
+  });
+});
+
+describe('the landing screen', () => {
+  /** An open store whose guard holds `runs` live; the stream answers with
+      the captured bytes. Records every path. */
+  function serveLive(runs) {
+    const paths = [];
+    globalThis.fetch = vi.fn(async (url) => {
+      const path = String(url).split('?')[0];
+      paths.push(String(url));
+      if (path === '/v1/whoami') return json(200, whoamiOpen);
+      if (path === '/v1/runs/live') return json(200, { ...liveRuns, runs });
+      if (path === '/v1/runs/live/stream') {
+        return new Response(runs.length ? liveStream : 'event: snapshot\ndata: {"runs":[],"truncated":false,"window_ns":900000000000}\n\n',
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      return json(200, EMPTY[path] || {});
+    });
+    return paths;
+  }
+
+  it('is Live when runs are working right now, decided from one read of the guard', async () => {
+    vi.setSystemTime(new Date(Math.max(...liveRuns.runs.map((r) => r.last_activity_ns)) / 1e6 + 1000));
+    const paths = serveLive(liveRuns.runs);
+    window.location.hash = '';
+    render(<App />);
+    await settle(0);
+    await settle(50);
+    expect(paths).toContain('/v1/runs/live?limit=1');
+    expect(document.querySelector('header').textContent).toContain('Live');
+    expect(screen.getAllByTestId('live-row').length).toBe(liveRuns.runs.length);
+    expect(document.querySelector('nav [aria-current="page"]').textContent).toBe('Live');
+  });
+
+  it('is the Overview when nothing is live, and an address naming a screen is never redirected', async () => {
+    serveLive([]);
+    window.location.hash = '';
+    render(<App />);
+    await settle(0);
+    await settle(50);
+    expect(document.querySelector('header').textContent).toContain('Overview');
+    expect(screen.queryAllByTestId('live-row')).toHaveLength(0);
+    cleanup();
+
+    serveLive(liveRuns.runs);
+    window.location.hash = '#/overview';
+    render(<App />);
+    await settle(0);
+    await settle(50);
+    expect(document.querySelector('header').textContent).toContain('Overview');
   });
 });
 
@@ -438,5 +491,101 @@ describe('a credential change', () => {
     expect(screen.queryByTestId('minted-token')).toBeNull();
     expect(server.sentWith('trz_first').filter((p) => p === '/v1/whoami').length).toBe(asked);
     expect(getToken()).toBe('trz_first');
+  });
+
+  // An admin credential minted by an operator, whose secret must never be
+  // shown to whoever holds the tab after a switch to another credential.
+  const ADMIN_MINT = {
+    id: 'cr_admin2', token: 'trz_admin_secret', prefix: 'trz_admi', scope: 'admin', tenant: null,
+    label: 'second admin', source: 'api', created_at_ns: 1, expires_at_ns: null,
+  };
+
+  function serveMint() {
+    const server = serveTokens({
+      'Bearer op-token': { whoami: OPERATOR },
+      'Bearer tenant-token': { whoami: whoamiBound },
+    });
+    server.route = (c) => (c.path === '/v1/admin/credentials' && c.method === 'POST'
+      ? json(200, ADMIN_MINT) : undefined);
+    return server;
+  }
+
+  it('drops a mint that answers after a switch to another credential, secret unseen', async () => {
+    // The reproduction: an operator starts minting an unbound admin
+    // credential, then follows a tenant-token handoff before the answer.
+    const server = serveMint();
+    setToken('op-token');
+    window.location.hash = '#/credentials';
+    render(<App />);
+    await settle(0);
+    await settle(10);
+
+    server.hold = (c) => c.path === '/v1/admin/credentials' && c.method === 'POST';
+    await act(async () => { fireEvent.click(screen.getByText('Mint')); });
+    await settle(10);
+    await navigateTo('#/overview?token=tenant-token');
+    await settle(10);
+    expect(getToken()).toBe('tenant-token');
+
+    server.release((c) => c.method === 'POST');
+    await settle(10);
+    expect(screen.queryByTestId('minted-token')).toBeNull();
+    expect(document.body.textContent).not.toContain('trz_admin_secret');
+    expect(screen.queryByRole('dialog', { name: 'Credential minted' })).toBeNull();
+  });
+
+  it('never loses the store\'s first admin secret: a mint that closed an open store is shown even after a switch', async () => {
+    // An open store takes any token, so a handoff link followed while the
+    // first mint is in flight switches the tab before the answer lands —
+    // and that answer is the only admin credential the store now has.
+    const server = serveTokens({ '': { whoami: whoamiOpen }, 'Bearer handed-off': { whoami: whoamiOpen } });
+    const minted = {
+      id: 'cr_first', token: 'trz_first', prefix: 'trz_firs', scope: 'admin', tenant: null,
+      label: null, source: 'api', created_at_ns: 1, expires_at_ns: null,
+    };
+    server.route = (c) => {
+      if (c.path !== '/v1/admin/credentials' || c.method !== 'POST') return undefined;
+      server.byToken = { 'Bearer trz_first': { whoami: OPERATOR } };
+      return json(200, minted);
+    };
+    window.location.hash = '#/credentials';
+    render(<App />);
+    await settle(0);
+    await settle(10);
+
+    server.hold = (c) => c.path === '/v1/admin/credentials' && c.method === 'POST';
+    await act(async () => { fireEvent.click(screen.getByText('Mint')); });
+    await settle(10);
+    await navigateTo('#/overview?token=handed-off');
+    expect(getToken()).toBe('handed-off');
+
+    server.release((c) => c.method === 'POST');
+    await settle(10);
+    const dialog = screen.getByRole('dialog', { name: 'Credential minted' });
+    expect(within(dialog).getByTestId('minted-token').textContent).toContain('trz_first');
+    expect(dialog.textContent).toMatch(/closed the store/);
+    // Not adopted behind the reader's back: the tab keeps the token it was
+    // switched to, and the dialog offers this one.
+    expect(getToken()).toBe('handed-off');
+    expect(within(dialog).getByText('Use in this tab')).toBeTruthy();
+  });
+
+  it('clears a minted secret on display when the tab switches to another credential', async () => {
+    const server = serveMint();
+    setToken('op-token');
+    window.location.hash = '#/credentials';
+    render(<App />);
+    await settle(0);
+    await settle(10);
+
+    await act(async () => { fireEvent.click(screen.getByText('Mint')); });
+    await settle(10);
+    expect(screen.getByTestId('minted-token').textContent).toContain('trz_admin_secret');
+    expect(server.calls.some((c) => c.method === 'POST' && c.auth === 'Bearer op-token')).toBe(true);
+
+    await navigateTo('#/overview?token=tenant-token');
+    await settle(10);
+    expect(screen.queryByTestId('minted-token')).toBeNull();
+    expect(document.body.textContent).not.toContain('trz_admin_secret');
   });
 });

@@ -273,3 +273,29 @@ describe('the evidence pack', () => {
     expect(calls[1].url).toBe('/v1/evidence?since=1&until=2');
   });
 });
+
+describe('a stream that ends in an error', () => {
+  it('lets the body go without leaving the cancel\'s rejection unhandled, as leaving a live screen ends one', async () => {
+    const unhandled = [];
+    const onNodeUnhandled = (reason) => unhandled.push(reason);
+    process.on('unhandledRejection', onNodeUnhandled);
+    try {
+      const cut = new DOMException('signal is aborted without reason', 'AbortError');
+      mockFetch(() => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('event: snapshot\ndata: {"runs":[]}\n\n'));
+          // The connection is cut under the reader, as an abort cuts it.
+          setTimeout(() => controller.error(cut), 0);
+        },
+      }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }));
+      const chunks = await api.liveChunks({});
+      const seen = [];
+      await expect((async () => { for await (const chunk of chunks) seen.push(chunk); })()).rejects.toBe(cut);
+      expect(seen).toHaveLength(1);
+      await new Promise((done) => setTimeout(done, 20));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onNodeUnhandled);
+    }
+  });
+});

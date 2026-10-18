@@ -273,6 +273,34 @@ function read(path, signal) {
   });
 }
 
+/** A streamed response as an async iterable of decoded text chunks.
+
+    Decoding is stateful (`stream: true`): a chunk boundary can fall inside a
+    multi-byte character, and decoding each chunk independently would turn
+    every such name into replacement characters. */
+async function streamChunks(path, signal) {
+  const response = await request(path, { raw: true, signal });
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  return {
+    async *[Symbol.asyncIterator]() {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          yield decoder.decode(value, { stream: true });
+        }
+      } finally {
+        // Releasing matters on the abort path: without it the response body
+        // stays locked and the connection is held until GC gets to it. On
+        // that path the cancel's promise rejects with the abort's reason;
+        // left unhandled, leaving the screen threw it as a page error.
+        try { Promise.resolve(reader.cancel()).catch(() => {}); } catch (e) { /* already closed */ }
+      }
+    },
+  };
+}
+
 /** Drops `url` from the in-flight map only if `entry` is still the one there.
     Without the identity check a settling or aborted request can evict its own
     replacement. */
@@ -360,31 +388,13 @@ export const api = {
    *  Not `EventSource`: that cannot set an `Authorization` header, and the only
    *  alternative it leaves is putting the bearer token in the URL, where it
    *  lands in proxy logs and browser history. `fetch` carries the header, and
-   *  its reader is abortable, which `EventSource` also is not.
-   *
-   *  Decoding is stateful (`stream: true`): a chunk boundary can fall inside a
-   *  multi-byte character, and decoding each chunk independently would turn
-   *  every such span name into replacement characters. */
-  tailChunks: async (filters, signal) => {
-    const response = await request('/v1/tail' + query(filters), { raw: true, signal });
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    return {
-      async *[Symbol.asyncIterator]() {
-        try {
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            yield decoder.decode(value, { stream: true });
-          }
-        } finally {
-          // Releasing matters on the abort path: without it the response body
-          // stays locked and the connection is held until GC gets to it.
-          try { reader.cancel(); } catch (e) { /* already closed */ }
-        }
-      },
-    };
-  },
+   *  its reader is abortable, which `EventSource` also is not. */
+  tailChunks: (filters, signal) => streamChunks('/v1/tail' + query(filters), signal),
+
+  /** The live runs as a stream of decoded text chunks — `GET
+      /v1/runs/live/stream`, read like the tail and for the same reason: the
+      bearer token travels as a header, never in the URL. */
+  liveChunks: (params, signal) => streamChunks('/v1/runs/live/stream' + query(params), signal),
 
   // ---------------------------------------------------------------- identity
 
@@ -408,6 +418,23 @@ export const api = {
   fuseReset: (run, grant, params) => request('/v1/fuses/runs/' + encodeURIComponent(run) + '/reset' + query(params),
     { method: 'POST', body: grant && Object.keys(grant).length ? { grant } : {} }),
   policies: (params, signal) => read('/v1/fuses/policies' + query(params), signal),
+
+  // ----------------------------------------------- steer: live runs, nudges
+
+  /** The runs working now, from the guard's memory. `tenant` names one for
+      an unbound credential; absent is every tenant. */
+  liveRuns: (params, signal) => read('/v1/runs/live' + query(params), signal),
+  /** A run's nudges, in the order they were queued. */
+  nudges: (run, params, signal) => read('/v1/runs/' + encodeURIComponent(run) + '/nudges' + query(params), signal),
+  /** Queues a nudge for the run's next pre-call check. Needs `rw`. */
+  nudge: (run, body, params) => request('/v1/runs/' + encodeURIComponent(run) + '/nudges' + query(params),
+    { method: 'POST', body }),
+  /** The run's agent graph: agents, delegations, handoffs, ping-pong. */
+  topology: (run, params, signal) => read('/v1/runs/' + encodeURIComponent(run) + '/topology' + query(params), signal),
+  /** How earlier runs of its agent that took the same path ended. */
+  fateRun: (run, params, signal) => read('/v1/fate/runs/' + encodeURIComponent(run) + query(params), signal),
+  /** A run's forks, each diffed against it. */
+  forks: (params, signal) => read('/v1/forks' + query(params), signal),
   savePolicy: (policy) => request('/v1/fuses/policies', { method: 'POST', body: policy }),
   deletePolicy: (id) => request('/v1/fuses/policies/' + encodeURIComponent(id) + '/delete', { method: 'POST' }),
 

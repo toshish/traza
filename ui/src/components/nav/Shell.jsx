@@ -24,6 +24,7 @@ export const NAV = [
     { id: 'tail', label: 'Live tail' },
   ] },
   { label: 'runs', items: [
+    { id: 'live', label: 'Live' },
     { id: 'guard', label: 'Guard' },
     { id: 'diff', label: 'Diff' },
   ] },
@@ -69,7 +70,8 @@ export const SCREENS = {
   sessions: ['Sessions', 'conversations, most recent first'],
   session: ['Session', 'one conversation end to end'],
   conversation: ['Conversation', 'the turns, as they were exchanged'],
-  run: ['Run', 'the tape: every step in order, and a replay of it'],
+  run: ['Run', 'the tape: every step in order, a replay of it, a fork from any step'],
+  live: ['Live', 'the runs working now, and the wheel'],
   guard: ['Guard', 'runs held to their limits, and the brake'],
   diff: ['Diff', 'two runs aligned, and where they first parted'],
   analytics: ['Analytics', 'cost, tokens, latency and efficiency by any grouping'],

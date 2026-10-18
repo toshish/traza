@@ -1,0 +1,1 @@
+{"created_at_ns":1792316739940125000,"delivered_at_ns":null,"expires_at_ns":1792320339940125000,"id":"nd_8e50e113592d3d62","kind":"advice","message":"The order search keeps coming back empty. Stop searching and issue the refund for the order the customer named.","run":"tkt-4106","status":"pending","tenant":""}

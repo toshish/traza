@@ -13,6 +13,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, act, cleanup, fireEvent, screen, within } from '@testing-library/react';
 import fuseRuns from '../test/fixtures/fuse_runs.json';
 import policies from '../test/fixtures/policies.json';
+// A policy with a predictive limit and both its companions, as a 0.28.0
+// server stored and listed it.
+import predictive from '../test/fixtures/policies_predictive.json';
 
 /** The server's listing: `state` selects a verdict class, `limit` cuts the
     most recently active first. */
@@ -185,5 +188,33 @@ describe('parseLimits', () => {
       .toEqual({ limits: { max_cost_usd: 2.5, max_steps: 40 } });
     expect(parseLimits({ max_steps: '0' }).error).toMatch(/positive/);
     expect(parseLimits({ max_steps: '2.5' }).error).toMatch(/whole/);
+  });
+});
+
+describe('a predictive policy', () => {
+  it('saves every limit it was loaded with: editing one field never drops the predictive companions', async () => {
+    api.policies.mockImplementation(async () => predictive);
+    await show(RW);
+    fireEvent.click(within(screen.getByTestId('policy-row')).getByText('Edit'));
+    const dialog = screen.getByRole('dialog', { name: 'Edit policy' });
+    expect(within(dialog).getByLabelText('foresight_min_support').value).toBe('100');
+    expect(within(dialog).getByLabelText('foresight_after_steps').value).toBe('5');
+    fireEvent.change(within(dialog).getByLabelText('max_cost_usd'), { target: { value: '3' } });
+    await act(async () => { fireEvent.click(within(dialog).getByText('Save policy')); });
+    expect(api.savePolicy).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'support',
+      limits: { max_cost_usd: 3, min_success_odds: 0.7, foresight_min_support: 100, foresight_after_steps: 5 },
+    }));
+    api.policies.mockImplementation(async () => policies);
+  });
+
+  it('refuses the companions without the odds they tune, as the server does, and only in a policy', () => {
+    expect(parseLimits({ foresight_min_support: '100' }, { policy: true }).error)
+      .toMatch(/foresight_min_support .*min_success_odds/);
+    expect(parseLimits({ foresight_after_steps: '2.5', min_success_odds: '0.7' }, { policy: true }).error).toMatch(/whole/);
+    expect(parseLimits({ min_success_odds: '0.7', foresight_min_support: '100' }, { policy: true }))
+      .toEqual({ limits: { min_success_odds: 0.7, foresight_min_support: 100 } });
+    // A grant may raise one alone: the server merges it over the policy's.
+    expect(parseLimits({ foresight_min_support: '100' })).toEqual({ limits: { foresight_min_support: 100 } });
   });
 });

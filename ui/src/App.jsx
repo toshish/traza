@@ -28,6 +28,7 @@ import { StoreScreen } from './views/StoreScreen.jsx';
 import { ConnectScreen } from './views/ConnectScreen.jsx';
 import { McpScreen } from './views/McpScreen.jsx';
 import { GuardScreen } from './views/GuardScreen.jsx';
+import { LiveScreen } from './views/LiveScreen.jsx';
 import { RunScreen } from './views/RunScreen.jsx';
 import { DiffScreen } from './views/DiffScreen.jsx';
 import { LedgerScreen } from './views/LedgerScreen.jsx';
@@ -104,6 +105,29 @@ function useIdentity(generation) {
     return () => { live = false; clearTimeout(timer); };
   }, [generation]);
   return answer && answer.generation === generation ? answer.identity : null;
+}
+
+/** Where an address with no screen lands: Live when runs are working right
+    now, else the Overview. Decided once per credential, from one read of
+    the guard's memory (`GET /v1/runs/live?limit=1`), once the server has
+    said who the credential is — and never re-decided under the reader's
+    feet because a run started while they read the Overview. Anything that
+    is not a listing with a run in it (a store started with --no-fuses
+    answers 409) lands on the Overview. `null` while undecided. */
+function useLanding(identity, generation) {
+  const [landing, setLanding] = React.useState(null);
+  const known = Boolean(identity);
+  React.useEffect(() => {
+    if (!known) return undefined;
+    let live = true;
+    const controller = new AbortController();
+    api.liveRuns({ limit: 1 }, controller.signal).then(
+      (doc) => { if (live) setLanding({ generation, screen: doc && Array.isArray(doc.runs) && doc.runs.length ? 'live' : 'overview' }); },
+      () => { if (live) setLanding({ generation, screen: 'overview' }); },
+    );
+    return () => { live = false; controller.abort(); };
+  }, [generation, known]);
+  return landing && landing.generation === generation ? landing.screen : null;
 }
 
 const NO_PULSE = { rate: null, spark: [], live: false, durability: null, count: null };
@@ -208,7 +232,9 @@ export function App() {
   // A credential just minted, shown once. Held here rather than by the
   // Credentials screen: adopting the first token on an open store is a
   // credential change, which remounts every screen, and the one-time display
-  // must survive it.
+  // must survive it. It is kept with the credential generation it belongs
+  // to, and shown only under that generation: a secret minted by one
+  // credential is that credential's holder's to see, not the next one's.
   const [minted, setMinted] = React.useState(null);
   const [palette, setPalette] = React.useState(false);
   const [drawer, setDrawer] = React.useState(false);
@@ -252,6 +278,7 @@ export function App() {
   const identity = useIdentity(generation);
   const operator = Boolean(identity && identity.operator === true);
   const pulse = useIngestPulse(identity, generation);
+  const landing = useLanding(identity, generation);
 
   // After a new token is stored: close the prompt and re-arm it. Re-asking
   // whoami and remounting every screen under the token follow from the
@@ -272,13 +299,38 @@ export function App() {
   // is adopted at once, or the next poll would answer 401 and open the prompt
   // over the one-time display — and adopting it is a token change like any
   // other: the screens wait for whoami before asking an operator surface.
-  const onMinted = (doc, { adopt = false } = {}) => {
-    setMinted(adopt ? { ...doc, adopted: true } : doc);
-    if (adopt) changeToken(doc.token);
+  //
+  // `asked` is the generation the mint was sent under. An answer that lands
+  // after the tab has switched credentials — a handoff link followed while
+  // the POST was in flight — is dropped: the screen that asked is gone, and
+  // the secret would otherwise appear over another credential's session,
+  // with an offer to adopt it. Adopting the first token is the one switch
+  // the display follows, so it moves to the new generation explicitly.
+  //
+  // Except the first mint on an open store: that answer closed the store and
+  // is its only admin credential, so dropping it would lock everyone out
+  // until a recovery on the server. An open store had no credential to keep
+  // it from — anyone who could reach the page could mint — so it is shown
+  // under the credential the tab holds now, not adopted, and marked as what
+  // closed the store.
+  const onMinted = (doc, { adopt = false, asked = credentialGeneration() } = {}) => {
+    if (asked !== credentialGeneration()) {
+      if (adopt) setMinted({ doc: { ...doc, closedStore: true }, generation: credentialGeneration() });
+      return;
+    }
+    if (adopt) {
+      changeToken(doc.token);
+      setMinted({ doc: { ...doc, adopted: true }, generation: credentialGeneration() });
+    } else {
+      setMinted({ doc, generation: asked });
+    }
   };
+  const mintedShown = minted && minted.generation === generation ? minted.doc : null;
 
   const [head, second, third] = route.parts;
-  const screen = head || 'overview';
+  // An address naming no screen waits for the landing decision (a moment:
+  // one read from memory) rather than mounting the Overview only to swap it.
+  const screen = head || landing || 'landing';
   const go = React.useCallback((parts, params) => navigate(Array.isArray(parts) ? parts : [parts], params), []);
 
   // Leaving a screen closes the narrow-width drawer: it was opened to go
@@ -326,6 +378,8 @@ export function App() {
         break;
       case 'run': view = <RunScreen key={k('run:' + second)} runId={second} {...common} />; break;
       case 'guard': view = <GuardScreen key={k('guard')} {...common} />; break;
+      case 'live': view = <LiveScreen key={k('live')} {...common} />; break;
+      case 'landing': view = <Skeleton height={120} />; break;
       case 'diff': view = <DiffScreen key={k('diff')} {...common} />; break;
       case 'analytics': view = <AnalyticsScreen key={k('analytics')} {...common} />; break;
       case 'latency': view = <LatencyScreen key={k('latency')} {...common} />; break;
@@ -364,7 +418,7 @@ export function App() {
     <NavRail screen={railScreen} ingest={pulse} identity={identity} open={drawer} onGo={(id) => go([id])} />
     <div className="tz-scrim" data-open={drawer ? 'true' : 'false'} onClick={() => setDrawer(false)} aria-hidden="true" />
     <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-      <Header screen={SCREENS[screen] ? screen : 'overview'} subtitle={subtitle}
+      <Header screen={screen === 'landing' ? 'landing' : SCREENS[screen] ? screen : 'overview'} subtitle={subtitle}
         count={pulse.count} density={density} onDensity={setDensity}
         theme={theme} onTheme={() => setThemeChoice(theme === 'dark' ? 'light' : 'dark')}
         onPalette={() => setPalette(true)} onToken={() => setTokenModal(true)}
@@ -375,7 +429,7 @@ export function App() {
     <CommandPalette open={palette} onClose={() => setPalette(false)} nav={navFor(operator)}
       onNavigate={(parts) => go(parts)} />
 
-    <TokenOnce doc={minted} onClose={() => setMinted(null)}
+    <TokenOnce doc={mintedShown} onClose={() => setMinted(null)}
       onUse={(token) => { setMinted(null); changeToken(token); }} />
 
     <Modal open={tokenModal} title="Set token" onClose={() => setTokenModal(false)} footer={<>

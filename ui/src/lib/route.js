@@ -184,6 +184,28 @@ export function readStored(key, initial) {
   try { return JSON.parse(raw); } catch (e) { return raw; }
 }
 
+/** Whether a media query matches, live. Layout facts that inline styles
+    cannot express — a table that becomes cards on a phone — read this rather
+    than rendering both and hiding one. */
+export function useMedia(query) {
+  const read = () => typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+    && Boolean(window.matchMedia(query).matches);
+  const [matches, setMatches] = React.useState(read);
+  React.useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined;
+    const list = window.matchMedia(query);
+    const onChange = () => setMatches(Boolean(list.matches));
+    onChange();
+    if (list.addEventListener) list.addEventListener('change', onChange);
+    else if (list.addListener) list.addListener(onChange);
+    return () => {
+      if (list.removeEventListener) list.removeEventListener('change', onChange);
+      else if (list.removeListener) list.removeListener(onChange);
+    };
+  }, [query]);
+  return matches;
+}
+
 /** The OS colour-scheme preference, live: it changes when the user flips
     their system theme, and a page that honours it only at load is wrong
     for the rest of the session. */

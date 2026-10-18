@@ -17,6 +17,10 @@ vi.mock('../lib/api.js', () => ({
     createReplay: vi.fn(async () => replay),
     replay: vi.fn(async () => ({ served: 1, remaining: 1, diverged: null })),
     payload: vi.fn(async () => '{"k":1}'),
+    topology: vi.fn(async () => ({ nodes: [], edges: [], handoffs: [], cycles: [], sequence: [], spans_read: 0 })),
+    nudges: vi.fn(async () => ({ nudges: [], run: 'weather-9', tenant: '' })),
+    forks: vi.fn(async () => ({ forks: [], merged_into_parent: 0, parent: null, run: 'weather-9', spans_examined: 0, truncated: false })),
+    fateRun: vi.fn(async () => null),
   },
 }));
 
@@ -83,6 +87,9 @@ describe('the tenant the tape is read in', () => {
     // out is the operator view across every tenant.
     expect(api.tape).toHaveBeenCalledWith('weather-9', expect.objectContaining({ tenant: '' }), expect.anything());
     expect(api.fuseRun).toHaveBeenCalledWith('weather-9', { tenant: '' }, expect.anything());
+    expect(api.topology).toHaveBeenCalledWith('weather-9', { tenant: '' }, expect.anything());
+    expect(api.nudges).toHaveBeenCalledWith('weather-9', { tenant: '' }, expect.anything());
+    expect(api.forks).toHaveBeenCalledWith({ run: 'weather-9', tenant: '' }, expect.anything());
     expect(screen.getByText('guard: continue')).toBeTruthy();
     await act(async () => { fireEvent.click(screen.getByText('Create replay')); });
     expect(api.createReplay).toHaveBeenCalledWith({ run: 'weather-9', mode: 'strict', tenant: '' });
@@ -97,6 +104,9 @@ describe('the tenant the tape is read in', () => {
     expect(view.container.textContent).toMatch(/every tenant/);
     expect(view.container.textContent).not.toContain('guard:');
     expect(api.fuseRun).not.toHaveBeenCalled();
+    // A run's agents and nudges are one tenant's too: not asked unscoped.
+    expect(api.topology).not.toHaveBeenCalled();
+    expect(api.nudges).not.toHaveBeenCalled();
   });
 
   it('lets an operator scope an unscoped tape to the default tenant', async () => {
