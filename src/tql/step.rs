@@ -133,6 +133,8 @@ pub(crate) struct Step<'a> {
     calls: OnceCell<Vec<String>>,
     edit: OnceCell<bool>,
     test: OnceCell<bool>,
+    /// An edit step's `(added, removed)` text (see [`Step::edit_text`]).
+    edit_text: OnceCell<(Option<String>, Option<String>)>,
     /// The request digest and fingerprint, computed on first use: the facts
     /// may come without them ([`crate::semconv::step_facts_undigested`]).
     digested: OnceCell<(Option<String>, String)>,
@@ -296,6 +298,44 @@ impl<'a> Step<'a> {
         Ok(known)
     }
 
+    /// An edit step's text as Agent Blame reads its edits
+    /// ([`crate::blame::edits`]): the lines it wrote and the lines it
+    /// replaced, each whitespace-normalised ([`crate::blame::normalize_line`]),
+    /// blank lines dropped, joined by newlines and cut to [`MAX_TEXT_BYTES`].
+    /// Either is `None` when there is none — a whole-file write replaced
+    /// nothing anyone recorded, a deletion wrote nothing — and both are for
+    /// a step that is no [edit](Self::is_edit). Normalising is what lets an
+    /// undo that re-indents still equal what it undoes.
+    fn edit_text(&self) -> &(Option<String>, Option<String>) {
+        self.edit_text.get_or_init(|| {
+            if !self.is_edit() {
+                return (None, None);
+            }
+            let edits = crate::blame::edits(self.span);
+            let join = |lines: &mut dyn Iterator<Item = &String>| {
+                let mut out = String::new();
+                for line in lines {
+                    let line = crate::blame::normalize_line(line);
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&line);
+                    if out.len() >= MAX_TEXT_BYTES {
+                        break;
+                    }
+                }
+                (!out.is_empty()).then(|| capped(&out).to_owned())
+            };
+            (
+                join(&mut edits.iter().flat_map(|edit| edit.added.iter())),
+                join(&mut edits.iter().flat_map(|edit| edit.removed.iter())),
+            )
+        })
+    }
+
     fn tokens_reported(&self) -> bool {
         self.llm.prompt_tokens.is_some()
             || self.llm.completion_tokens.is_some()
@@ -386,6 +426,27 @@ impl<'a> Step<'a> {
             },
             Field::Edit => Val::Bool(self.is_edit()),
             Field::TestRun => Val::Bool(self.is_test(meter)?),
+            Field::Conversation => text(
+                self.span
+                    .attributes
+                    .get(crate::xray::CONVERSATION_ATTRIBUTE)
+                    .and_then(Value::as_str)
+                    .filter(|conversation| !conversation.is_empty()),
+            ),
+            Field::Added | Field::Removed => {
+                let fresh = self.edit_text.get().is_none();
+                let (added, removed) = self.edit_text();
+                if fresh {
+                    // Reading the edit costs its text, once.
+                    let bytes = added.as_ref().map_or(0, String::len)
+                        + removed.as_ref().map_or(0, String::len);
+                    meter.charge(CONDITION_UNITS + bytes as u64 / BYTES_PER_UNIT)?;
+                }
+                text(match field {
+                    Field::Added => added.as_deref(),
+                    _ => removed.as_deref(),
+                })
+            }
             Field::Attr(key) => self.span.attributes.get(key).map_or(Val::Missing, json_val),
         })
     }
@@ -873,6 +934,7 @@ pub(crate) fn build_steps<'a>(
             calls: OnceCell::new(),
             edit: OnceCell::new(),
             test: OnceCell::new(),
+            edit_text: OnceCell::new(),
             digested: OnceCell::new(),
         });
     }
@@ -1525,17 +1587,34 @@ pub(crate) mod tests {
                 field_of(eager, &Field::Signature)
             );
             assert!(lazy.digested.get().is_none());
-            // Asked for, the digest and fingerprint are the eager ones.
+            // Asked for, the digest and fingerprint are the ones the eager
+            // facts computed when the step was built — read from those
+            // facts, not through `digested()` on both sides, which would
+            // compare the lazy path with itself.
             assert!(eager.facts.request_digest.is_some());
             assert_eq!(
-                field_of(lazy, &Field::Digest),
-                field_of(eager, &Field::Digest)
+                text_of(lazy, &Field::Digest),
+                eager.facts.request_digest,
+                "the lazy digest is the eager one"
             );
             assert_eq!(
-                field_of(lazy, &Field::Fingerprint),
-                field_of(eager, &Field::Fingerprint)
+                text_of(lazy, &Field::Fingerprint).as_deref(),
+                Some(eager.facts.fingerprint.as_str()),
+                "the lazy fingerprint is the eager one"
             );
             assert!(lazy.digested.get().is_some());
+        }
+    }
+
+    /// A text field's value, `None` when the step has none.
+    fn text_of(step: &Step<'_>, field: &Field) -> Option<String> {
+        match step
+            .field(field, &mut Meter::new(None))
+            .expect("no deadline")
+        {
+            Val::Text(text) => Some(text.into_owned()),
+            Val::Missing => None,
+            other => panic!("{field:?} is not text: {other:?}"),
         }
     }
 
@@ -2040,5 +2119,86 @@ pub(crate) mod tests {
         let long = "é".repeat(MAX_TEXT_BYTES);
         let text = value_text(&json!(long));
         assert!(text.len() <= MAX_TEXT_BYTES && text.is_char_boundary(text.len()));
+    }
+
+    #[test]
+    fn edits_read_as_added_and_removed_text_and_steps_name_their_conversation() {
+        let tool = |index: usize, name: &str, arguments: Value| {
+            step_span(
+                index,
+                "tool",
+                name,
+                "ok",
+                json!({"gen_ai.tool.call.arguments": arguments}),
+            )
+        };
+        let patch = "*** Begin Patch\n*** Update File: src/b.py\n@@\n-    old  line\n+    new line\n+second\n*** End Patch";
+        let spans = vec![
+            tool(
+                0,
+                "Edit",
+                json!({"file_path": "src/a.py", "old_string": "x  =  1\n\n", "new_string": "  x = 2"}),
+            ),
+            tool(
+                1,
+                "MultiEdit",
+                json!({"file_path": "src/a.py", "edits": [
+                    {"old_string": "a", "new_string": "b"},
+                    {"old_string": "c", "new_string": "d"}]}),
+            ),
+            tool(
+                2,
+                "Write",
+                json!({"file_path": "src/c.py", "content": "print(1)\n"}),
+            ),
+            tool(3, "apply_patch", json!({"input": patch})),
+            tool(
+                4,
+                "Edit",
+                json!({"file_path": "src/a.py", "old_string": "gone", "new_string": ""}),
+            ),
+            tool(5, "Read", json!({"file_path": "src/a.py"})),
+            step_span(
+                6,
+                "llm",
+                "claude",
+                "ok",
+                json!({"gen_ai.conversation.id": "sess/agent-1"}),
+            ),
+            step_span(
+                7,
+                "llm",
+                "claude",
+                "ok",
+                json!({"gen_ai.conversation.id": ""}),
+            ),
+        ];
+        let steps = steps(&spans);
+        let read = |index: usize, field: Field| text_of(&steps[index], &field);
+        // Whitespace is normalised line by line and blank lines dropped.
+        assert_eq!(read(0, Field::Added).as_deref(), Some("x = 2"));
+        assert_eq!(read(0, Field::Removed).as_deref(), Some("x = 1"));
+        // A multi-edit's parts, in order.
+        assert_eq!(read(1, Field::Added).as_deref(), Some("b\nd"));
+        assert_eq!(read(1, Field::Removed).as_deref(), Some("a\nc"));
+        // A whole-file write replaced nothing recorded.
+        assert_eq!(read(2, Field::Added).as_deref(), Some("print(1)"));
+        assert_eq!(read(2, Field::Removed), None);
+        // A Codex patch's lines.
+        assert_eq!(read(3, Field::Added).as_deref(), Some("new line\nsecond"));
+        assert_eq!(read(3, Field::Removed).as_deref(), Some("old line"));
+        // A deletion wrote nothing.
+        assert_eq!(read(4, Field::Added), None);
+        assert_eq!(read(4, Field::Removed).as_deref(), Some("gone"));
+        // A read is no edit.
+        assert_eq!(read(5, Field::Added), None);
+        assert_eq!(read(5, Field::Removed), None);
+        // The conversation a call names; an empty one is none.
+        assert_eq!(
+            read(6, Field::Conversation).as_deref(),
+            Some("sess/agent-1")
+        );
+        assert_eq!(read(7, Field::Conversation), None);
+        assert_eq!(read(0, Field::Conversation), None);
     }
 }

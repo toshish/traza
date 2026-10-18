@@ -74,11 +74,15 @@ impl Run {
     }
 
     fn edit(&mut self, file: &str) -> Value {
+        self.change(file, "a", "b")
+    }
+
+    fn change(&mut self, file: &str, old: &str, new: &str) -> Value {
         self.span(
             "ok",
             json!({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "Edit",
-                   "gen_ai.tool.call.arguments": {"file_path": file, "old_string": "a",
-                                                   "new_string": "b"}}),
+                   "gen_ai.tool.call.arguments": {"file_path": file, "old_string": old,
+                                                   "new_string": new}}),
         )
     }
 
@@ -119,10 +123,16 @@ fn seed(server: &Server, headers: &[(&str, &str)]) {
     spans.push(honest.bash("pytest -q", "ok"));
     spans.push(honest.llm(&catalog));
 
+    // Five edits of one file, each undoing the one before.
     let mut thrash = run("", "thrash", 200);
-    for _ in 0..5 {
+    for flip in 0..5 {
         spans.push(thrash.llm(&catalog));
-        spans.push(thrash.edit("src/app.py"));
+        let (old, new) = if flip % 2 == 0 {
+            ("a", "b")
+        } else {
+            ("b", "a")
+        };
+        spans.push(thrash.change("src/app.py", old, new));
     }
     spans.push(thrash.bash("make", "error"));
 
@@ -390,8 +400,13 @@ fn the_detector_library_and_its_findings() {
     assert_eq!(tampering["runs_matched"], json!(1));
     assert_eq!(tampering["examples"][0]["run"], json!("tampered"));
     assert_eq!(tampering["success_rate"], json!(1.0));
-    assert_eq!(row("edit_thrash")["runs_matched"], json!(1));
-    assert_eq!(row("edit_thrash")["outcomes"]["failure"], json!(1));
+    let thrash = row("edit_thrash");
+    assert_eq!(thrash["runs_matched"], json!(1));
+    assert_eq!(thrash["outcomes"]["failure"], json!(1));
+    assert_eq!(thrash["severity"], json!("medium"), "the run failed");
+    assert_eq!(thrash["examples"][0]["severity"], json!("medium"));
+    // The honest run edited its source once and passed: not thrash.
+    assert_eq!(thrash["examples"].as_array().map(Vec::len), Some(1));
     assert_eq!(row("hallucinated_tool")["runs_matched"], json!(1));
     assert_eq!(row("ping_pong")["runs_matched"], json!(0));
     // Findings come first, high severity first.

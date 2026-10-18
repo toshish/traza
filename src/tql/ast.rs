@@ -204,6 +204,9 @@ pub(crate) enum Field {
     UnknownCalls,
     Edit,
     TestRun,
+    Conversation,
+    Added,
+    Removed,
     Attr(String),
 }
 
@@ -252,6 +255,9 @@ pub(crate) const FIELDS: &[(&str, FieldType, &str)] = &[
     ("unknown_calls", FieldType::List, "calls an llm step made to tools outside its own catalog"),
     ("edit", FieldType::Bool, "a tool step that edits a file"),
     ("test", FieldType::Bool, "a tool step whose input runs a test suite"),
+    ("conversation", FieldType::Text, "the conversation the step names (gen_ai.conversation.id): a main thread or one sub-agent"),
+    ("added", FieldType::Text, "an edit step's new text, whitespace-normalised line by line"),
+    ("removed", FieldType::Text, "the text an edit step replaced, whitespace-normalised line by line (absent for a whole-file write)"),
 ];
 
 impl Field {
@@ -288,6 +294,9 @@ impl Field {
             "unknown_calls" => Self::UnknownCalls,
             "edit" => Self::Edit,
             "test" => Self::TestRun,
+            "conversation" => Self::Conversation,
+            "added" => Self::Added,
+            "removed" => Self::Removed,
             _ => return None,
         };
         let ty = field.field_type();
@@ -308,7 +317,10 @@ impl Field {
             | Self::Result
             | Self::Digest
             | Self::Fingerprint
-            | Self::Signature => FieldType::Text,
+            | Self::Signature
+            | Self::Conversation
+            | Self::Added
+            | Self::Removed => FieldType::Text,
             Self::Error | Self::InCatalog | Self::Edit | Self::TestRun => FieldType::Bool,
             Self::Cost
             | Self::Tokens

@@ -1842,8 +1842,9 @@ curl -sG 'http://localhost:8080/v1/trajectories/explain' \
 
 ### `GET /v1/detectors`
 
-The detector library: `{"detectors": [{name, title, severity, summary,
-query}]}` — `test_tampering`, `hallucinated_tool`, `give_up_loop`,
+The detector library: `{"detectors": [{name, title, severity,
+severity_if_succeeded, summary, query}]}` (`severity_if_succeeded` only where
+a successful run lowers it: `edit_thrash`, `low`) — `test_tampering`, `hallucinated_tool`, `give_up_loop`,
 `edit_thrash`, `ping_pong`, `context_blowup`, `retry_without_change`,
 `tool_error_streak`, `unverified_finish`. Each `query` is ordinary TQL. Takes
 no parameters.
@@ -1860,13 +1861,15 @@ The library run over the window's 2,000 most recent runs.
 | `cursor` | string | Continue from an earlier answer's `next_cursor`, as for search |
 | `tenant` | string | Tenant scope |
 
-Per detector: `name`, `title`, `severity`, `summary`, `query`,
+Per detector: `name`, `title`, `severity` (its `severity_if_succeeded`
+when every run it matched succeeded, else its `severity`), `summary`, `query`,
 `runs_matched`, `runs_inexact` (checked runs it did not match where its
 matcher hit a cap — `runs_matched` is then a lower bound), `occurrences`,
 `outcomes` (`{success, failure, abandoned,
 unknown}` of the matched runs), `success_rate` (successes over runs whose
 outcome is known; `null` when none is), up to five `examples` (newest first,
-shaped like search matches) and `last_seen_ns`. Beside them: `baseline` and
+shaped like search matches, each with the `severity` of its finding given how
+that run ended) and `last_seen_ns`. Beside them: `baseline` and
 `baseline_success_rate` over every checked run, `runs_checked` (the runs the
 detectors ran on — the baseline's total, and the denominator for
 `runs_matched`), `runs_scanned` (candidates examined, those the `agent`

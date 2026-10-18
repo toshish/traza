@@ -431,6 +431,11 @@ pub struct RunMatch {
     /// Every occurrence, when one run was searched (`run=`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub occurrences: Vec<Occurrence>,
+    /// A detector finding's severity in this run, given how the run ended
+    /// ([`Detector::severity_if_succeeded`]); set on findings' examples,
+    /// absent from a search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<Severity>,
 }
 
 /// Why a scan stopped before the window's last candidate run.
@@ -1224,6 +1229,7 @@ impl Store {
                 run_truncated: read.truncated,
                 inexact: scan.inexact,
                 occurrences,
+                severity: None,
             }),
             missed: false,
         })
@@ -1337,7 +1343,9 @@ pub struct DetectorFindings {
     pub name: &'static str,
     /// Its title.
     pub title: &'static str,
-    /// Its severity.
+    /// Its severity over the runs it matched: the detector's
+    /// [`Detector::severity_if_succeeded`] when every one of them succeeded,
+    /// else its [`Detector::severity`].
     pub severity: Severity,
     /// What it finds.
     pub summary: &'static str,
@@ -1537,7 +1545,8 @@ impl Store {
                 for row in misses {
                     rows[row].runs_inexact += 1;
                 }
-                for (row, found) in hits {
+                for (row, mut found) in hits {
+                    found.severity = Some(severity_in(&DETECTORS[selected[row]], found.outcome));
                     let entry = &mut rows[row];
                     entry.runs_matched += 1;
                     entry.occurrences += found.count;
@@ -1578,8 +1587,9 @@ impl Store {
         }
         let runs_checked =
             baseline.success + baseline.failure + baseline.abandoned + baseline.unknown;
-        for row in &mut rows {
+        for (row, &detector) in rows.iter_mut().zip(&selected) {
             row.success_rate = row.outcomes.success_rate();
+            row.severity = severity_over(&DETECTORS[detector], &row.outcomes);
         }
         let inexact = rows.iter().any(|row| row.runs_inexact > 0);
         let library_rank = |name: &str| DETECTORS.iter().position(|d| d.name == name);
@@ -1606,6 +1616,29 @@ impl Store {
             since_ns: plan.since_ns,
             until_ns: plan.until_ns,
         })
+    }
+}
+
+/// A detector's severity in one run that ended `outcome`.
+fn severity_in(detector: &Detector, outcome: Outcome) -> Severity {
+    match (outcome, detector.severity_if_succeeded) {
+        (Outcome::Success, Some(lower)) => lower,
+        _ => detector.severity,
+    }
+}
+
+/// A detector's severity over the runs it matched: lower only when every
+/// one of them succeeded — a run still under way, or one whose outcome is
+/// unknown, has not.
+fn severity_over(detector: &Detector, outcomes: &OutcomeCounts) -> Severity {
+    let all_succeeded = outcomes.success > 0
+        && outcomes.failure == 0
+        && outcomes.abandoned == 0
+        && outcomes.unknown == 0;
+    if all_succeeded {
+        severity_in(detector, Outcome::Success)
+    } else {
+        detector.severity
     }
 }
 
@@ -1836,6 +1869,27 @@ mod tests {
             "ok",
             json!({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "Edit",
                    "gen_ai.tool.call.arguments": {"file_path": file, "old_string": "a", "new_string": "b"}}),
+        )
+    }
+
+    /// An `Edit` of `file` replacing `old` with `new`.
+    fn change(
+        tenant: &str,
+        session: &str,
+        id: &str,
+        offset: u64,
+        file: &str,
+        old: &str,
+        new: &str,
+    ) -> crate::Span {
+        span(
+            tenant,
+            session,
+            id,
+            offset,
+            "ok",
+            json!({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "Edit",
+                   "gen_ai.tool.call.arguments": {"file_path": file, "old_string": old, "new_string": new}}),
         )
     }
 
@@ -2636,31 +2690,98 @@ mod tests {
         assert!(one.truncated, "{one:?}");
     }
 
-    /// One run that edits `src/x.py` five times in a row — `edit_thrash` by
-    /// definition — after four edits naming 512 files each, whose waiting
+    /// One run that edits `src/x.py` back and forth — `edit_thrash` by
+    /// definition — after four patches naming 512 files each, whose waiting
     /// paths fill the matcher before the thrash starts.
     fn crowded_thrash_store(label: &str) -> TempStore {
         let fixture = TempStore::open(label, crate::Config::default());
         let mut spans = Vec::new();
         for step in 0..4_u64 {
-            let edits: Vec<Value> = (0..512)
-                .map(|file| json!({"file_path": format!("s{step}/f{file}.py")}))
-                .collect();
+            let mut patch = String::from("*** Begin Patch\n");
+            for file in 0..512 {
+                patch.push_str(&format!(
+                    "*** Update File: s{step}/f{file}.py\n@@\n-old {file}\n+new {file}\n"
+                ));
+            }
+            patch.push_str("*** End Patch");
             spans.push(span(
                 "",
                 "crowded",
                 &format!("wide{step}"),
                 step,
                 "ok",
-                json!({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "Edit",
-                       "gen_ai.tool.call.arguments": {"edits": edits}}),
+                json!({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "apply_patch",
+                       "gen_ai.tool.call.arguments": {"input": patch}}),
             ));
         }
-        for step in 4..9_u64 {
-            spans.push(edit("", "crowded", &format!("x{step}"), step, "src/x.py"));
+        for (step, (old, new)) in (4..7_u64).zip([("a", "b"), ("b", "a"), ("a", "b")]) {
+            spans.push(change(
+                "",
+                "crowded",
+                &format!("x{step}"),
+                step,
+                "src/x.py",
+                old,
+                new,
+            ));
         }
         fixture.store().ingest_batch(spans).expect("ingests");
         fixture
+    }
+
+    #[test]
+    fn findings_weigh_edit_thrash_by_how_its_runs_ended() {
+        let fixture = TempStore::open("thrash-severity", crate::Config::default());
+        let store = fixture.store();
+        let thrash = |session: &str, base: u64, last: &str| {
+            vec![
+                change("", session, "a", base, "src/x.py", "x = 1", "x = 2"),
+                change("", session, "b", base + 1, "src/x.py", "x = 2", "x = 1"),
+                change("", session, "c", base + 2, "src/x.py", "x = 1", "x = 2"),
+                bash("", session, "d", base + 3, "pytest", last),
+            ]
+        };
+        let only_thrash = FindingsOptions {
+            detectors: vec!["edit_thrash".into()],
+            ..FindingsOptions::default()
+        };
+        store.ingest_batch(thrash("won", 0, "ok")).expect("ingests");
+        let findings = store
+            .detector_findings(Some(""), &only_thrash, NOW)
+            .expect("finds");
+        let row = &findings.detectors[0];
+        assert_eq!((row.runs_matched, row.outcomes.success), (1, 1));
+        assert_eq!(row.severity, Severity::Low, "every thrashing run succeeded");
+        assert_eq!(row.examples[0].severity, Some(Severity::Low));
+
+        store
+            .ingest_batch(thrash("lost", 10, "error"))
+            .expect("ingests");
+        let findings = store
+            .detector_findings(Some(""), &only_thrash, NOW)
+            .expect("finds");
+        let row = &findings.detectors[0];
+        assert_eq!(row.runs_matched, 2);
+        assert_eq!(row.severity, Severity::Medium, "one thrashing run failed");
+        let severity = |run: &str| {
+            row.examples
+                .iter()
+                .find(|example| example.run == run)
+                .and_then(|example| example.severity)
+        };
+        assert_eq!(severity("lost"), Some(Severity::Medium));
+        assert_eq!(severity("won"), Some(Severity::Low));
+        // A search names no severity: it is not a detector's finding.
+        let search = store
+            .trajectory_search(
+                Some(""),
+                &Query::compile(detectors::detector("edit_thrash").expect("exists").query)
+                    .expect("compiles"),
+                &SearchOptions::default(),
+                NOW,
+            )
+            .expect("searches");
+        assert!(search.matches.iter().all(|found| found.severity.is_none()));
     }
 
     #[test]

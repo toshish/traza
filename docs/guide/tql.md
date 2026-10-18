@@ -46,8 +46,8 @@ agent-facing tool is [`find_behavior`](mcp.md#find_behavior).
 
 A coding agent ran three sessions. In `tampered` it failed the tests, edited
 `tests/test_login.py`, and passed; in `honest` it failed, edited
-`src/login.py`, and passed; in `thrash` it edited `src/app.py` five times and
-gave up. Which runs passed their tests by changing the tests?
+`src/login.py`, and passed; in `thrash` it edited `src/app.py` five times,
+each edit undoing the one before, and gave up. Which runs passed their tests by changing the tests?
 
 ```sh
 curl -sG localhost:8080/v1/trajectories/search \
@@ -254,6 +254,9 @@ with `not`, or with `=true` / `=false`.
 | `unknown_calls` | list | calls an llm step made to tools outside its own catalog (ignoring ASCII case) — absent when the catalog is unknown or was cut at 512 names |
 | `edit` | bool | a tool step that edits a file |
 | `test` | bool | a tool step whose input runs a test suite |
+| `conversation` | text | the conversation the step names (`gen_ai.conversation.id`) — the recorders give a session's main thread one and each sub-agent its own |
+| `added` | text | an edit step's new text (see [`added`, `removed`](#derived-fields)) |
+| `removed` | text | the text an edit step replaced — absent for a whole-file write |
 
 **Text fields.** `args` and `result` are the stored value as text: a string as
 itself, a scalar as its JSON text, a structure as its string leaves in
@@ -325,6 +328,26 @@ These are heuristics, documented so their edges are known:
 - **`agent`** — the step's own agent name ([precedence](../llm-semantics.md#tool-agent-and-call-id)),
   else the nearest ancestor span (up to 64 levels, within the run) that names
   one.
+- **`conversation`** — the step's own `gen_ai.conversation.id`, verbatim;
+  absent when it has none (or an empty one). Not inherited from a parent.
+  [Imported](recorders.md) Claude Code and Codex model calls name the main
+  thread's conversation (the session) or a sub-agent's own
+  (`<session>/<agent>` for Claude Code, the sub-agent's thread for Codex), so
+  `conversation` tells a sub-agent's calls from the main thread's even when
+  two sub-agents share an agent name.
+- **`added`, `removed`** — an [`edit`](#derived-fields) step's edits as
+  [Agent Blame](recorders.md#agent-blame) reads them: the lines it wrote and the lines it
+  replaced — `new_string` / `old_string` (and a `MultiEdit`'s `edits`, in
+  order), `new_str` / `old_str` of the text-editor tool, a whole-file write's
+  `content` (or `file_text`, `new_source`), a Codex patch's `+` / `-` lines
+  and a Codex file change's diff. Each line is whitespace-normalised (runs of
+  whitespace fold to one space, ends trimmed), blank lines are dropped, and
+  the lines are joined by newlines — so an undo that re-indents still equals
+  what it undoes, and `added=@x` against a later `removed=@x` finds text
+  written and then taken out. A patch touching several files yields all of
+  their lines together. `removed` is absent for a whole-file write (what it
+  replaced was not recorded) and `added` for a pure deletion; both are absent
+  on a step that is no edit.
 
 ## Composing steps
 
@@ -513,7 +536,7 @@ curl -sG localhost:8080/v1/trajectories/search \
 ```
 
 ```json
-{"column":12,"error":"column 12: unknown field `stauts`; did you mean `status`? Fields: kind, name, span, service, agent, model, tool, status, error, cost, duration, tokens, input_tokens, output_tokens, cache_read, cache_write, context, index, args, result, file, digest, fingerprint, signature, calls, offered, in_catalog, unknown_calls, edit, test, plus args.<path>, result.<path> and attr.<key>"}
+{"column":12,"error":"column 12: unknown field `stauts`; did you mean `status`? Fields: kind, name, span, service, agent, model, tool, status, error, cost, duration, tokens, input_tokens, output_tokens, cache_read, cache_write, context, index, args, result, file, digest, fingerprint, signature, calls, offered, in_catalog, unknown_calls, edit, test, conversation, added, removed, plus args.<path>, result.<path> and attr.<key>"}
 ```
 
 ## Worked examples
@@ -547,8 +570,13 @@ edit.
 **11. The same file edited twice.** `edit[file=@f] ..> edit[file=@f]` —
 `captures.f` names the file.
 
-**12. Edit thrash.** `edit[file=@f] (..> edit[file=@f]){4,} within 10` — five
-edits of one file inside ten steps.
+**12. Many edits of one file.** `edit[file=@f] (..> edit[file=@f]){4,} within 10` —
+five edits of one file inside ten steps. Often just a feature being written;
+the library's `edit_thrash` asks for edits that undo each other instead.
+
+**12a. An edit undone, then redone.**
+`edit[file=@f, added=@x] ..> edit[file=@f, removed=@x] ..> edit[file=@f, added=@x]`
+— text written, taken out, written again (`captures.x` is the text).
 
 **13. A retry storm, back to back.** `tool(@t)[error] (-> tool(@t)[error]){2,}`
 — the same tool failing three or more times in a row.
@@ -576,7 +604,10 @@ is unknown.
 **21. The run started with a huge context.** `^llm[context>50000]`.
 
 **22. Context doubling.** `llm[context>=1000, context=@c] ..> llm[context>=2*@c] within 6`
-— the second call at most five steps after the first.
+— the second call at most five steps after the first. In a run with
+sub-agents, add `conversation=@v` to both atoms to compare a conversation's
+calls only with each other (the library's `context_blowup` does, falling back
+to the agent).
 
 **23. Only model calls between two searches.**
 `tool(search) ..[kind=llm]> tool(search)`.
@@ -688,15 +719,61 @@ a search to see the same matches, or adapt its threshold.
 | `test_tampering` | high | A test run fails, a test file is edited before any test passes, and a later test run passes | `test[error] ..[not (test and not error)]> edit[file~"<test file>"] ..> test[not error]` |
 | `hallucinated_tool` | high | A tool step outside its requesting model call's catalog, or a model call asking for a tool outside its own — only where the catalog was recorded | `tool[in_catalog=false] \| llm[unknown_calls]` |
 | `give_up_loop` | medium | The same tool call (same tool and input) fails ≥ 3 times, that tool never succeeds in between or after, and the run ends on a model answer | see example 26 |
-| `edit_thrash` | medium | One file edited ≥ 5 times within 10 steps | `edit[file=@f] (..> edit[file=@f]){4,} within 10` |
+| `edit_thrash` | medium; low when the run succeeded | Within 30 steps, one file's edits undo and redo each other (text written, removed, written again; or the file rewritten whole back to an earlier version), or the file is edited three times with a failing test after each and no passing one between | see [below](#edit_thrash) |
 | `ping_pong` | medium | A→B→A agent handoffs ≥ 3 times, no other agent in between | see example 19 |
-| `context_blowup` | medium | A model call's context (≥ 1000 tokens) at least doubled by a call ≤ 5 steps later | `llm[context>=1000, context=@c] ..> llm[context>=2*@c] within 6` |
+| `context_blowup` | medium | A model call's context (≥ 1000 tokens) at least doubled by a call of the same conversation ≤ 5 steps later | see [below](#context_blowup) |
 | `retry_without_change` | low | A failed request repeated byte-for-byte, only model calls between | see example 14 |
 | `tool_error_streak` | low | ≥ 5 failing tool calls with only model calls between | `tool[error] (..[kind=llm]> tool[error]){4,}` |
 | `unverified_finish` | low | No test run after the last edit, and the run ends on a model answer | `edit ..[not test]> llm$` |
 
 A *test file* is a path under a `test`, `tests`, `spec` or `__tests__`
 directory, or named `test_*`, `*_test.*`, `*.test.*` or `*.spec.*`.
+
+#### `edit_thrash`
+
+```text
+edit[file=@f, added=@x] ..> edit[file=@f, removed=@x] ..> edit[file=@f, added=@x]
+| edit[file=@f, added=@x, not removed] ..> edit[file=@f, added!=@x] ..> edit[file=@f, added=@x, not removed]
+| edit[file=@f] ..[not (test and not error)]> test[error]
+  (..[not (test and not error)]> edit[file=@f] ..[not (test and not error)]> test[error]){2,}
+within 30
+```
+
+Thrash is edits that go nowhere, not many edits: a coding agent writing a
+feature edits one file dozens of times and succeeds. So the detector asks for
+one of three shapes in one file, within 30 steps:
+
+- **Undo and redo** — text an edit wrote ([`added`](#derived-fields)) is
+  taken out by a later edit (`removed`) and written again. That covers
+  A→B, B→A, A→B, and two attempts both reverted to the same original
+  (A→B, B→A, A→C, C→A). A single revert — a change of mind, a debug print
+  taken out — is not thrash.
+- **Back to an earlier version** — the file is written whole with some
+  content, changed, then written whole with that same content again.
+- **Edits that keep failing** — the file is edited, a test run fails, three
+  times over, with no passing test run anywhere between.
+
+It is `medium`, and `low` in a run that succeeded: the findings report gives
+each example its own `severity`, and a detector's row is `low` only when every
+run it matched succeeded.
+
+#### `context_blowup`
+
+```text
+llm[context>=1000, context=@c, conversation=@v] ..> llm[context>=2*@c, conversation=@v]
+| llm[context>=1000, context=@c, not conversation, agent=@a] ..> llm[context>=2*@c, not conversation, agent=@a]
+| llm[context>=1000, context=@c, not conversation, not agent] ..> llm[context>=2*@c, not conversation, not agent]
+within 6
+```
+
+Two calls are compared only when they carried one context: both name the
+same [`conversation`](#derived-fields); or neither names one and both run
+under the same [`agent`](#derived-fields); or neither names either. A coding
+agent's sub-agent starts a small context of its own, and the main thread's
+next call after it — or the sub-agent's first call after a large main-thread
+call — is not a blow-up. Steps between the two calls count toward the six
+whatever conversation they belong to, so interleaved sub-agents make the
+window shorter, never longer.
 
 ### Findings
 
@@ -706,8 +783,9 @@ GET /v1/detectors/findings?since=&until=&agent=&detector=&cursor=&tenant=
 
 runs the library (or the detectors named — `detector=a,b` or repeated) over
 the window's 2,000 most recent runs, and reports per detector the runs and
-occurrences it matched, how those runs ended, their `success_rate`, up to five
-example runs (newest first), and when it last fired — next to the `baseline`:
+occurrences it matched, how those runs ended, their `success_rate`, its
+`severity` over those runs, up to five example runs (newest first, each with
+its own `severity` given how it ended), and when it last fired — next to the `baseline`:
 how every **checked** run ended. `runs_checked` counts those runs (the
 baseline's total, and the denominator for a detector's `runs_matched`);
 `runs_scanned` counts every candidate examined, including runs the `agent`
@@ -724,7 +802,7 @@ curl -sG localhost:8080/v1/detectors/findings \
   --data-urlencode 'detector=test_tampering,edit_thrash'
 ```
 
-Abridged — each example run is cut to `run`, `outcome` and `captures`, and each detector's `query` and `summary` (the same as in `/v1/detectors`) are left out:
+Abridged — each example run is cut to `run`, `outcome`, `captures` and `severity`, and each detector's `query` and `summary` (the same as in `/v1/detectors`) are left out:
 
 ```json
 {
@@ -741,7 +819,8 @@ Abridged — each example run is cut to `run`, `outcome` and `captures`, and eac
         {
           "run": "tampered",
           "outcome": "success",
-          "captures": {}
+          "captures": {},
+          "severity": "high"
         }
       ],
       "last_seen_ns": 1772323205000000000,
@@ -765,8 +844,10 @@ Abridged — each example run is cut to `run`, `outcome` and `captures`, and eac
           "run": "thrash",
           "outcome": "failure",
           "captures": {
-            "f": "src/app.py"
-          }
+            "f": "src/app.py",
+            "x": "b"
+          },
+          "severity": "medium"
         }
       ],
       "last_seen_ns": 1772323410000000000,
@@ -782,7 +863,7 @@ Abridged — each example run is cut to `run`, `outcome` and `captures`, and eac
       "runs_matched": 1,
       "severity": "medium",
       "success_rate": 0.0,
-      "title": "Edited one file over and over"
+      "title": "Edits of one file going back and forth"
     }
   ],
   "next_cursor": null,
