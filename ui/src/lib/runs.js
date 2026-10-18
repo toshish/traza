@@ -8,7 +8,12 @@ import { fmtDurationNs, fmtNum } from './format.js';
 /** Every fuse limit, the usage figure it is compared with, and how to read
     both. The order is the order the guide's limit table uses. `used` reads
     the verdict document's `usage`; `>=` is the comparison (a run AT a limit
-    has reached it), exactly as docs/guide/guard.md states. */
+    has reached it), exactly as docs/guide/guard.md states.
+
+    `min_success_odds` is the one limit that is not usage: a predictive fuse
+    on how runs like this one have ended, a fraction in (0, 1] — so it draws
+    no bar (`bar: false`) and takes a decimal (`decimal`, `max`). It is here
+    because a grant of lower odds is how a foresight stop is lifted. */
 export const LIMITS = [
   { key: 'max_cost_usd', label: 'cost', used: (u) => u.cost_usd, fmt: (v) => '$' + fmtMoney(v) },
   { key: 'max_tokens', label: 'tokens', used: (u) => u.tokens, fmt: fmtNum },
@@ -21,6 +26,14 @@ export const LIMITS = [
   },
   { key: 'max_repeats', label: 'repeats', used: (u) => (u.top_repeat ? u.top_repeat.count : 0), fmt: fmtNum },
   { key: 'max_error_streak', label: 'error streak', used: (u) => u.error_streak, fmt: fmtNum },
+  {
+    key: 'max_handoff_cycles', label: 'handoff cycles',
+    used: (u) => (u.top_handoff_cycle ? u.top_handoff_cycle.count : 0), fmt: fmtNum,
+  },
+  {
+    key: 'min_success_odds', label: 'success odds', used: () => 0, fmt: (v) => String(v),
+    bar: false, decimal: true, max: 1,
+  },
 ];
 
 /** Money at the precision the figure deserves: cents for dollars, more
@@ -39,7 +52,7 @@ export function fmtMoney(value) {
 export function usageBars(doc) {
   const limits = (doc && doc.limits) || {};
   const usage = (doc && doc.usage) || {};
-  return LIMITS.filter((limit) => typeof limits[limit.key] === 'number').map((limit) => {
+  return LIMITS.filter((limit) => limit.bar !== false && typeof limits[limit.key] === 'number').map((limit) => {
     const max = limits[limit.key];
     const used = Number(limit.used(usage)) || 0;
     const fraction = max > 0 ? used / max : 0;

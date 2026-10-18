@@ -18,6 +18,8 @@ import { isOperatorPath } from './lib/session.js';
 import whoamiBound from './test/fixtures/whoami_bound.json';
 import whoamiOpen from './test/fixtures/whoami_open.json';
 import usageBound from './test/fixtures/usage_bound.json';
+import liveRuns from './test/fixtures/live_runs.json';
+import liveStream from './test/fixtures/live_stream.txt?raw';
 
 const json = (status, body) => new Response(JSON.stringify(body), {
   status, headers: { 'Content-Type': 'application/json' },
@@ -120,6 +122,57 @@ describe('an operator', () => {
     const nav = Array.from(document.querySelectorAll('nav[aria-label="Screens"] button')).map((b) => b.textContent);
     expect(nav).toEqual(expect.arrayContaining(['Server', 'Store', 'Credentials', 'Ledger', 'Guard', 'Diff']));
     expect(screen.getByTestId('rail-scope').textContent).toContain('open store');
+  });
+});
+
+describe('the landing screen', () => {
+  /** An open store whose guard holds `runs` live; the stream answers with
+      the captured bytes. Records every path. */
+  function serveLive(runs) {
+    const paths = [];
+    globalThis.fetch = vi.fn(async (url) => {
+      const path = String(url).split('?')[0];
+      paths.push(String(url));
+      if (path === '/v1/whoami') return json(200, whoamiOpen);
+      if (path === '/v1/runs/live') return json(200, { ...liveRuns, runs });
+      if (path === '/v1/runs/live/stream') {
+        return new Response(runs.length ? liveStream : 'event: snapshot\ndata: {"runs":[],"truncated":false,"window_ns":900000000000}\n\n',
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      return json(200, EMPTY[path] || {});
+    });
+    return paths;
+  }
+
+  it('is Live when runs are working right now, decided from one read of the guard', async () => {
+    vi.setSystemTime(new Date(Math.max(...liveRuns.runs.map((r) => r.last_activity_ns)) / 1e6 + 1000));
+    const paths = serveLive(liveRuns.runs);
+    window.location.hash = '';
+    render(<App />);
+    await settle(0);
+    await settle(50);
+    expect(paths).toContain('/v1/runs/live?limit=1');
+    expect(document.querySelector('header').textContent).toContain('Live');
+    expect(screen.getAllByTestId('live-row').length).toBe(liveRuns.runs.length);
+    expect(document.querySelector('nav [aria-current="page"]').textContent).toBe('Live');
+  });
+
+  it('is the Overview when nothing is live, and an address naming a screen is never redirected', async () => {
+    serveLive([]);
+    window.location.hash = '';
+    render(<App />);
+    await settle(0);
+    await settle(50);
+    expect(document.querySelector('header').textContent).toContain('Overview');
+    expect(screen.queryAllByTestId('live-row')).toHaveLength(0);
+    cleanup();
+
+    serveLive(liveRuns.runs);
+    window.location.hash = '#/overview';
+    render(<App />);
+    await settle(0);
+    await settle(50);
+    expect(document.querySelector('header').textContent).toContain('Overview');
   });
 });
 

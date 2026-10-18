@@ -359,7 +359,7 @@ function ActionError({ error }) {
   return <ErrorState what={error.what || 'The request failed.'} next={error.next} style={{ marginTop: 10 }} />;
 }
 
-function TripModal({ run, onClose, onDone }) {
+export function TripModal({ run, onClose, onDone }) {
   const [reason, setReason] = React.useState('');
   const action = useAction();
   React.useEffect(() => { setReason(''); action.clear(); }, [run]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -396,7 +396,8 @@ export function parseLimits(fields) {
     if (!text) continue;
     const value = Number(text);
     if (!Number.isFinite(value) || value <= 0) return { error: `${limit.key} must be a positive number` };
-    if (limit.key !== 'max_cost_usd' && !Number.isInteger(value)) return { error: `${limit.key} must be a whole number` };
+    if (limit.max != null && value > limit.max) return { error: `${limit.key} must be at most ${limit.max}` };
+    if (limit.key !== 'max_cost_usd' && !limit.decimal && !Number.isInteger(value)) return { error: `${limit.key} must be a whole number` };
     limits[limit.key] = value;
   }
   return { limits };
@@ -413,7 +414,7 @@ function LimitFields({ fields, setFields, placeholders }) {
   </div>;
 }
 
-function ResetModal({ run, onClose, onDone }) {
+export function ResetModal({ run, onClose, onDone }) {
   const [fields, setFields] = React.useState({});
   const [invalid, setInvalid] = React.useState('');
   const action = useAction();
@@ -438,6 +439,11 @@ function ResetModal({ run, onClose, onDone }) {
         for this run only, kept across restarts. Leave a field empty to keep the current limit.
       </div>
       {run.reasons?.length ? <div style={{ fontSize: 12, color: 'var(--error)' }}>{run.reasons.join('; ')}</div> : null}
+      {(run.reasons || []).some((reason) => reason.startsWith('foresight:')) ? <div style={{ fontSize: 12, color: 'var(--ink-muted)', lineHeight: '18px' }}>
+        A foresight stop is a prediction made again at every check, so a reset alone does not lift it. To let the
+        run go on against its history, grant it lower odds: <code>min_success_odds</code> below the upper bound
+        in the reason, for example <code>0.05</code>.
+      </div> : null}
       <LimitFields fields={fields} setFields={setFields} placeholders={run.limits} />
       {invalid ? <div role="alert" style={{ fontSize: 12, color: 'var(--error)' }}>{invalid}</div> : null}
       <ActionError error={action.error} />

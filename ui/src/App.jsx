@@ -28,6 +28,7 @@ import { StoreScreen } from './views/StoreScreen.jsx';
 import { ConnectScreen } from './views/ConnectScreen.jsx';
 import { McpScreen } from './views/McpScreen.jsx';
 import { GuardScreen } from './views/GuardScreen.jsx';
+import { LiveScreen } from './views/LiveScreen.jsx';
 import { RunScreen } from './views/RunScreen.jsx';
 import { DiffScreen } from './views/DiffScreen.jsx';
 import { LedgerScreen } from './views/LedgerScreen.jsx';
@@ -104,6 +105,29 @@ function useIdentity(generation) {
     return () => { live = false; clearTimeout(timer); };
   }, [generation]);
   return answer && answer.generation === generation ? answer.identity : null;
+}
+
+/** Where an address with no screen lands: Live when runs are working right
+    now, else the Overview. Decided once per credential, from one read of
+    the guard's memory (`GET /v1/runs/live?limit=1`), once the server has
+    said who the credential is — and never re-decided under the reader's
+    feet because a run started while they read the Overview. Anything that
+    is not a listing with a run in it (a store started with --no-fuses
+    answers 409) lands on the Overview. `null` while undecided. */
+function useLanding(identity, generation) {
+  const [landing, setLanding] = React.useState(null);
+  const known = Boolean(identity);
+  React.useEffect(() => {
+    if (!known) return undefined;
+    let live = true;
+    const controller = new AbortController();
+    api.liveRuns({ limit: 1 }, controller.signal).then(
+      (doc) => { if (live) setLanding({ generation, screen: doc && Array.isArray(doc.runs) && doc.runs.length ? 'live' : 'overview' }); },
+      () => { if (live) setLanding({ generation, screen: 'overview' }); },
+    );
+    return () => { live = false; controller.abort(); };
+  }, [generation, known]);
+  return landing && landing.generation === generation ? landing.screen : null;
 }
 
 const NO_PULSE = { rate: null, spark: [], live: false, durability: null, count: null };
@@ -254,6 +278,7 @@ export function App() {
   const identity = useIdentity(generation);
   const operator = Boolean(identity && identity.operator === true);
   const pulse = useIngestPulse(identity, generation);
+  const landing = useLanding(identity, generation);
 
   // After a new token is stored: close the prompt and re-arm it. Re-asking
   // whoami and remounting every screen under the token follow from the
@@ -293,7 +318,9 @@ export function App() {
   const mintedShown = minted && minted.generation === generation ? minted.doc : null;
 
   const [head, second, third] = route.parts;
-  const screen = head || 'overview';
+  // An address naming no screen waits for the landing decision (a moment:
+  // one read from memory) rather than mounting the Overview only to swap it.
+  const screen = head || landing || 'landing';
   const go = React.useCallback((parts, params) => navigate(Array.isArray(parts) ? parts : [parts], params), []);
 
   // Leaving a screen closes the narrow-width drawer: it was opened to go
@@ -341,6 +368,8 @@ export function App() {
         break;
       case 'run': view = <RunScreen key={k('run:' + second)} runId={second} {...common} />; break;
       case 'guard': view = <GuardScreen key={k('guard')} {...common} />; break;
+      case 'live': view = <LiveScreen key={k('live')} {...common} />; break;
+      case 'landing': view = <Skeleton height={120} />; break;
       case 'diff': view = <DiffScreen key={k('diff')} {...common} />; break;
       case 'analytics': view = <AnalyticsScreen key={k('analytics')} {...common} />; break;
       case 'latency': view = <LatencyScreen key={k('latency')} {...common} />; break;
@@ -379,7 +408,7 @@ export function App() {
     <NavRail screen={railScreen} ingest={pulse} identity={identity} open={drawer} onGo={(id) => go([id])} />
     <div className="tz-scrim" data-open={drawer ? 'true' : 'false'} onClick={() => setDrawer(false)} aria-hidden="true" />
     <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-      <Header screen={SCREENS[screen] ? screen : 'overview'} subtitle={subtitle}
+      <Header screen={screen === 'landing' ? 'landing' : SCREENS[screen] ? screen : 'overview'} subtitle={subtitle}
         count={pulse.count} density={density} onDensity={setDensity}
         theme={theme} onTheme={() => setThemeChoice(theme === 'dark' ? 'light' : 'dark')}
         onPalette={() => setPalette(true)} onToken={() => setTokenModal(true)}
