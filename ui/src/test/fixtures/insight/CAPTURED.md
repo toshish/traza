@@ -27,6 +27,7 @@ that window, so their last step is open and pooled.
 | `fate_cohorts.json` | `GET /v1/fate/cohorts` |
 | `fate_map_support.json`, `fate_map_researcher.json` | `GET /v1/fate/map?agent=support-agent` (and `researcher`) |
 | `fate_map_missing.json` | `GET /v1/fate/map?agent=nobody` (404) |
+| `fate_map_cc_pruned.json` | `GET /v1/fate/map?agent=claude-code&since=1760000000000000000` (two runs, every branch under the default support) |
 | `fate_run_doomed.json`, `fate_run_healthy.json`, `fate_run_novel.json` | `GET /v1/fate/runs/live-doomed-0` (`live-healthy-0`, `live-novel-0`) |
 | `fate_run_cc.json` | `GET /v1/fate/runs/11111111-1111-4111-8111-111111111111` (the imported Claude Code session, older than the 30-day window) |
 | `cache_fix7.json` | `GET /v1/cache/fix-parser-7` |

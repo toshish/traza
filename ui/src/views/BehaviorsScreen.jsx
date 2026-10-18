@@ -271,7 +271,7 @@ function DetectorRow({ d, baseline, checked, go, onSearch }) {
       <span style={{ fontSize: 13, fontWeight: 500 }}>{d.title}</span>
       <Mono size={11} color="var(--ink-faint)">{d.name}</Mono>
       <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', fontSize: 12, color: 'var(--ink-muted)' }}>
-        <span><Mono color="var(--accent)">{fmtNum(d.runs_matched)}</Mono> of <Mono>{fmtNum(checked)}</Mono> runs · <Mono>{fmtNum(d.occurrences)}</Mono> times</span>
+        <span><Mono color="var(--accent)">{fmtNum(d.runs_matched)}</Mono> of <Mono>{fmtNum(checked)}</Mono> runs · <Mono>{fmtNum(d.occurrences)}</Mono> {d.occurrences === 1 ? 'time' : 'times'}</span>
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }} title="Successes over runs whose outcome is known, against every checked run (the ink hairline)">
           <CiBar rate={d.success_rate} base={baseline} width={90} label={false} />
           <Mono color={d.success_rate != null && baseline != null && d.success_rate < baseline ? 'var(--error)' : 'var(--accent)'}>{fmtPct(d.success_rate, 0)}</Mono> succeeded

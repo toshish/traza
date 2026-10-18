@@ -419,8 +419,9 @@ The cohorts sit in one row of cards — each agent, and each of its task
 sub-cohorts, with its completed runs, base rate, and runs still live (excluded
 from every rate, counted on the card). The largest opens first. Window chips
 (`24h` to `1y`) re-read both; `30d` sends no window at all, which is the
-server's default and the build it caches. **min support** and **depth** set
-the map's pruning. Tiles give completed runs, the base rate, runs live or
+server's default and the build it caches. **min support** (1 to 30) and **depth**
+set the map's pruning; a map whose every branch falls under the support says
+so rather than drawing a bare start. Tiles give completed runs, the base rate, runs live or
 unknown, nodes shown of the tree's total, fatal forks, hotspots, and the
 map's best calibration skill. Whatever bounded the build — a narrowed window,
 the node cap, runs read in part — is said under the tiles.

@@ -44,6 +44,7 @@ export function ContextBar({ chunks, focusKey, onFocus, onPick, height = 30 }) {
           tabIndex={0}
           onMouseMove={(e) => move(e, chunk)}
           onFocus={() => onFocus && onFocus(provenanceKey(chunk))}
+          onBlur={() => onFocus && onFocus(null)}
           onClick={() => onPick && onPick(chunk)}
           onKeyDown={(e) => { if (e.key === 'Enter') onPick && onPick(chunk); }}
           style={{

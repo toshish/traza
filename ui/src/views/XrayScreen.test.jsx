@@ -86,6 +86,12 @@ describe('the Cache Autopsy', () => {
     expect(new URLSearchParams(window.location.hash.split('?')[1]).get('step')).toBe('2');
   });
 
+  it('says when the step named is not a model call of the run', async () => {
+    await show('fix-parser-7', 'step=1');
+    expect(screen.getByTestId('missing-call').textContent).toContain("Step 1 is not one of this run's model calls");
+    expect(api.xray).not.toHaveBeenCalled();
+  });
+
   it('assumes a longer cache lifetime when told to', async () => {
     await show('fix-parser-7', 'ttl=3600');
     expect(api.cache).toHaveBeenCalledWith('fix-parser-7', { ttl_seconds: '3600' }, expect.anything());

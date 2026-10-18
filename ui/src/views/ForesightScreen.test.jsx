@@ -14,6 +14,7 @@ import doomed from '../test/fixtures/insight/fate_run_doomed.json';
 import healthy from '../test/fixtures/insight/fate_run_healthy.json';
 import novel from '../test/fixtures/insight/fate_run_novel.json';
 import missing from '../test/fixtures/insight/fate_map_missing.json';
+import ccPruned from '../test/fixtures/insight/fate_map_cc_pruned.json';
 
 const RUNS = { 'live-doomed-0': doomed, 'live-healthy-0': healthy, 'live-novel-0': novel };
 
@@ -23,6 +24,7 @@ vi.mock('../lib/api.js', () => ({
     fateMap: vi.fn(async (params) => {
       if (params.agent === 'researcher') return researcherMap;
       if (params.agent === 'support-agent') return supportMap;
+      if (params.agent === 'claude-code') return ccPruned;
       throw Object.assign(new Error(missing.error), { status: 404, what: missing.error, body: missing });
     }),
     fateRun: vi.fn(async (run) => RUNS[run]),
@@ -116,6 +118,13 @@ describe('the cohorts and the map', () => {
     expect(api.fateCohorts.mock.calls[0][0].since).toBe(asked.since);
   });
 
+  it('says why a map draws nothing past the start: every branch is under the support', async () => {
+    await show('agent=claude-code&window=1y');
+    expect(screen.getAllByTestId('fate-node')).toHaveLength(1);
+    expect(screen.getByTestId('all-pruned').textContent)
+      .toBe('Every branch from the start has fewer than 3 runs, so none is drawn (1 branch, 2 runs). Lower min support to see them.');
+  });
+
   it('says so when the agent has no runs in the window', async () => {
     await show('agent=nobody');
     expect(screen.getByRole('alert').textContent).toContain('No runs of nobody in this window.');
@@ -153,6 +162,13 @@ describe('a run on its map', () => {
     expect(document.body.textContent).toContain('NEVER TAKEN HERE BEFORE');
     expect(document.body.textContent).toContain('delete_database');
     expect(node(['llm:gpt-4o', 'tool:search_orders']).textContent).toContain('RECOMMENDED NEXT');
+  });
+
+  it('does not light a run on one task of its agent, which is not what it was judged against', async () => {
+    api.fateMap.mockResolvedValueOnce({ ...supportMap, task: 'dd8fe599d8750716' });
+    await show('run=live-healthy-0&agent=support-agent&task=dd8fe599d8750716');
+    expect(screen.getByTestId('run-foresight').textContent).toContain('The map shown is one task of support-agent');
+    expect(document.body.textContent).not.toContain('THIS RUN');
   });
 
   it('says when the run belongs to another cohort than the map shown', async () => {

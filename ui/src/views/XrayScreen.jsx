@@ -102,6 +102,9 @@ function RunXray({ runId, go, params }) {
       <CallList steps={steps} selected={chosen && chosen.step_index} onPick={pick} />
     </>}
 
+    {stepParam != null && steps.length && !chosen ? <Caveat testId="missing-call">
+      Step {stepParam} is not one of this run's model calls; pick a call above.
+    </Caveat> : null}
     {chosen ? <XrayView xray={xray} step={chosen} runId={runId} go={go} runParams={runParams} onPick={pick} /> : null}
   </div>;
 }
@@ -596,6 +599,6 @@ function XrayLanding({ go }) {
       </div>)}
     </Card>
     <EmptyState message={<span>The same reads, from a shell:</span>}
-      command={`curl -s ${publicBase() || 'http://localhost:8080'}/v1/cache/<run>\ncurl -s ${publicBase() || 'http://localhost:8080'}/v1/xray/<trace_id>/<span_id>`} />
+      command={`curl -s ${publicBase()}/v1/cache/<run>\ncurl -s ${publicBase()}/v1/xray/<trace_id>/<span_id>`} />
   </div>;
 }

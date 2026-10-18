@@ -20,7 +20,7 @@ import { NextOptions } from '../components/insight/NextOptions.jsx';
 // arithmetic over stored spans, and the map scores its own predictions so a
 // reader knows how far to trust a verdict.
 
-const SUPPORT_CHOICES = [3, 5, 10, 30];
+const SUPPORT_CHOICES = [1, 3, 5, 10, 30];
 const DEPTH_CHOICES = [6, 12, 24];
 
 /** The cohort a route names, as a key that tells task sub-cohorts and
@@ -80,7 +80,15 @@ export function ForesightScreen({ go, params, identity }) {
   });
 
   const data = map.data;
-  const sameCohort = foresight.data && data && foresight.data.agent === data.agent && !task;
+  // The run is lit only on the map it was judged against: its agent's whole
+  // cohort, in its tenant. A task's map, or another tenant's agent of the
+  // same name, would place it on paths it was not compared with.
+  const sameCohort = Boolean(foresight.data && data && foresight.data.agent === data.agent && !task
+    && (foresight.data.tenant || '') === (data.tenant || ''));
+  const mismatch = !foresight.data || !data || sameCohort ? null
+    : foresight.data.agent !== data.agent ? `This run belongs to ${foresight.data.agent}; the map shown is ${data.agent}. Pick its cohort to see it on the map.`
+      : task ? `The map shown is one task of ${data.agent}; foresight judged this run against the agent's whole cohort, so it is not lit here.`
+        : `The map shown is tenant ${data.tenant || '(default)'}'s ${data.agent}; this run is tenant ${foresight.data.tenant || '(default)'}'s.`;
   const highlight = React.useMemo(
     () => (sameCohort ? runOnMap(data.root, foresight.data) : null),
     [sameCohort, data, foresight.data],
@@ -117,7 +125,7 @@ export function ForesightScreen({ go, params, identity }) {
     <LoadingBar active={map.loading || cohorts.loading || foresight.loading} />
 
     {run ? <RunForesightBanner foresight={foresight} run={run} tenant={tenant} go={go}
-      mismatch={foresight.data && data && !sameCohort ? data.agent : null} windowId={windowId} /> : null}
+      mismatch={mismatch} windowId={windowId} /> : null}
 
     <MapBody map={map} data={data} shownAgent={shownAgent} task={task} windowId={windowId} cohorts={list}
       highlight={highlight} activeKey={activeKey} activeNode={activeNode} collapsed={collapsed} onToggle={toggle}
@@ -196,6 +204,9 @@ function MapBody({ map, data, shownAgent, task, windowId, highlight, activeKey, 
       <PanelHead title={`Fate Map · ${data.agent}${task ? ' · task ' + task.slice(0, 8) : ''}`}
         note="hover a node to read it, click to open it, double-click to fold its branches" />
       <FateLegend base={data.base_rate} />
+      {!(data.root.children || []).length && data.root.omitted_children ? <div style={{ marginTop: 8 }}>
+        <Caveat testId="all-pruned">Every branch from the start has fewer than {data.min_support} runs, so none is drawn ({data.root.omitted_children} branch{data.root.omitted_children === 1 ? '' : 'es'}, {data.root.omitted_visits} runs). Lower min support to see them.</Caveat>
+      </div> : null}
       <div style={{ marginTop: 8 }}>
         <FateMap map={data} highlight={highlight} selected={activeKey} onSelect={onSelect} collapsed={collapsed} onToggle={onToggle} />
       </div>
@@ -406,7 +417,7 @@ function RunForesightBanner({ foresight, run, tenant, go, mismatch, windowId }) 
           support <Mono>{fmtNum(f.support)}</Mono> of <Mono>{fmtNum(f.cohort_runs)}</Mono> completed runs · needs <Mono>{fmtNum(f.min_support)}</Mono> · matched <Mono>{f.matched_depth}</Mono> of <Mono>{f.path.length}</Mono> tokens
         </div>
         <PathTokens path={f.path} matched={f.matched_depth} max={12} accentIndex={f.divergence ? f.divergence.depth : undefined} />
-        {mismatch ? <Caveat>This run belongs to {f.agent}; the map shown is {mismatch}. Pick its cohort to see it on the map.</Caveat> : null}
+        {mismatch ? <Caveat>{mismatch}</Caveat> : null}
         {windowId !== '30d' ? <Caveat>Foresight judges a run against the last 30 days; the map shown covers {windowId}.</Caveat> : null}
       </div>
       <NextOptions foresight={f} />
