@@ -260,6 +260,11 @@ pub struct VerdictDoc {
     pub evidence: Vec<SpanRef>,
     /// Whether answering read the store.
     pub source: Source,
+    /// The run's foresight, when its policy sets `min_success_odds` and the
+    /// run is not already stopped (see [`crate::fate`]): what runs that took
+    /// its path did, and whether that raised the policy's action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foresight: Option<crate::fate::GuardForesight>,
 }
 
 /// Which runs a listing returns.
@@ -756,6 +761,20 @@ impl Guard {
         drop(state);
         log.compact(&records)?;
         Ok(())
+    }
+
+    /// The action of the policy named `name` in `tenant` — the one a verdict
+    /// document just reported — or the global action.
+    fn policy_action(&self, tenant: &str, name: &str) -> Result<Action> {
+        if name == GLOBAL_POLICY_NAME {
+            return Ok(self.config.action);
+        }
+        let state = self.lock_state()?;
+        Ok(state
+            .tenant_policies(tenant)
+            .iter()
+            .find(|policy| policy.name == name)
+            .map_or(self.config.action, |policy| policy.action))
     }
 
     /// The verdict document for `key` as `judged`, unless the run's state
@@ -1373,6 +1392,7 @@ impl State {
             tripped_by: judged.tripped_by,
             evidence: judged.evidence,
             source,
+            foresight: None,
         }
     }
 
@@ -1504,7 +1524,25 @@ impl Store {
         self.fuse_answer(tenant, run, Some(next))
     }
 
+    /// The verdict from usage, then — when the policy sets
+    /// `min_success_odds` — the run's foresight over it, read from a cached
+    /// Fate Map with what is left of the request's one budget.
     fn fuse_answer(&self, tenant: &str, run: &str, next: Option<&NextStep>) -> Result<VerdictDoc> {
+        let started = Instant::now();
+        let mut doc = self.fuse_answer_usage(tenant, run, next)?;
+        if doc.limits.min_success_odds.is_some() && doc.verdict != Verdict::Stop {
+            let action = self.guard()?.policy_action(tenant, &doc.policy)?;
+            crate::fate::apply_to_verdict(self, &mut doc, action, next, started);
+        }
+        Ok(doc)
+    }
+
+    fn fuse_answer_usage(
+        &self,
+        tenant: &str,
+        run: &str,
+        next: Option<&NextStep>,
+    ) -> Result<VerdictDoc> {
         let guard = self.guard()?;
         validate_tenant(tenant)?;
         validate_run(run)?;

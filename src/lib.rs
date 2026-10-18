@@ -18,6 +18,7 @@ pub mod diff;
 pub mod erasure;
 pub mod evals;
 pub mod expiration;
+pub mod fate;
 mod generation;
 pub mod guard;
 pub mod gzip;
@@ -932,6 +933,8 @@ pub struct Config {
     /// many runs it keeps live. On by default, warning on repeated steps
     /// only. See [`guard`].
     pub fuses: guard::FuseConfig,
+    /// The Fate Map's bounds and cache lifetime. See [`fate`].
+    pub fate: fate::FateConfig,
 }
 
 /// The last commit whose reader accepts every segment format retired WITHOUT
@@ -1041,6 +1044,7 @@ impl Default for Config {
             max_span_bytes: Some(caps::DEFAULT_MAX_SPAN_BYTES),
             max_batch_spans: Some(caps::DEFAULT_MAX_BATCH_SPANS),
             fuses: guard::FuseConfig::default(),
+            fate: fate::FateConfig::default(),
         }
     }
 }
@@ -2423,6 +2427,9 @@ pub struct Store {
     /// [`Config::fuses`] disables it. Its locks are leaf-level: never held
     /// while an engine lock is taken.
     guard: Option<guard::Guard>,
+    /// Cached Fate Map builds. Its lock is leaf-level and never held while
+    /// the store is read; every erasure empties it.
+    fate: fate::FateCache,
     _directory_lock: DirectoryLock,
 }
 
@@ -2564,6 +2571,7 @@ impl Store {
 
             Ok(Self {
                 guard: guard::Guard::open(&directory, &config.fuses)?,
+                fate: fate::FateCache::new(&config.fate),
                 annotations: annotations::AnnotationLog::open(&directory)?,
                 evals: evals::EvalLog::open(&directory)?,
                 erasures,
@@ -6460,6 +6468,9 @@ impl Store {
     fn complete_erasure(&self, record: &erasure::EraseRecord) -> Result<erasure::SettleRecord> {
         let erasing = Instant::now();
         let subject = &record.subject;
+        // The mask is up: new Fate Map builds cannot see the subject, and
+        // cached ones (and any in flight) must not keep serving it.
+        self.forget_fate();
 
         let (purge, annotations_removed, eval_records_removed, payloads_removed, payloads_retained) = {
             // One rewriter at a time, same as compaction and expiry.
@@ -6614,6 +6625,7 @@ impl Store {
         // resolves no keys — its veil is the tenant predicate itself.
         self.veil_tail(subject, &purge.keys);
         self.forget_fuse_subject(subject, &purge.keys)?;
+        self.forget_fate();
 
         // ---- confirm: everything mutable, BEFORE the checkpoint ----------
         // The admission barrier suppresses covered spans (and the annotate
@@ -6657,6 +6669,7 @@ impl Store {
         if !confirm.keys.is_empty() {
             self.veil_tail(subject, &confirm.keys);
             self.forget_fuse_subject(subject, &confirm.keys)?;
+            self.forget_fate();
         }
         // Annotations that arrived before the annotate barrier went up get
         // the same confirm treatment; a no-op rewrite costs nothing (the

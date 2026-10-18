@@ -75,6 +75,7 @@ fn open_store(dir: &Path) -> Store {
         dir,
         Config {
             fuses: Default::default(),
+            fate: Default::default(),
             pricing: Default::default(),
             max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
             max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),

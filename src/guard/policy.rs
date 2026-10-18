@@ -111,6 +111,22 @@ pub struct Limits {
     /// Ceiling on consecutive failed steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_error_streak: Option<u64>,
+    /// A predictive limit: the success odds a run's path must keep. When
+    /// runs that took the same path ([`crate::fate`]) succeeded so rarely
+    /// that the 95% interval's upper bound is below this — with the support
+    /// and after the steps below — the policy's action applies. Evaluated on
+    /// the pre-call check and verdict queries only, never on ingest, and
+    /// never latched. In `(0, 1]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_success_odds: Option<f64>,
+    /// Earlier runs that must share the path before `min_success_odds` may
+    /// act (default 30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foresight_min_support: Option<u64>,
+    /// Recorded steps a run must have before `min_success_odds` may act
+    /// (default 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foresight_after_steps: Option<u64>,
 }
 
 impl Limits {
@@ -130,6 +146,9 @@ impl Limits {
             max_duration_seconds: grant.max_duration_seconds.or(self.max_duration_seconds),
             max_repeats: grant.max_repeats.or(self.max_repeats),
             max_error_streak: grant.max_error_streak.or(self.max_error_streak),
+            min_success_odds: grant.min_success_odds.or(self.min_success_odds),
+            foresight_min_support: grant.foresight_min_support.or(self.foresight_min_support),
+            foresight_after_steps: grant.foresight_after_steps.or(self.foresight_after_steps),
         }
     }
 
@@ -142,7 +161,16 @@ impl Limits {
                 )));
             }
         }
+        if let Some(odds) = self.min_success_odds {
+            if !odds.is_finite() || odds <= 0.0 || odds > 1.0 {
+                return Err(Error::Invalid(format!(
+                    "{what}: min_success_odds must be a probability in (0, 1] (got {odds})"
+                )));
+            }
+        }
         let counts = [
+            ("foresight_min_support", self.foresight_min_support),
+            ("foresight_after_steps", self.foresight_after_steps),
             ("max_tokens", self.max_tokens),
             ("max_steps", self.max_steps),
             ("max_llm_calls", self.max_llm_calls),
@@ -276,6 +304,16 @@ impl PolicySpec {
                 )))
             }
             _ => {}
+        }
+        if self.limits.min_success_odds.is_none()
+            && (self.limits.foresight_min_support.is_some()
+                || self.limits.foresight_after_steps.is_some())
+        {
+            return Err(Error::Invalid(
+                "foresight_min_support and foresight_after_steps tune min_success_odds; set it \
+                 too, or they do nothing"
+                    .to_owned(),
+            ));
         }
         self.limits.validate("policy limits")
     }
@@ -445,6 +483,35 @@ mod tests {
                 other => panic!("expected a refusal naming {needle}, got {other:?}"),
             }
         }
+        for (limits, needle) in [
+            (json!({"min_success_odds": 0.0}), "probability in (0, 1]"),
+            (json!({"min_success_odds": 1.5}), "probability in (0, 1]"),
+            (
+                json!({"min_success_odds": 0.5, "foresight_min_support": 0}),
+                "foresight_min_support must be positive",
+            ),
+            (
+                json!({"min_success_odds": 0.5, "foresight_after_steps": 0}),
+                "foresight_after_steps must be positive",
+            ),
+        ] {
+            let parsed: Limits = serde_json::from_value(limits).expect("parses");
+            match parsed.validate("test") {
+                Err(Error::Invalid(message)) => assert!(message.contains(needle), "{message}"),
+                other => panic!("expected a refusal naming {needle}, got {other:?}"),
+            }
+        }
+        let foresight: Limits = serde_json::from_value(
+            json!({"min_success_odds": 0.25, "foresight_min_support": 40, "foresight_after_steps": 2}),
+        )
+        .expect("parses");
+        assert!(foresight.validate("test").is_ok());
+        let granted = foresight.overlaid(&Limits {
+            min_success_odds: Some(0.01),
+            ..Limits::default()
+        });
+        assert_eq!(granted.min_success_odds, Some(0.01));
+        assert_eq!(granted.foresight_min_support, Some(40));
         let typo = serde_json::from_value::<Limits>(json!({"max_step": 3}));
         assert!(typo.is_err(), "an unknown limit is a typo, not a no-op");
         let fine: Limits =
@@ -470,6 +537,16 @@ mod tests {
             (spec("", Some("x")), "1 to 64 bytes"),
             (spec("x", Some("")), "must not be empty"),
             (spec("x", Some(&"s".repeat(257))), "at most 256 bytes"),
+            (
+                PolicySpec {
+                    limits: Limits {
+                        foresight_min_support: Some(10),
+                        ..Limits::default()
+                    },
+                    ..spec("default", None)
+                },
+                "tune min_success_odds",
+            ),
         ] {
             match bad.validate() {
                 Err(Error::Invalid(message)) => assert!(message.contains(needle), "{message}"),

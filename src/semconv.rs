@@ -875,6 +875,36 @@ fn step_fingerprint(
     fingerprint
 }
 
+/// What [`step_facts_with`] would report as the step's kind, its
+/// [`StepFacts::signature`] and its [`StepFacts::agent`] — and nothing else:
+/// no request or response is extracted or digested. For a caller that reads
+/// every span of a window for its behaviour alone (the Fate Map,
+/// [`crate::fate`]), where a SHA-256 of every request would be the whole cost
+/// of the fold. Built from the same helpers as [`step_facts_with`], so the
+/// two cannot disagree.
+pub(crate) fn step_signature_with(
+    span: &Span,
+    llm: &LlmFacts,
+) -> (StepKind, String, Option<String>) {
+    let attributes = &span.attributes;
+    let traceloop_kind =
+        attr_str(attributes, TRACELOOP_SPAN_KIND).map(|kind| kind.to_ascii_lowercase());
+    let kind = step_kind(attributes, traceloop_kind.as_deref(), llm);
+    let tool = match kind {
+        StepKind::Tool => step_tool(attributes, traceloop_kind.as_deref()),
+        _ => None,
+    };
+    let agent = step_agent(attributes, traceloop_kind.as_deref());
+    let name = match kind {
+        StepKind::Tool => tool.as_deref(),
+        StepKind::Llm => llm.model.as_deref(),
+        StepKind::Agent => agent.as_deref(),
+        _ => None,
+    }
+    .unwrap_or(&span.name);
+    (kind, format!("{kind}:{name}"), agent)
+}
+
 /// The kind [`step_facts_with`] would report, without extracting or
 /// digesting the step's request and response — for a caller that needs the
 /// rest of the facts only for some kinds (the run guard fingerprints steps
@@ -1297,6 +1327,58 @@ mod tests {
 
     fn attrs(value: Value) -> Map<String, Value> {
         value.as_object().expect("object").clone()
+    }
+
+    #[test]
+    fn the_cheap_signature_agrees_with_full_step_facts() {
+        let span = |name: &str, attributes: Value| Span {
+            trace_id: "t".into(),
+            span_id: "s".into(),
+            tenant: String::new(),
+            parent_span_id: None,
+            name: name.into(),
+            start_time_ns: 1,
+            end_time_ns: 2,
+            status: "ok".into(),
+            service: "svc".into(),
+            attributes: attrs(attributes),
+            events: Vec::new(),
+            links: Vec::new(),
+            extra: Map::new(),
+        };
+        let cases = [
+            span(
+                "chat",
+                json!({"gen_ai.operation.name": "chat", "gen_ai.request.model": "gpt-4o",
+                       "gen_ai.input.messages": [{"role": "user", "content": "hi"}]}),
+            ),
+            span(
+                "tool",
+                json!({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "search",
+                       "gen_ai.tool.call.arguments": "{\"q\": 1}"}),
+            ),
+            span(
+                "agent",
+                json!({"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": "planner"}),
+            ),
+            span(
+                "wf",
+                json!({"traceloop.span.kind": "workflow", "traceloop.entity.name": "flow"}),
+            ),
+            span("plain", json!({"http.method": "GET"})),
+            span(
+                "oi",
+                json!({"openinference.span.kind": "TOOL", "tool.name": "read_file"}),
+            ),
+            span("nameless-llm", json!({"gen_ai.operation.name": "chat"})),
+        ];
+        for case in &cases {
+            let full = step_facts(case);
+            let (kind, signature, agent) = step_signature_with(case, &facts(&case.attributes));
+            assert_eq!(kind, full.kind, "{}", case.name);
+            assert_eq!(signature, full.signature(), "{}", case.name);
+            assert_eq!(agent, full.agent, "{}", case.name);
+        }
     }
 
     #[test]

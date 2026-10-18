@@ -43,6 +43,8 @@ use crate::{semconv, Error, Span, SpanCursor, SpanFilter, SpanSort, Store};
 
 // get_run_tape, compare_runs and recall_runs live beside this file.
 mod replay_tools;
+// foresee_run lives beside this file too.
+mod fate_tools;
 
 /// The MCP endpoint path served by `traza-server`.
 pub const ENDPOINT: &str = "/v1/mcp";
@@ -628,6 +630,7 @@ impl<'a> Server<'a> {
             );
         }
         tools.extend(replay_tools::definitions());
+        tools.extend(fate_tools::definitions());
         if self.annotation_tool_available(access) {
             tools.push(tool(
                 "record_annotation",
@@ -750,6 +753,7 @@ impl<'a> Server<'a> {
             name if replay_tools::handles(name) => {
                 replay_tools::call(self, name, arguments, &context)
             }
+            name if fate_tools::handles(name) => fate_tools::call(self, name, arguments, &context),
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
             }
@@ -2936,6 +2940,12 @@ fn guard_output_schema() -> Value {
             "tripped_by": {"type": ["string", "null"], "enum": ["policy", "manual", null]},
             "evidence": {"type": "array", "items": span_ref},
             "source": {"type": "string", "enum": ["live", "rebuilt"]},
+            "foresight": {
+                "type": "object",
+                "description": "Present when the policy sets min_success_odds: what runs that \
+                                took this run's path did (verdict, p_success, ci95, support), \
+                                and whether that raised the policy's action.",
+            },
         },
         "required": ["run", "verdict", "reasons", "policy", "usage", "source"],
     })

@@ -188,6 +188,7 @@ impl RouteClass {
             ("GET", "/v1/annotations") => Self::Lookup,
             ("GET", path) if path.starts_with("/v1/tapes/") => Self::Lookup,
             ("GET", "/v1/diff" | "/v1/recall") => Self::Stats,
+            ("GET", path) if path.starts_with("/v1/fate/") => Self::Stats,
             _ => Self::Other,
         }
     }
@@ -656,6 +657,10 @@ besides loopback)] \
 (the global default run-fuse policy; 0 removes a limit) \
 [--fuse-action stop|warn (default warn)] [--fuse-max-runs N (live runs kept; default 100000)] \
 [--no-fuses (do not observe runs; every /v1/fuses route answers 409)] \
+[--fate-max-runs N (completed runs per Fate Map cohort, newest first; default 20000)] \
+[--fate-max-nodes N (Fate Map tree nodes per build; default 50000)] \
+[--fate-cache-seconds N (how long a Fate Map build is served; 0 disables the cache and the \
+predictive fuses; default 300)] \
 [--tape-max-bytes N (payload bytes one tape or replay inlines; default 8MiB)] \
 [--allow-unauthenticated-non-loopback] [--version] \
 [--restore BACKUP_DIR (install a backup into --data-dir, then serve it)]\n\
@@ -756,6 +761,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut max_batch_spans = traza::caps::DEFAULT_MAX_BATCH_SPANS as u64;
     let cap = |value: u64| (value > 0).then_some(value as usize);
     let mut fuses = traza::guard::FuseConfig::default();
+    let mut fate = traza::fate::FateConfig::default();
     let mut tape_max_bytes = traza::tape::DEFAULT_TAPE_MAX_BYTES;
 
     let value = |i: usize, name: &str| -> Result<&String, String> {
@@ -1010,6 +1016,18 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 fuses.max_runs = (number(i, "--fuse-max-runs")? as usize).max(1);
             }
             "--no-fuses" => fuses.enabled = false,
+            "--fate-max-runs" => {
+                i += 1;
+                fate.max_runs = (number(i, "--fate-max-runs")? as usize).max(1);
+            }
+            "--fate-max-nodes" => {
+                i += 1;
+                fate.max_nodes = (number(i, "--fate-max-nodes")? as usize).max(1);
+            }
+            "--fate-cache-seconds" => {
+                i += 1;
+                fate.cache_ttl = Duration::from_secs(number(i, "--fate-cache-seconds")?);
+            }
             "--allow-unauthenticated-non-loopback" => {
                 allow_unauthenticated_non_loopback = true;
             }
@@ -1093,6 +1111,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             max_span_bytes: cap(max_span_bytes),
             max_batch_spans: cap(max_batch_spans),
             fuses,
+            fate,
         },
     }))
 }
@@ -1378,6 +1397,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("checkpoint failed: {error}");
                         }
                     }
+                }
+            })?;
+    }
+    // Fate Maps the predictive fuses asked for are built here, off every
+    // request path: a fuse check reads only a cached map and never builds
+    // one. A thread of its own, because a build runs up to the query
+    // deadline and must not hold up compaction or an erasure resume.
+    {
+        let warmer = Arc::clone(&engine);
+        thread::Builder::new()
+            .name("traza-foresight".into())
+            .spawn(move || loop {
+                thread::sleep(std::time::Duration::from_secs(2));
+                if let Err(error) = warmer.maintain_fate() {
+                    eprintln!("fate map warm-up failed: {error}");
                 }
             })?;
     }
@@ -3507,6 +3541,22 @@ fn serve_request(
                 query,
                 &request.body,
                 scope,
+            );
+            if reply.deadline_exceeded {
+                metrics.query_deadline_exceeded.increment();
+            }
+            responder.json(reply.status, reply.body)
+        }
+        // The Fate Map and foresight: every route a read, living beside the
+        // engine API it calls (traza::fate::http).
+        (_, path) if traza::fate::http::handles(path) => {
+            let reply = traza::fate::http::serve(
+                engine,
+                &request.method,
+                path,
+                query,
+                scope,
+                traza::mcp::unix_nanos_now(),
             );
             if reply.deadline_exceeded {
                 metrics.query_deadline_exceeded.increment();
