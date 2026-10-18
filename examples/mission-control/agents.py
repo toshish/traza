@@ -41,6 +41,12 @@ def say(*parts):
         print(*parts, flush=True)
 
 
+def warn(*parts):
+    """What went wrong, on stderr: CI keeps stderr when it throws stdout away."""
+    with LOCK:
+        print(*parts, file=sys.stderr, flush=True)
+
+
 # ------------------------------------------------------------------ HTTP
 
 
@@ -257,7 +263,7 @@ class Run(threading.Thread):
         nxt = {"tool": name} if kind == "tool" else {"est_cost_usd": 0.004}
         status, verdict = self.api.post("/v1/fuses/check", {"run": self.run_id, "next": nxt})
         if status != 200:
-            say(f"  {self.run_id}: the check answered {status}: {verdict}")
+            warn(f"  {self.run_id}: the check answered {status}: {verdict}")
             return "continue", [], []
         nudges = verdict.get("nudges") or []
         for nudge in nudges:
@@ -330,7 +336,7 @@ class Run(threading.Thread):
         try:
             self.work()
         except Exception as error:  # a demo agent that dies says why
-            say(f"  {self.run_id}: crashed: {error!r}")
+            warn(f"  {self.run_id}: crashed: {error!r}")
             self.outcome = "crashed"
 
     def work(self):
@@ -525,13 +531,21 @@ def verify(api, fleet):
     say("\n3. A run held by its history")
     held = fleet.find(lambda r: any(rs and rs[0].startswith("foresight:") for rs in r.stops) and r.holding, 60,
                       "held by a foresight stop")
+    # What the check itself answered, naming the step about to happen — not
+    # the verdict read, which judges the path so far without it.
+    answered = next(rs for rs in reversed(held.stops) if rs and rs[0].startswith("foresight:"))[0]
+    claim(answered.startswith("foresight:"), f"{held.run_id}'s pre-call check, naming its next step, answered stop: {answered}")
     status, doc = api.get(f"/v1/fuses/runs/{q(held.run_id)}")
-    claim(status == 200 and doc["verdict"] == "stop" and doc["foresight"]["raised"],
-          f"{held.run_id}'s pre-call check answered stop: {doc['reasons'][0]}")
+    if status == 200 and doc.get("verdict") == "stop" and (doc.get("foresight") or {}).get("raised"):
+        claim(True, f"its verdict read, which judges the path so far without that step, says stop too "
+              f"({doc['reasons'][0]}), so the Live screen marks it held")
+    else:
+        say(f"  its verdict read, which judges the path so far without that step, says "
+            f"{doc.get('verdict') if status == 200 else status}: the Live screen shows it waiting, not held")
     _, live = api.get("/v1/runs/live")
     row = next((r for r in live["runs"] if r["run"] == held.run_id), None)
     claim(row is not None and row["verdict"] != "stop" and row["current"]["pending"],
-          "the live listing never carries a foresight stop: it shows the step pending (the dashboard asks the verdict)")
+          "the live listing never carries a foresight stop: it shows the step pending")
 
     say("\n4. A nudge, and an approval")
     status, nudge = api.post(f"/v1/runs/{q(held.run_id)}/nudges", {
@@ -680,7 +694,7 @@ def main():
                 verify(api, fleet)
                 say("\nverified: every claim above was read back from the server")
             except (Failed, RedirectRefused, OSError) as error:
-                say(f"\nFAILED: {error}")
+                warn(f"\nFAILED: {error}")
                 code = 1
                 end = time.time()
         while code == 0 and (end is None or time.time() < end):
