@@ -825,17 +825,24 @@ pub fn bucket(count: usize) -> &'static str {
     }
 }
 
-/// A signature's text as a token stem: its name cut to [`MAX_NAME_BYTES`]
-/// at a character boundary, marked when cut.
+/// A signature's (or an agent's) text as a stem: cut to [`MAX_NAME_BYTES`]
+/// at a character boundary, marked when cut. Every reader names steps and
+/// cohorts through it — the build, the map and run routes, the run guard's
+/// live path — so a long name means the same thing everywhere.
 fn stem(signature: &str) -> String {
+    stem_cow(signature).into_owned()
+}
+
+/// [`stem`], borrowing a name short enough to need no cut.
+fn stem_cow(signature: &str) -> std::borrow::Cow<'_, str> {
     if signature.len() <= MAX_NAME_BYTES {
-        return signature.to_owned();
+        return std::borrow::Cow::Borrowed(signature);
     }
     let mut end = MAX_NAME_BYTES;
     while end > 0 && !signature.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…", &signature[..end])
+    std::borrow::Cow::Owned(format!("{}…", &signature[..end]))
 }
 
 /// Run-length groups of consecutive equal items.
@@ -881,7 +888,11 @@ fn bucket_range(bucket: u8) -> (usize, usize) {
 /// A build matches path tokens and cohorts by key, so a reader that keeps
 /// keys only — the run guard's live path — reads the same map.
 pub(crate) fn stem_key(stem: &str) -> u64 {
-    let digest = crate::hash::hash128(stem.as_bytes());
+    stem_key_bytes(stem.as_bytes())
+}
+
+fn stem_key_bytes(bytes: &[u8]) -> u64 {
+    let digest = crate::hash::hash128(bytes);
     let mut low = [0_u8; 8];
     low.copy_from_slice(&digest.as_bytes()[..8]);
     u64::from_le_bytes(low).max(1)
@@ -1048,19 +1059,44 @@ struct StepRecord {
     signature: u32,
 }
 
+/// Which of two spans [`attribution::session_outcome`] takes as the later
+/// one: the later end, then the greater trace and span id — here by their
+/// first eight bytes, then by a hash of both ids. Fixed-size, so a run's
+/// accumulator holds no copy of ids a producer may make megabytes long; it
+/// differs from the full comparison only for spans that end together and
+/// share both eight-byte prefixes.
+type EndKey = (u64, u64, u64, u64);
+
+fn end_key(span: &Span) -> EndKey {
+    // FNV-1a over both ids, a separator between: a tie-break only, so a
+    // producer that forged a collision would decide nothing but which of
+    // its own simultaneous spans ends its own run.
+    let ids = span
+        .trace_id
+        .bytes()
+        .chain(std::iter::once(0xff))
+        .chain(span.span_id.bytes());
+    let hash = ids.fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    (
+        span.end_time_ns,
+        prefix8(&span.trace_id),
+        prefix8(&span.span_id),
+        hash,
+    )
+}
+
 /// The span that ended last, as [`attribution::session_outcome`] reads it.
 struct Tail {
-    end: u64,
-    trace: Box<str>,
-    span: Box<str>,
+    end: EndKey,
     error: bool,
 }
 
-/// The last declared outcome.
+/// The last declared outcome: when, and its text (at most
+/// [`MAX_DECLARED_BYTES`]).
 struct Declared {
-    end: u64,
-    trace: Box<str>,
-    span: Box<str>,
+    end: EndKey,
     text: Box<str>,
 }
 
@@ -1177,7 +1213,7 @@ impl Fold<'_> {
             return;
         }
         let key = order_key(span);
-        let service = match self.names.intern(&span.service) {
+        let service = match self.names.intern(&stem_cow(&span.service)) {
             Some(id) => id,
             None => {
                 self.bounds.spans_skipped += 1;
@@ -1205,9 +1241,7 @@ impl Fold<'_> {
                     first_step: None,
                     task: None,
                     tail: Tail {
-                        end: span.end_time_ns,
-                        trace: span.trace_id.as_str().into(),
-                        span: span.span_id.as_str().into(),
+                        end: end_key(span),
                         error: span.status.eq_ignore_ascii_case("error"),
                     },
                     declared: None,
@@ -1231,32 +1265,27 @@ impl Fold<'_> {
         if key < acc.earliest.0 {
             acc.earliest = (key, service);
         }
-        let ends_later = (
-            span.end_time_ns,
-            span.trace_id.as_str(),
-            span.span_id.as_str(),
-        ) > (acc.tail.end, &*acc.tail.trace, &*acc.tail.span);
-        if ends_later {
+        // Only a span that might end later pays for its full end key.
+        let ends = if span.end_time_ns >= acc.tail.end.0 {
+            Some(end_key(span))
+        } else {
+            None
+        };
+        if let Some(end) = ends.filter(|end| *end > acc.tail.end) {
             acc.tail = Tail {
-                end: span.end_time_ns,
-                trace: span.trace_id.as_str().into(),
-                span: span.span_id.as_str().into(),
+                end,
                 error: span.status.eq_ignore_ascii_case("error"),
             };
         }
         if let Some(text) = semconv::outcome(&span.attributes) {
-            let later = acc.declared.as_ref().map_or(true, |declared| {
-                (
-                    span.end_time_ns,
-                    span.trace_id.as_str(),
-                    span.span_id.as_str(),
-                ) > (declared.end, &*declared.trace, &*declared.span)
-            });
-            if later {
+            let end = ends.unwrap_or_else(|| end_key(span));
+            if acc
+                .declared
+                .as_ref()
+                .map_or(true, |declared| end > declared.end)
+            {
                 acc.declared = Some(Declared {
-                    end: span.end_time_ns,
-                    trace: span.trace_id.as_str().into(),
-                    span: span.span_id.as_str().into(),
+                    end,
                     text: cut_to(&text, MAX_DECLARED_BYTES).into(),
                 });
             }
@@ -1274,7 +1303,7 @@ impl Fold<'_> {
             return;
         }
         acc.step_count += 1;
-        let agent = agent.and_then(|agent| self.names.intern(&agent));
+        let agent = agent.and_then(|agent| self.names.intern(&stem_cow(&agent)));
         if acc
             .first_step
             .as_ref()
@@ -1286,7 +1315,7 @@ impl Fold<'_> {
         // place, as an unnamed record, and the run's path ends before it.
         let signature = self
             .signatures
-            .intern(&stem(&signature))
+            .intern(&stem_cow(&signature))
             .unwrap_or_else(|| {
                 self.bounds.signature_cap = true;
                 NONE
@@ -1326,9 +1355,11 @@ struct RunFinal {
 /// span to end is `tail` and whose last declaration is `declared` — the two
 /// spans it reads; every other span changes nothing it decides.
 fn outcome_of(tail: &Tail, declared: Option<&Declared>, now_ns: u64) -> Outcome {
-    let minimal = |trace: &str, span: &str, end: u64, status: &str| Span {
-        trace_id: trace.to_owned(),
-        span_id: span.to_owned(),
+    // With at most one span of each kind, the ids session_outcome breaks
+    // ties on decide nothing; the fold already broke them.
+    let minimal = |end: u64, status: &str| Span {
+        trace_id: String::new(),
+        span_id: String::new(),
         tenant: String::new(),
         parent_span_id: None,
         name: String::new(),
@@ -1341,14 +1372,9 @@ fn outcome_of(tail: &Tail, declared: Option<&Declared>, now_ns: u64) -> Outcome 
         links: Vec::new(),
         extra: Map::new(),
     };
-    let mut spans = vec![minimal(
-        &tail.trace,
-        &tail.span,
-        tail.end,
-        if tail.error { "error" } else { "ok" },
-    )];
+    let mut spans = vec![minimal(tail.end.0, if tail.error { "error" } else { "ok" })];
     if let Some(declared) = declared {
-        let mut span = minimal(&declared.trace, &declared.span, declared.end, "ok");
+        let mut span = minimal(declared.end.0, "ok");
         span.attributes.insert(
             semconv::OUTCOME_KEYS[0].to_owned(),
             serde_json::Value::String(declared.text.to_string()),
@@ -3439,7 +3465,7 @@ impl Store {
         let key = BuildKey::of(Some(tenant), request.task.as_deref(), request.window);
         let build = self.fate.get_or_build(self, &key, now_ns, deadline)?;
         Ok(build
-            .cohort(tenant, &request.agent)
+            .cohort(tenant, &stem(&request.agent))
             .map(|cohort| render_map(&build, cohort, request)))
     }
 

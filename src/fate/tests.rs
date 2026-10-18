@@ -189,6 +189,55 @@ fn long_names_are_cut_at_a_character_boundary() {
 }
 
 #[test]
+fn an_agent_with_a_long_name_finds_its_cohort_from_every_reader() {
+    // A long CrewAI role as the service: the build, the map route, the run
+    // route and the fuse must all name the cohort the same way.
+    let fixture = TempStore::open("long-agent", crate::Config::default());
+    let store = fixture.store();
+    let now = now();
+    let agent = format!("the {} agent", "very ".repeat(60));
+    assert!(agent.len() > MAX_NAME_BYTES);
+    let mut spans = Vec::new();
+    for index in 0..40_u64 {
+        spans.extend(synthetic_run(
+            &format!("done-{index}"),
+            &agent,
+            &["llm:gpt-4o", "tool:lookup"],
+            now - 3 * 3_600_000_000_000 - index * 60_000_000_000,
+            index % 4 == 0,
+        ));
+    }
+    spans.extend(synthetic_run(
+        "going",
+        &agent,
+        &["llm:gpt-4o", "tool:lookup"],
+        now - 30_000_000_000,
+        false,
+    ));
+    store.ingest_batch(spans).expect("ingests");
+    let map = store
+        .fate_map("", &MapRequest::new(&agent), now)
+        .expect("builds")
+        .expect("the long name finds its cohort");
+    assert_eq!(map.runs, 40);
+    assert!(map.agent.len() <= MAX_NAME_BYTES + "…".len());
+    let foresight = store
+        .foresee("", "going", 30, now)
+        .expect("reads")
+        .expect("exists");
+    assert_eq!(foresight.cohort_runs, 40, "{}", foresight.explanation);
+    assert_eq!(foresight.verdict, ForesightVerdict::OnTrack);
+    // The fuse's reading, from the map the route just built.
+    let cached = store.foresee_cached("", "going", 30);
+    assert_eq!(
+        (cached.verdict, cached.support),
+        (ForesightVerdict::OnTrack, 40),
+        "{}",
+        cached.explanation
+    );
+}
+
+#[test]
 fn the_outcome_read_from_two_spans_is_session_outcomes() {
     // The fold keeps only the last span to end and the last declaration;
     // session_outcome over the whole run must agree with it.
@@ -223,9 +272,7 @@ fn the_outcome_read_from_two_spans_is_session_outcomes() {
             .max_by_key(|span| (span.end_time_ns, &span.trace_id, &span.span_id))
             .expect("a span");
         let tail = Tail {
-            end: last.end_time_ns,
-            trace: last.trace_id.as_str().into(),
-            span: last.span_id.as_str().into(),
+            end: end_key(last),
             error: last.status == "error",
         };
         let declared = spans
@@ -233,14 +280,20 @@ fn the_outcome_read_from_two_spans_is_session_outcomes() {
             .filter(|span| span.attributes.contains_key("session.outcome"))
             .max_by_key(|span| (span.end_time_ns, &span.trace_id, &span.span_id))
             .map(|span| Declared {
-                end: span.end_time_ns,
-                trace: span.trace_id.as_str().into(),
-                span: span.span_id.as_str().into(),
+                end: end_key(span),
                 text: span.attributes["session.outcome"]
                     .as_str()
                     .unwrap_or_default()
                     .into(),
             });
+        // The fold's fixed-size key picks the same spans the full ids do,
+        // and a run's record of them holds no id however long.
+        assert_eq!(std::mem::size_of::<Tail>(), 40);
+        assert_eq!(
+            spans.iter().map(end_key).max(),
+            Some(end_key(last)),
+            "case {index}"
+        );
         assert_eq!(
             outcome_of(&tail, declared.as_ref(), now),
             expected,
