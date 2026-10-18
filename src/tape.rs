@@ -60,8 +60,8 @@ const DEADLINE_CHECK_SPANS: usize = 16;
 /// Every `gen_ai.request.*` key qualifies (model, temperature, top_p,
 /// max_tokens, seed, stop sequences, …) plus OpenInference's single
 /// `llm.invocation_parameters` blob.
-const CONFIG_PREFIX: &str = "gen_ai.request.";
-const OI_INVOCATION_PARAMETERS: &str = "llm.invocation_parameters";
+pub(crate) const CONFIG_PREFIX: &str = "gen_ai.request.";
+pub(crate) const OI_INVOCATION_PARAMETERS: &str = "llm.invocation_parameters";
 
 /// Token usage one step reported. Each count is `None` when the span did not
 /// report it — a tool step reports none, and an unreported count is not zero.

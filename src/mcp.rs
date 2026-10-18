@@ -51,6 +51,9 @@ mod blame_tools;
 // xray_step lives beside this file.
 mod xray_tools;
 
+// what_changed (the change radar) lives beside this file too.
+mod radar_tools;
+
 /// The MCP endpoint path served by `traza-server`.
 pub const ENDPOINT: &str = "/v1/mcp";
 
@@ -639,6 +642,7 @@ impl<'a> Server<'a> {
         tools.extend(steer_tools::definitions(self.store.fuses_enabled()));
         tools.extend(blame_tools::definitions());
         tools.extend(xray_tools::definitions());
+        tools.extend(radar_tools::definitions());
         if self.annotation_tool_available(access) {
             tools.push(tool(
                 "record_annotation",
@@ -769,6 +773,9 @@ impl<'a> Server<'a> {
                 blame_tools::call(self, name, arguments, &context)
             }
             name if xray_tools::handles(name) => xray_tools::call(self, arguments, &context),
+            name if radar_tools::handles(name) => {
+                radar_tools::call(self, name, arguments, &context)
+            }
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
             }

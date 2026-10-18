@@ -67,12 +67,85 @@ pub(crate) struct SpanParts {
     pub links: Vec<Link>,
 }
 
+/// Resource attributes that reach the span, besides `service.name` (which
+/// becomes [`Span::service`]) and `traza.tenant` (which becomes its tenant).
+///
+/// These are the ones that say WHICH BUILD produced a span — the deployed
+/// version, the environment, the telemetry SDK — which is what the change
+/// radar ([`crate::radar`]) reads a deploy from. Each is copied onto every
+/// span of its resource as a span attribute, beneath the scope's and the
+/// span's own: a span that already carries the key keeps its value. Every
+/// other resource attribute is still dropped (see `docs/guide/ingest.md`).
+pub const KEPT_RESOURCE_ATTRIBUTES: [&str; 5] = [
+    "service.version",
+    "deployment.environment.name",
+    "deployment.environment",
+    "telemetry.sdk.name",
+    "telemetry.sdk.version",
+];
+
+/// Bytes of a build attribute's string value copied at most: a version, an
+/// environment or an SDK name is short, and a longer one is not copied.
+pub const MAX_BUILD_VALUE_BYTES: usize = 256;
+
+/// Whether `key = value` is a build attribute in the shape the copy gives
+/// them: a [`KEPT_RESOURCE_ATTRIBUTES`] key with a scalar value — a string
+/// of at most [`MAX_BUILD_VALUE_BYTES`], a number or a boolean.
+///
+/// The admission caps ([`crate::caps`]) do not count these, so copying them
+/// from the resource can never push a span that was admissible before the
+/// copy over `--max-span-attributes` or `--max-span-bytes`: the copy is
+/// additive, as it must be for an exporter that does not retry a `400`.
+pub fn is_build_attribute(key: &str, value: &Value) -> bool {
+    KEPT_RESOURCE_ATTRIBUTES.contains(&key)
+        && match value {
+            Value::String(text) => text.len() <= MAX_BUILD_VALUE_BYTES,
+            Value::Number(_) | Value::Bool(_) => true,
+            _ => false,
+        }
+}
+
+/// What one OTLP `Resource` contributes to its spans. Both decoders fill it
+/// through [`ResourceIdentity::absorb`], so which attribute wins a duplicate
+/// key is decided once.
+#[derive(Default)]
+pub(crate) struct ResourceIdentity {
+    /// The first string `service.name`.
+    pub service: Option<String>,
+    /// The first string `traza.tenant`.
+    pub tenant: Option<String>,
+    /// The first scalar value of each [`KEPT_RESOURCE_ATTRIBUTES`] key.
+    pub kept: Map<String, Value>,
+}
+
+impl ResourceIdentity {
+    /// Takes in one resource attribute. A non-string `service.name` or
+    /// `traza.tenant` does not stop the scan, and a kept key keeps its first
+    /// value that [`is_build_attribute`] accepts; arrays, maps, nulls and
+    /// overlong strings are not versions and are ignored.
+    pub(crate) fn absorb(&mut self, key: String, value: Value) {
+        match (key.as_str(), value) {
+            ("service.name", Value::String(name)) if self.service.is_none() => {
+                self.service = Some(name);
+            }
+            ("traza.tenant", Value::String(name)) if self.tenant.is_none() => {
+                self.tenant = Some(name);
+            }
+            (name, value) if is_build_attribute(name, &value) && !self.kept.contains_key(name) => {
+                self.kept.insert(key, value);
+            }
+            _ => {}
+        }
+    }
+}
+
 impl SpanParts {
     pub(crate) fn finish(
         self,
         service: &str,
         tenant: &str,
         scope_attributes: &Map<String, Value>,
+        resource_attributes: &Map<String, Value>,
     ) -> Result<Span, OtlpError> {
         if self.trace_id.is_empty() || self.span_id.is_empty() {
             return Err(err("traceId and spanId must be non-empty"));
@@ -81,7 +154,7 @@ impl SpanParts {
         // the common case — the span's own map is already the answer, so it
         // moves through untouched instead of being re-inserted key by key
         // into a fresh map.
-        let attributes = if scope_attributes.is_empty() {
+        let mut attributes = if scope_attributes.is_empty() {
             self.attributes
         } else {
             let mut merged = scope_attributes.clone();
@@ -90,6 +163,13 @@ impl SpanParts {
             }
             merged
         };
+        // The kept resource attributes sit beneath both: at most five
+        // lookups, and nothing at all for a resource that carries none.
+        for (key, value) in resource_attributes {
+            if !attributes.contains_key(key) {
+                attributes.insert(key.clone(), value.clone());
+            }
+        }
         Ok(Span {
             trace_id: self.trace_id,
             span_id: self.span_id,
@@ -254,21 +334,24 @@ pub fn spans_from_json(body: &[u8]) -> Result<Vec<Span>, OtlpError> {
         serde_json::from_slice(body).map_err(|error| OtlpError(error.to_string()))?;
     let mut spans = Vec::new();
     for resource_entry in request.resource_spans {
-        let (service, tenant) = resource_entry
+        let identity = resource_entry
             .resource
             .map(JsonResource::identity)
             .unwrap_or_default();
-        let service = service.unwrap_or_else(|| "unknown_service".to_owned());
-        let tenant = tenant.unwrap_or_default();
+        let service = identity
+            .service
+            .unwrap_or_else(|| "unknown_service".to_owned());
+        let tenant = identity.tenant.unwrap_or_default();
         for scope_entry in resource_entry.scope_spans {
             let scope_attributes = scope_entry.scope.map(|scope| scope.attributes.0);
             let scope_attributes = scope_attributes.unwrap_or_default();
             for json_span in scope_entry.spans {
-                spans.push(
-                    json_span
-                        .into_parts()?
-                        .finish(&service, &tenant, &scope_attributes)?,
-                );
+                spans.push(json_span.into_parts()?.finish(
+                    &service,
+                    &tenant,
+                    &scope_attributes,
+                    &identity.kept,
+                )?);
             }
         }
     }
@@ -303,26 +386,22 @@ struct JsonResource {
 
 impl JsonResource {
     /// The FIRST `service.name` and FIRST `traza.tenant` attributes whose
-    /// values are strings, from one scan. A non-string one does not stop the
-    /// scan, exactly as the DOM walk's `find_map` did not. `traza.tenant` is
-    /// the one resource attribute besides the service that flows onto spans:
-    /// it becomes span identity, and the engine validates it like any
+    /// values are strings, from one scan, plus the kept build attributes
+    /// ([`KEPT_RESOURCE_ATTRIBUTES`]). A non-string one does not stop the
+    /// scan, exactly as the DOM walk's `find_map` did not. `traza.tenant`
+    /// becomes span identity, and the engine validates it like any
     /// client-supplied tenant.
-    fn identity(self) -> (Option<String>, Option<String>) {
-        let mut service = None;
-        let mut tenant = None;
+    ///
+    /// The attribute list arrives already flattened to a map, so of two
+    /// entries with one key the LAST survived that flattening; the protobuf
+    /// decoder sees every entry and keeps the first. Both agree on the
+    /// common case of one entry per key, which is what OTLP requires.
+    fn identity(self) -> ResourceIdentity {
+        let mut identity = ResourceIdentity::default();
         for (key, value) in self.attributes.0 {
-            match (key.as_str(), value) {
-                ("service.name", Value::String(name)) if service.is_none() => {
-                    service = Some(name);
-                }
-                ("traza.tenant", Value::String(name)) if tenant.is_none() => {
-                    tenant = Some(name);
-                }
-                _ => {}
-            }
+            identity.absorb(key, value);
         }
-        (service, tenant)
+        identity
     }
 }
 
@@ -975,6 +1054,220 @@ mod tests {
             attribute(serde_json::json!({"bytesValue": {"nested": true}})),
             Value::Null
         );
+    }
+
+    /// The resource of the build-attribute tests, as OTLP JSON: three kept
+    /// keys (one numeric), one the span overrides, one the scope overrides,
+    /// one non-scalar and one that is not kept at all.
+    fn build_resource_json() -> Value {
+        serde_json::json!({"resourceSpans": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "checkout"}},
+                {"key": "service.version", "value": {"stringValue": "1.5.0"}},
+                {"key": "deployment.environment.name", "value": {"stringValue": "prod"}},
+                {"key": "telemetry.sdk.name", "value": {"stringValue": "opentelemetry"}},
+                {"key": "telemetry.sdk.version", "value": {"intValue": "127"}},
+                {"key": "deployment.environment", "value": {"arrayValue": {"values": []}}},
+                {"key": "host.name", "value": {"stringValue": "box-1"}}
+            ]},
+            "scopeSpans": [{
+                "scope": {"attributes": [
+                    {"key": "deployment.environment.name", "value": {"stringValue": "scope-env"}}
+                ]},
+                "spans": [{
+                    "traceId": "aa", "spanId": "bb",
+                    "startTimeUnixNano": "1", "endTimeUnixNano": "2",
+                    "attributes": [
+                        {"key": "service.version", "value": {"stringValue": "span-own"}}
+                    ]
+                }]
+            }]
+        }]})
+    }
+
+    #[test]
+    fn build_resource_attributes_reach_the_span_beneath_its_own() {
+        let span = spans_from_json(build_resource_json().to_string().as_bytes())
+            .expect("maps")
+            .remove(0);
+        assert_eq!(span.service, "checkout");
+        let attributes = &span.attributes;
+        assert_eq!(attributes["service.version"], "span-own", "the span wins");
+        assert_eq!(
+            attributes["deployment.environment.name"], "scope-env",
+            "the scope wins over the resource"
+        );
+        assert_eq!(attributes["telemetry.sdk.name"], "opentelemetry");
+        assert_eq!(
+            attributes["telemetry.sdk.version"], 127,
+            "scalars keep their type"
+        );
+        assert!(
+            !attributes.contains_key("deployment.environment"),
+            "a non-scalar is not a version"
+        );
+        assert!(
+            !attributes.contains_key("host.name"),
+            "other keys still drop"
+        );
+        assert!(
+            !attributes.contains_key("service.name"),
+            "the service is a field"
+        );
+    }
+
+    /// A tiny protobuf ENCODER for the agreement test: an independent
+    /// implementation of the wire format, so agreement with the decoder is
+    /// evidence about the format rather than a shared bug.
+    mod pb {
+        fn varint(mut value: u64, out: &mut Vec<u8>) {
+            loop {
+                let byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value == 0 {
+                    out.push(byte);
+                    return;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+
+        pub fn bytes(field: u64, payload: &[u8], out: &mut Vec<u8>) {
+            varint(field << 3 | 2, out);
+            varint(payload.len() as u64, out);
+            out.extend_from_slice(payload);
+        }
+
+        pub fn fixed64(field: u64, value: u64, out: &mut Vec<u8>) {
+            varint(field << 3 | 1, out);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+
+        pub fn key_value(key: &str, any: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            bytes(1, key.as_bytes(), &mut out);
+            bytes(2, any, &mut out);
+            out
+        }
+
+        pub fn string(text: &str) -> Vec<u8> {
+            let mut out = Vec::new();
+            bytes(1, text.as_bytes(), &mut out);
+            out
+        }
+
+        pub fn int(value: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            varint(3 << 3, &mut out);
+            varint(value, &mut out);
+            out
+        }
+
+        pub fn empty_array() -> Vec<u8> {
+            let mut out = Vec::new();
+            bytes(5, &[], &mut out);
+            out
+        }
+    }
+
+    /// [`build_resource_json`], protobuf-encoded.
+    fn build_resource_protobuf() -> Vec<u8> {
+        let mut resource = Vec::new();
+        for (key, any) in [
+            ("service.name", pb::string("checkout")),
+            ("service.version", pb::string("1.5.0")),
+            ("deployment.environment.name", pb::string("prod")),
+            ("telemetry.sdk.name", pb::string("opentelemetry")),
+            ("telemetry.sdk.version", pb::int(127)),
+            ("deployment.environment", pb::empty_array()),
+            ("host.name", pb::string("box-1")),
+        ] {
+            pb::bytes(1, &pb::key_value(key, &any), &mut resource);
+        }
+        let mut scope = Vec::new();
+        pb::bytes(
+            3,
+            &pb::key_value("deployment.environment.name", &pb::string("scope-env")),
+            &mut scope,
+        );
+        let mut span = Vec::new();
+        pb::bytes(1, &[0xaa], &mut span);
+        pb::bytes(2, &[0xbb], &mut span);
+        pb::fixed64(7, 1, &mut span);
+        pb::fixed64(8, 2, &mut span);
+        pb::bytes(
+            9,
+            &pb::key_value("service.version", &pb::string("span-own")),
+            &mut span,
+        );
+        let mut scope_spans = Vec::new();
+        pb::bytes(1, &scope, &mut scope_spans);
+        pb::bytes(2, &span, &mut scope_spans);
+        let mut resource_spans = Vec::new();
+        pb::bytes(1, &resource, &mut resource_spans);
+        pb::bytes(2, &scope_spans, &mut resource_spans);
+        let mut request = Vec::new();
+        pb::bytes(1, &resource_spans, &mut request);
+        request
+    }
+
+    #[test]
+    fn copied_build_attributes_never_push_a_span_over_the_admission_caps() {
+        // A span already at --max-span-attributes, from a resource that
+        // carries every build attribute: before the copy it was admitted,
+        // and the copy must not make it refused.
+        let body = serde_json::json!({"resourceSpans": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "checkout"}},
+                {"key": "service.version", "value": {"stringValue": "1.5.0"}},
+                {"key": "deployment.environment.name", "value": {"stringValue": "prod"}},
+                {"key": "deployment.environment", "value": {"stringValue": "prod"}},
+                {"key": "telemetry.sdk.name", "value": {"stringValue": "opentelemetry"}},
+                {"key": "telemetry.sdk.version", "value": {"stringValue": "1.27.0"}}
+            ]},
+            "scopeSpans": [{"spans": [{
+                "traceId": "aa", "spanId": "bb",
+                "startTimeUnixNano": "1", "endTimeUnixNano": "2",
+                "attributes": [
+                    {"key": "a", "value": {"stringValue": "1"}},
+                    {"key": "b", "value": {"stringValue": "2"}},
+                    {"key": "c", "value": {"stringValue": "3"}}
+                ]
+            }]}]
+        }]});
+        let spans = spans_from_json(body.to_string().as_bytes()).expect("maps");
+        assert_eq!(spans[0].attributes["service.version"], "1.5.0", "copied");
+        let fixture = crate::tape::tests::TempStore::open(
+            "otlp-build-caps",
+            crate::Config {
+                max_span_attributes: Some(3),
+                ..crate::Config::default()
+            },
+        );
+        fixture
+            .store()
+            .ingest_batch(spans)
+            .expect("the copies do not count against the span's caps");
+        // The cap still holds for the span's own attributes.
+        let mut over = body.clone();
+        over["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array_mut()
+            .expect("attributes")
+            .push(serde_json::json!({"key": "d", "value": {"stringValue": "4"}}));
+        let spans = spans_from_json(over.to_string().as_bytes()).expect("maps");
+        assert!(fixture.store().ingest_batch(spans).is_err());
+    }
+
+    #[test]
+    fn both_encodings_keep_the_same_build_attributes() {
+        let from_json = spans_from_json(build_resource_json().to_string().as_bytes())
+            .expect("json maps")
+            .remove(0);
+        let from_protobuf = crate::otlp_pb::spans_from_protobuf(&build_resource_protobuf())
+            .expect("protobuf maps")
+            .remove(0);
+        assert_eq!(from_json, from_protobuf);
+        assert_eq!(from_protobuf.attributes["telemetry.sdk.version"], 127);
     }
 
     /// Precedence must not depend on key order: `stringValue` outranks

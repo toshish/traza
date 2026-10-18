@@ -155,6 +155,7 @@ with `{"partialSuccess":{}}`.
 | `startTimeUnixNano` / `endTimeUnixNano` | `start_time_ns` / `end_time_ns`. Accepted as a JSON string (OTLP JSON's u64 encoding) or a number |
 | Resource attribute `service.name` | `service` |
 | Resource attribute `traza.tenant` | The span's tenant, validated like any client-supplied one |
+| Resource attributes `service.version`, `deployment.environment.name`, `deployment.environment`, `telemetry.sdk.name`, `telemetry.sdk.version` | Copied onto every span of the resource as span attributes, beneath scope and span attributes (see below) |
 | **Every other resource attribute** | **Dropped** — see below |
 | Scope attributes | Merged beneath span attributes, which take precedence on a collision |
 | `attributes` (`AnyValue`) | Flattened to plain JSON: `intValue` becomes a number, `doubleValue` a double, `stringValue` a string |
@@ -167,12 +168,27 @@ with `{"partialSuccess":{}}`.
 A link whose id pair is empty is dropped rather than treated as fatal — a link
 to nothing is meaningless, and rejecting a whole batch for it would be worse.
 
-#### Resource attributes do not reach the span
+#### Which resource attributes reach the span
 
-Two are read — `service.name` and `traza.tenant` — and **the rest are
-discarded**. `deployment.environment`, `service.version`,
-`service.instance.id`, `host.name`, `k8s.*` and `telemetry.sdk.*` are not
-stored and cannot be filtered on. Scope attributes are different: those *are*
+`service.name` becomes the span's `service`, and `traza.tenant` becomes its
+tenant.
+
+Five more say which build produced the span: `service.version`,
+`deployment.environment.name`, `deployment.environment`, `telemetry.sdk.name`
+and `telemetry.sdk.version`. These are copied onto every span of their
+resource as ordinary span attributes, so they are stored, searchable and
+read by the [change radar](radar.md). A copied attribute sits beneath the
+scope's and the span's own attributes: a span that already carries one of
+these keys keeps its value. Only scalar values (string, number or boolean)
+are copied, and a string only up to 256 bytes. Each adds a few bytes to
+every span. The admission caps do not count these five attributes, so a span
+admitted at `--max-span-attributes` or `--max-span-bytes` before the copy is
+still admitted after it. That holds for native ingest too: a span may carry
+these five, in that shape, beyond its caps.
+
+**The rest are discarded.** `service.instance.id`, `host.name`, `k8s.*`,
+`telemetry.sdk.language` and every other resource attribute are not stored
+and cannot be filtered on. Scope attributes are different: those *are*
 merged beneath the span's own.
 
 If you need a resource attribute to be queryable, copy it onto spans — an SDK
@@ -180,8 +196,9 @@ span processor, or an OpenTelemetry Collector `transform` processor moving
 `resource.attributes[...]` to `attributes[...]`. Span attributes round-trip
 faithfully and are indexed like any other.
 
-This page previously said other resource attributes were "merged beneath span
-attributes". They never were.
+Before v0.28 this page said other resource attributes were "merged beneath
+span attributes". They never were. The five build attributes above are the
+first to reach the span, and only those five do.
 
 `span.kind` has no dedicated Traza field. If you need it queryable, carry it as
 an attribute.

@@ -149,6 +149,7 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `GET` | [`/v1/blame`](#get-v1blame) | Agent Blame: the tool step that introduced a line of code |
 | `GET` | [`/v1/xray/{trace_id}/{span_id}`](#get-v1xraytrace_idspan_id) | A model call's context window: chunks, provenance, staleness, duplicates, compaction loss |
 | `GET` | [`/v1/cache/{run}`](#get-v1cacherun) | Cache Autopsy: why each call's prompt cache held or broke, and what it cost |
+| `GET` | [`/v1/changes`](#get-v1changes) | What changed in each agent, when, and what it did: ranked change points with deltas and verdicts |
 | `POST` | [`/v1/annotations`](#post-v1annotations) | Attach a score or feedback record |
 | `GET` | [`/v1/annotations`](#get-v1annotations) | Query annotations |
 | `POST` | [`/v1/datasets`](#post-v1datasets) | Create a dataset |
@@ -343,6 +344,16 @@ every span in the export lands under that tenant. A bound credential stamps
 and checks it exactly as native ingest does, and an invalid `traza.tenant` is
 a `400` for the **whole export**, deliberately loud — OTLP's `partialSuccess`
 is for data the server chose to drop, not for a defect the client must fix.
+
+**Build attributes.** The resource attributes `service.version`,
+`deployment.environment.name`, `deployment.environment`, `telemetry.sdk.name`
+and `telemetry.sdk.version` are copied onto every span of their resource as
+span attributes. A span or scope attribute with the same key wins. Only
+scalar values are copied, and a string only up to 256 bytes. The admission
+caps do not count these five attributes, so the copy never turns an
+admissible span into a refused export. The [change radar](#get-v1changes)
+reads deploys from them. Every other resource attribute except
+`service.name` and `traza.tenant` is dropped.
 
 **Errors.** `400` with the decode failure for malformed protobuf or JSON, a
 non-hex id, or a timestamp that is not a `u64`; `400` for an exceeded
@@ -1622,6 +1633,76 @@ curl 'http://localhost:8080/v1/cache/weather-9'
 | `texts_partial` | boolean | More than 32 MiB of distinct chunk text across the 32 most recent calls; some `diff` is `null` |
 
 `404 {"error":"run not found"}` for a run with no spans in scope.
+
+---
+
+## Change radar
+
+### `GET /v1/changes`
+
+What changed in each agent over a window, when it changed, and what it did:
+a ranked timeline of change points. The [radar guide](radar.md) explains the
+fingerprints, the detection rule, the statistics and the limits, and walks
+through a full example.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `agent` | string | Only this agent: the first step's agent name, else the service of the run's earliest span |
+| `environment` | string | Only runs that report this `deployment.environment.name` (or `deployment.environment`) |
+| `since` | integer | Window start in Unix ns, for spans starting at or after it. Default: 30 days before `until` |
+| `until` | integer | Window end in Unix ns. Default: now |
+| `behavior_threshold` | number | The Jensen–Shannon distance a `behavior` change must reach, in `(0, 1]`. Default `0.3` |
+| `run` | string | Place one run on its agent's timeline. The answer narrows to that run's agent and adds `run` (see below). `404` when the run is not among the window's agent runs; `400` when it is but `agent` or `environment` excludes it |
+| `tenant` | string | Tenant scope for an unbound credential. Absent means every tenant, each with its own cohorts |
+
+```sh
+curl 'http://localhost:8080/v1/changes?agent=billing-bot'
+```
+
+When none of the window's 363 spans belongs to that agent, the answer is:
+
+```json
+{"agents":[],"runs_scanned":0,"since_ns":1789706417403613000,"spans_scanned":363,"truncated":false,"until_ns":1792298417403613000}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `since_ns`, `until_ns` | integer | The window asked for |
+| `covered_since_ns` | integer, optional | Present when `--radar-max-runs` applied. Every agent run whose first step starts at or after this time is analysed in full; runs whose first step started earlier are not analysed at all |
+| `spans_scanned` | integer | Spans read |
+| `runs_scanned` | integer | Agent runs analysed, across the cohorts reported |
+| `truncated` | boolean | The run cap or the 100-cohort cap applied, or some agent is `unnamed` |
+| `agents[]` | array | One cohort per `(tenant, agent)`, cohorts with a regression first: `agent`, `tenant`, `runs`, `first_run_ns`, `last_run_ns`, `summary` (one sentence), `current` (each dimension's dominant value over the latest runs), `volatile` (dimensions too varied to search), `changes[]`, `truncated` (more than 40 changes), and `unnamed` (some value, tool or path step is shown as `#` and a 16-hex digest because its name did not fit the bounded name tables; it was still compared exactly) |
+| `changes[].at_ns` | integer | Start of the first run on the new value |
+| `changes[].dimension` | string | `system_prompt`, `tool_catalog`, `model_requested`, `model_returned`, `params`, `service_version`, `sdk_version` or `behavior` |
+| `changes[].from`, `.to` | string | The old and new values: 16-hex digests for prompts and catalogs, otherwise the value (a set of values is joined with ` + `). For `behavior`, the most common top-level path on each side |
+| `changes[].runs_before`, `.runs_after` | integer | Finished runs compared on each side |
+| `changes[].deltas` | object | `error_rate` and `success_rate` (`before`, `after`, `p_value`, `n_before`, `n_after`); `cost_per_run`, `steps_per_run` and `duration_ns_per_run` (the same, plus `ratio`); `tool_mix[]` (`tool`, `before_share`, `after_share`) |
+| `changes[].verdict` | string | `regression`, `improvement`, `neutral` or `insufficient_data` |
+| `changes[].decided_by` | string, optional | `quality` (error or success rate) or `efficiency` (cost, steps or duration): which kind of metric decided a `regression` or `improvement`. Changes are ranked by verdict, then quality before efficiency, then effect size |
+| `changes[].effect_size` | number | The effect behind the verdict: Cohen's h for rates, d for log-scale means (capped at 4; a difference with no spread on either side is reported at the cap). `0` when neutral. Comparable only between changes with the same `decided_by` |
+| `changes[].explanation` | string | The metrics behind the verdict, with their p-values |
+| `changes[].co_changes` | array | Other dimensions that changed within two runs |
+| `changes[].behavior_shift` | object, optional | `js_distance` and `p_value` between the two sides' path distributions. For a `behavior` change, measured on the half of the runs that did not choose the split, with the p-value Bonferroni-corrected |
+| `changes[].detail` | object, optional | For a system prompt, `diff` (`offset`, `context`, `before`, `after`). For a catalog, `added`, `removed` and `definitions_changed`. For params, `changed[]` (`key`, `before`, `after`). For behaviour, `paths[]` |
+| `changes[].example_runs` | object | `before` and `after`: up to three run ids each, nearest the change |
+| `run` | object, with `run=` only | `run`, `tenant`, `agent`, `start_ns`, `outcome`, `errored`, `fingerprint` (each dimension's value for this run, plus `path`), and `downstream_of[]`. For each dimension, `downstream_of` holds the latest change point at or before the run whose new value the run carries, regressions first: `dimension`, `at_ns`, `to`, `verdict`, `explanation` |
+
+Rate p-values come from the pooled two-proportion z-test. Mean p-values come
+from Welch's t-test on a log scale: cost over priced runs, steps and duration
+as `ln(1+x)`. Holm's correction at 5% across the five tests of a change
+decides the verdict. A verdict needs at least 10 finished runs on each side.
+
+A bound credential reads its own tenant, and naming another is `403`.
+Unknown or repeated parameters are `400`, and so are a non-integer
+`since`/`until`, a `since` after `until`, a `behavior_threshold` outside
+`(0, 1]`, an invalid `tenant`, a `run` that exists in more than one tenant
+when the caller named none, and a `run` that `agent` or `environment`
+excludes. An analysis that does not finish within the request's
+`--query-deadline-ms` budget is also `400`, with no partial answer, and is
+counted in `traza_query_deadline_exceeded_total`. A bigger window costs
+more time, not more memory: plain request traces are never held, and at most
+`--radar-max-runs` agent runs are.
 
 ---
 

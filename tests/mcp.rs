@@ -332,7 +332,7 @@ fn every_tool_declares_what_it_does_to_the_store() {
         }
     }
 
-    // Nineteen readers and one writer, so a tool added without a decision
+    // Twenty readers and one writer, so a tool added without a decision
     // about its nature fails here rather than shipping as pessimistically
     // annotated. (The second writer, promote_failures_to_dataset, needs
     // --mcp-promote and so is absent from this listing; its own gating test
@@ -342,8 +342,8 @@ fn every_tool_declares_what_it_does_to_the_store() {
         .filter(|tool| tool["annotations"]["readOnlyHint"] == json!(true))
         .count();
     assert_eq!(
-        read_only, 19,
-        "expected nineteen read-only tools, found {read_only}"
+        read_only, 20,
+        "expected twenty read-only tools, found {read_only}"
     );
 }
 

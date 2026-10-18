@@ -201,6 +201,7 @@ impl RouteClass {
             ("GET", path) if traza::xray::http::handles(path) => Self::Lookup,
             ("GET", "/v1/diff" | "/v1/recall") => Self::Stats,
             ("GET", path) if path.starts_with("/v1/fate/") => Self::Stats,
+            ("GET", traza::radar::ROUTE) => Self::Stats,
             _ => Self::Other,
         }
     }
@@ -683,6 +684,7 @@ default 900)] \
 [--tape-max-bytes N (payload bytes one tape or replay inlines; default 8MiB)] \
 [--xray-stale-steps N (steps after which an unreferenced tool result is stale in the \
 context X-Ray; default 20)] \
+[--radar-max-runs N (runs one change analysis reads, the newest; default 20000)] \
 [--allow-unauthenticated-non-loopback] [--version] \
 [--restore BACKUP_DIR (install a backup into --data-dir, then serve it)]\n\
        traza-server mcp --url URL [--token TOKEN] \
@@ -716,6 +718,8 @@ struct Options {
     mcp: McpOptions,
     /// `--tape-max-bytes`: payload bytes one tape (or replay) inlines.
     tape_max_bytes: usize,
+    /// `--radar-max-runs`: runs one change analysis reads.
+    radar_max_runs: usize,
     config: Config,
 }
 
@@ -792,6 +796,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut steer = traza::steer::SteerConfig::default();
     let mut tape_max_bytes = traza::tape::DEFAULT_TAPE_MAX_BYTES;
     let mut xray_stale_steps = traza::xray::DEFAULT_STALE_STEPS;
+    let mut radar_max_runs = traza::radar::DEFAULT_MAX_RUNS;
 
     let value = |i: usize, name: &str| -> Result<&String, String> {
         args.get(i)
@@ -1093,6 +1098,13 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 }
                 xray_stale_steps = steps as usize;
             }
+            "--radar-max-runs" => {
+                i += 1;
+                radar_max_runs = match number(i, "--radar-max-runs")? {
+                    0 => return Err("--radar-max-runs must be at least 1".to_owned()),
+                    runs => runs as usize,
+                };
+            }
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(None);
@@ -1131,6 +1143,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         compaction_enabled,
         mcp,
         tape_max_bytes,
+        radar_max_runs,
         config: Config {
             // Explicit flag beats profile beats built-in default, in that
             // order and regardless of where each appeared.
@@ -1353,9 +1366,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         compaction_enabled,
         mcp,
         tape_max_bytes,
+        radar_max_runs,
         config,
     } = options;
     replay_routes::configure(tape_max_bytes);
+    traza::radar::configure(radar_max_runs);
     let durability = config.durability;
 
     // Bearer auth from TRAZA_TOKENS; unset is allowed on loopback by default.
@@ -3665,6 +3680,23 @@ fn serve_request(
         // engine API it calls (traza::fate::http).
         (_, path) if traza::fate::http::handles(path) => {
             let reply = traza::fate::http::serve(
+                engine,
+                &request.method,
+                path,
+                query,
+                scope,
+                traza::mcp::unix_nanos_now(),
+            );
+            if reply.deadline_exceeded {
+                metrics.query_deadline_exceeded.increment();
+            }
+            responder.json(reply.status, reply.body)
+        }
+        // The change radar. Routing, parameters and the tenant binding live
+        // in the library beside the analysis (traza::radar); the method rule
+        // above already authorized the read.
+        (_, path) if traza::radar::handles(path) => {
+            let reply = traza::radar::serve(
                 engine,
                 &request.method,
                 path,

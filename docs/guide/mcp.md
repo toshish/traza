@@ -114,7 +114,7 @@ over `curl`.
 
 ## The tools
 
-Twenty-one tools: nineteen reads and two gated writers. They are shaped like the
+Twenty-two tools: twenty reads and two gated writers. They are shaped like the
 questions somebody asks at 2am, not like the route index — two routes may serve
 one tool, and one route may serve two. Most of them describe what is in the
 store; `diagnose_session` and `compare_runs` are the ones that answer a
@@ -141,6 +141,7 @@ question about it.
 | `run_topology` | **How did this run's agents hand work around, and where did they ping-pong?** |
 | `blame_line` | **Which agent step wrote this line of code, and why?** |
 | `xray_step` | **What exactly did the model see at this step — and why did its cache break?** |
+| `what_changed` | **What changed in this agent, and did it make things worse?** |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -149,13 +150,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the nineteen readers | `true` | — | — | `false` |
+| the twenty readers | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises nineteen read tools as though each might delete something and
+omits them advertises twenty read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -227,6 +228,31 @@ The reasoning behind these is worth knowing:
   telemetry block. Past the result ceiling rows are cut from the end, the
   chunk list first, and the note says whether the summary rows survived; the
   stale threshold is the server's `--xray-stale-steps`.
+- **`what_changed` before reading individual runs when an agent that used to
+  work is failing.** It runs the [change radar](radar.md) over the agent's
+  runs (default: the last 30 days) and returns a ranked timeline of change
+  points: a system prompt edit (with the edited text), tools added or
+  removed, a different requested or returned model, new sampling parameters,
+  a new service or SDK version, or a `behavior` change, where the agent's
+  paths shifted with no configuration change at all. Each change reports how
+  error rate, success rate, cost and steps moved across it, with p-values and
+  a verdict, regressions first. It also names example runs on each side,
+  which you can open with `get_run_tape` or compare with `compare_runs`. It
+  takes `agent`, `environment`, `since`, `until`, `limit` (changes per
+  agent, default 5, at most 20) and, for an unbound credential, `tenant` (a
+  bound credential naming another tenant is refused). Each change says
+  whether a quality or an efficiency metric decided its verdict
+  (`decided_by`), and quality regressions rank first. With `run_id`, it also
+  places that run on
+  its agent's timeline: its configuration, and the change points it ran
+  downstream of (for example, "this failed run used the system prompt
+  introduced by Tuesday's regression"). It returns `structuredContent` with
+  each agent's summary, current configuration and top changes, plus `run`
+  when one was named. A run id two tenants share needs `tenant`; a run the
+  `agent` or `environment` filter excludes is refused by name rather than
+  reported missing. Agent names,
+  values, prompt text, tool names and run ids render inside the telemetry
+  block.
 
 **`foresee_run` reads a run against its agent's [Fate Map](foresight.md).** It
 takes `run_id`, an optional `tenant` (for an unbound credential; a bound one
@@ -246,6 +272,7 @@ explanation that quotes them render inside the telemetry block, and are made
 JSON-safe in `structuredContent`. It is a read: it builds the agent's map if
 none is cached (under the query deadline), and changes nothing. Nothing in it
 comes from a model — it is counting over stored runs — and it says so.
+
 **`blame_line` answers "why does this code look like this?"** before an
 agent changes it. It takes `path` (a file path or a suffix such as
 `src/cart.rs`), `line` (the exact text; indentation does not matter), an
@@ -282,7 +309,7 @@ the run's `foresight` too, and a foresight stop reads as any other reason;
 in `structuredContent` the reasons and the foresight's explanation and next
 tool are made JSON-safe, as `foresee_run` makes the same text. On a server
 started with `--no-fuses` it is not listed, nor is `list_live_runs` —
-seventeen reads, then — and a call naming either is refused.
+eighteen reads, then — and a call naming either is refused.
 
 **`list_live_runs` and `run_topology` are [steering](steer.md)'s reads.**
 `list_live_runs` is [`GET /v1/runs/live`](http-api.md#get-v1runslive): the
@@ -373,7 +400,7 @@ so a tool composed of several folds — `describe_store` runs half a dozen —
 can spend several budgets end to end.
 
 `list_sessions`, `diagnose_session`, `analyze_cost`, `check_run_guard`,
-`compare_runs`, `recall_runs` and `foresee_run` additionally return `structuredContent` against a declared
+`compare_runs`, `recall_runs`, `foresee_run` and `what_changed` additionally return `structuredContent` against a declared
 `outputSchema`, because their answers are small, genuinely tabular or
 record-shaped, and the thing a client is most likely to chart or act on.
 Everything else is text only — for span data the compact rendering is strictly
