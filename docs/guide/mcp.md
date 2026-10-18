@@ -114,7 +114,7 @@ over `curl`.
 
 ## The tools
 
-Sixteen tools: fourteen reads and two gated writers. They are shaped like the
+Seventeen tools: fifteen reads and two gated writers. They are shaped like the
 questions somebody asks at 2am, not like the route index — two routes may serve
 one tool, and one route may serve two. Most of them describe what is in the
 store; `diagnose_session` and `compare_runs` are the ones that answer a
@@ -136,6 +136,7 @@ question about it.
 | `get_run_tape` | What did this run do, step by step? |
 | `compare_runs` | **Where did this run part from that one, and why?** |
 | `recall_runs` | Has this been done before, and how did it go? |
+| `list_forks` | Which branches of this run were tried, and how did each go? |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -144,13 +145,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the fourteen readers | `true` | — | — | `false` |
+| the fifteen readers | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises fourteen read tools as though each might delete something and
+omits them advertises fifteen read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -205,6 +206,16 @@ The reasoning behind these is worth knowing:
   deliberately no tool that creates a replay: a replay serves model answers to
   an agent harness, and letting the model under test create one would let
   stored telemetry choose which recording its next run is fed.
+- **`list_forks` reads the branches a harness already made** of a run
+  ([forks](fork.md)): the most recent first, each with the step it was cut
+  at, how it ended, its cost, and where it first parted from the parent —
+  the step, the kind of difference and the differ's explanation, all inside
+  the untrusted block. It takes `run_id` and an optional `limit` (default 20,
+  at most 50), reads the same listing as
+  [`GET /v1/forks`](http-api.md#get-v1forks) under the caller's tenant, and
+  says when a fork was not compared (the query budget ran out first, or the
+  parent has no spans in its tenant). There is no tool that creates a fork,
+  for the reason there is none that creates a replay.
 
 **`check_run_guard` reads a run's [fuse](guard.md) verdict** — `continue`,
 `warn` or `stop` — with its reasons, policy, limits and usage: the same

@@ -1,7 +1,8 @@
 # Client libraries
 
 Two thin clients for the routes an agent harness talks to — the run fuses,
-replays, diffs, recall, and the ledger — live in this repository:
+replays and forks, diffs, recall, and the ledger — live in this repository,
+with tape-test helpers on top:
 
 | | Python | TypeScript |
 |---|---|---|
@@ -39,6 +40,11 @@ each package's copy of `LICENSE` and `NOTICE` to the repository's).
 | `events(after, wait_ms, follow)` — an iterator | `events({after, waitMs, follow})` — an async iterable | [`GET /v1/fuses/events`](http-api.md#get-v1fusesevents) |
 | `tape(run, resolve)` | `tape(run, {resolve})` | [`GET /v1/tapes/{run}`](http-api.md#get-v1tapesrun) |
 | `replay(run, mode)` → `.openai_base_url`, `.anthropic_base_url`, `.env(api_key)`, `.status()`, `.next_tool(name)` | `replay(run, {mode})` → `.openaiBaseUrl`, `.anthropicBaseUrl`, `.env({apiKey})`, `.status()`, `.nextTool(name)` | [`/v1/replays`](http-api.md#post-v1replays) |
+| `replay(run, mode, edits, live_after)` | `replay(run, {mode, edits, liveAfter})` | [`POST /v1/replays`](http-api.md#post-v1replays) as a fork |
+| `fork(run, at_step, response=… \| tool_result=…, live=True)` — a context manager; `traza.fork(…)` | `fork(run, {atStep, response \| toolResult, live})` → a `Fork` | [`POST /v1/replays`](http-api.md#post-v1replays), then the provider ([forks](#forks-and-tape-tests)) |
+| `forks(run, limit)` | `forks(run, {limit})` | [`GET /v1/forks`](http-api.md#get-v1forks) |
+| `goldens(limit)`, `mark_golden(run, golden)` | `goldens({limit})`, `markGolden(run, {golden})` | [`GET /v1/goldens`](http-api.md#get-v1goldens), [`POST /v1/annotations`](http-api.md#post-v1annotations) |
+| `traza.testing.replay_test(client, run, agent)`, `TapeTest`, pytest-traza | `replayTest(client, run, agent)` | a strict replay, judged ([tape tests](#forks-and-tape-tests)) |
 | `diff(a, b)` | `diff(a, b)` | [`GET /v1/diff`](http-api.md#get-v1diff) |
 | `recall(query, outcome, limit)` | `recall(query, {outcome, limit})` | [`GET /v1/recall`](http-api.md#get-v1recall) |
 | `ledger_head()` | `ledgerHead()` | [`GET /v1/ledger/head`](http-api.md#get-v1ledgerhead) |
@@ -182,6 +188,42 @@ real provider SDKs (`openai` and `anthropic` for Python, `openai` and
 `@anthropic-ai/sdk` for TypeScript); the test suites drive the same routes
 with plain `urllib` and `fetch`, so they need no provider SDK installed.
 
+## Forks and tape tests
+
+The [fork guide](fork.md) walks through both clients' forks, tape tests and
+golden runs; in short:
+
+- **`fork`** creates a fork and switches the agent at the cut. Python's is a
+  context manager that points `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` at a
+  loopback switch — private to the process, answering only the per-fork
+  secret it puts in the API-key variables — which forwards to the replay
+  until it answers `replay_live` and to the real provider (with the real key,
+  read from the environment when the fork was made) after it; with the
+  OpenTelemetry SDK configured it also tags the spans started inside the
+  block. TypeScript's returns a `Fork` whose `openaiOptions()` /
+  `anthropicOptions()` carry a switching `fetch` for the provider SDKs, and
+  whose `spanProcessor()` tags spans until `close()`. `tool_result(name)` /
+  `toolResult(name)` returns the edited or recorded tool step, or
+  `None` / `null` once the real tool should run.
+- **Tape tests** replay a run strictly and fail — `TapeMismatch`, an
+  `AssertionError` in Python, an `Error` in TypeScript — naming where the
+  agent left the recorded path, when it stopped early, or when it overran.
+  Python adds the **pytest-traza** plugin (`@pytest.mark.traza_tape("run")`,
+  registered as a `pytest11` entry point; it needs pytest, the package still
+  depends on nothing) and the **`traza`** command:
+
+  ```sh
+  traza test -- python agent.py --task "{input}"   # every golden run; JUnit XML on stdout
+  traza golden add weather-7                        # mark a run golden
+  traza forks weather-7                             # its branches and where they parted
+  traza fork weather-7 --at 1 --response "Sunny." -- python agent.py
+  ```
+
+  The command reads the server from `--url` or `TRAZA_URL`, the tenant from
+  `--tenant` or `TRAZA_TENANT`, and the credential from `TRAZA_TOKEN` only.
+  It exits 0 when every test passed, 1 when one failed (or there was nothing
+  to test, unless `--allow-empty`), 2 when the server could not be asked.
+
 ## The exporter environment
 
 `otel_env(url, token, tenant)` returns the trace-signal variables:
@@ -223,6 +265,13 @@ cargo build --release
 python3 -m unittest discover -s sdk/python/tests
 (cd sdk/typescript && npm ci && npm test)
 ```
+
+The fork tests stand a canned-answer stub in for the real provider, so the
+hand-over at the cut is observed — which request reached it, with which key
+— and nothing leaves the machine. The pytest-traza test runs pytest in a
+child interpreter and is skipped, saying so, when pytest is not installed;
+the OpenTelemetry tagging test likewise needs the OpenTelemetry SDK, and the
+span processor's own logic is tested without it.
 
 Each suite spawns `traza-server` — `$TRAZA_SERVER_BIN`, else
 `target/release/traza-server` — twice on ephemeral loopback ports, one open
