@@ -1363,7 +1363,8 @@ fn a_pre_call_check_reads_the_guards_live_path_never_the_store() {
         let _ = check(run, None);
         let live = store.fuse_behaviour("", run).expect("followed");
         let read = store.run_spans(Some(""), run, 1_000, None).expect("reads");
-        let (stored, _) = read_spans(&read.spans, 1_000, !read.truncated, now);
+        let (stored, _) =
+            read_spans(&read.spans, 1_000, !read.truncated, now, None).expect("reads");
         let keys = |reading: &Reading| -> Vec<(u64, usize)> {
             reading
                 .groups
@@ -2069,6 +2070,37 @@ fn a_run_the_fold_cannot_track_keeps_nothing_not_even_its_tenant() {
         "{} names",
         fold.names.names.len()
     );
+}
+
+#[test]
+fn reading_a_long_run_for_foresight_answers_to_the_deadline() {
+    // A whole read of a long run walks every span twice — its path and step
+    // count, then its outcome — so a spent budget stops it rather than
+    // letting foresight run on past it.
+    let spans: Vec<Span> = (0..3 * DEADLINE_STRIDE as u64)
+        .map(|index| {
+            span(
+                "long",
+                &format!("s{index}"),
+                1_000 + index,
+                json!({"session.id": "long", "gen_ai.operation.name": "execute_tool",
+                       "gen_ai.tool.name": "lookup"}),
+            )
+        })
+        .collect();
+    let spent = Deadline::starting(Instant::now(), Some(Duration::ZERO));
+    assert!(matches!(
+        read_spans(&spans, FORESIGHT_RUN_SPANS, true, now(), spent),
+        Err(Error::DeadlineExceeded(_))
+    ));
+    // Only the outcome left to read: still refused.
+    assert!(matches!(
+        read_spans(&spans[..10], FORESIGHT_RUN_SPANS, true, now(), spent),
+        Err(Error::DeadlineExceeded(_))
+    ));
+    // In time, the same read answers.
+    let (reading, _) = read_spans(&spans, FORESIGHT_RUN_SPANS, true, now(), None).expect("reads");
+    assert_eq!(reading.steps, 3 * DEADLINE_STRIDE as u64);
 }
 
 #[test]

@@ -3363,12 +3363,18 @@ impl LivePath {
 /// earliest `max_spans` of them; the outcome and the step count from all —
 /// a whole read of a long run costs the same either way, and its outcome is
 /// what the map counted it as.
+///
+/// All of it is work over the run's spans — every one of them for a whole
+/// read — so it answers to `deadline`, checked every [`DEADLINE_STRIDE`]
+/// spans and around the outcome, which reads them all again.
 fn read_spans(
     spans: &[Span],
     max_spans: usize,
     read_whole: bool,
     now_ns: u64,
-) -> (Reading, Outcome) {
+    deadline: Option<Deadline>,
+) -> Result<(Reading, Outcome)> {
+    let mut paced = Paced::new(deadline);
     let truncated = !read_whole || spans.len() > max_spans;
     let (head, rest) = spans.split_at(spans.len().min(max_spans));
     let mut steps: Vec<(StepOrder, String, Option<String>)> = Vec::new();
@@ -3376,6 +3382,7 @@ fn read_spans(
     // service's key, whatever order the store returned the spans in.
     let mut earliest: Option<((OrderKey, u64), &str)> = None;
     for span in head {
+        paced.step(1)?;
         let key = order_key(span);
         if earliest.map_or(true, |((first, _), _)| key <= first) {
             let candidate = (key, stem_key(&stem_cow(&span.service)));
@@ -3406,15 +3413,22 @@ fn read_spans(
             .unwrap_or_default(),
     );
     // Past the head only the count is wanted: no signature is built.
-    let beyond = rest
-        .iter()
-        .filter(|span| semconv::step_kind_with(span, &semconv::facts(&span.attributes)).is_step())
-        .count();
+    let mut beyond = 0;
+    for span in rest {
+        paced.step(1)?;
+        if semconv::step_kind_with(span, &semconv::facts(&span.attributes)).is_step() {
+            beyond += 1;
+        }
+    }
     let total = steps.len() + beyond;
     let complete = !truncated && total <= RUN_STEP_WINDOW;
     steps.truncate(RUN_STEP_WINDOW);
     let outcome = if read_whole {
-        attribution::session_outcome(spans, now_ns, crate::mcp::SESSION_IDLE_NS).outcome
+        Deadline::check(deadline, 0)?;
+        let outcome =
+            attribution::session_outcome(spans, now_ns, crate::mcp::SESSION_IDLE_NS).outcome;
+        Deadline::check(deadline, 0)?;
+        outcome
     } else {
         Outcome::Unknown
     };
@@ -3434,7 +3448,7 @@ fn read_spans(
         live: outcome == Outcome::Unknown,
         steps: total as u64,
     };
-    (reading, outcome)
+    Ok((reading, outcome))
 }
 
 /// A cohort's counts as one run sees them: the run itself left out of
@@ -3883,7 +3897,8 @@ impl Store {
         }
         let key = BuildKey::of(Some(tenant), None, None);
         let build = self.fate.get_or_build(self, &key, now_ns, deadline)?;
-        let (reading, outcome) = read_spans(&read.spans, FORESIGHT_RUN_SPANS, true, now_ns);
+        let (reading, outcome) =
+            read_spans(&read.spans, FORESIGHT_RUN_SPANS, true, now_ns, deadline)?;
         let partial = read.spans.len() > FORESIGHT_RUN_SPANS;
         let agent = reading.agent.clone().unwrap_or_default();
         let mut foresight = Foresight {
@@ -3914,6 +3929,7 @@ impl Store {
         let Some(cohort) = build.cohort(tenant, &agent) else {
             foresight.explanation =
                 format!("no completed runs of agent `{agent}` in the window to compare with");
+            Deadline::check(deadline, 0)?;
             return Ok(Some(foresight));
         };
         let view = View::of(cohort, run);
@@ -3922,6 +3938,9 @@ impl Store {
         foresight.last_open = probe.open.is_some();
         let judged = judge(&build, &view, &probe, min_support);
         fill(&mut foresight, cohort, &judged);
+        // Judged past the budget, the answer is refused like any other
+        // work that ran out of time — never returned as if it were in time.
+        Deadline::check(deadline, 0)?;
         Ok(Some(foresight))
     }
 
@@ -4149,12 +4168,21 @@ impl Store {
                     out.explanation = "the run has no recorded steps yet".to_owned();
                     return out;
                 }
-                let (mut reading, _) = read_spans(
+                let read = read_spans(
                     &read.spans,
                     FORESIGHT_RUN_SPANS,
                     !read.truncated,
                     crate::mcp::unix_nanos_now(),
+                    deadline,
                 );
+                let (mut reading, _) = match read {
+                    Ok(read) => read,
+                    Err(error) => {
+                        out.explanation =
+                            format!("the run could not be read for foresight: {error}");
+                        return out;
+                    }
+                };
                 reading.live = true;
                 reading
             }
