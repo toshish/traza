@@ -45,6 +45,21 @@ seed --data-dir ./data --behaviours
 traza-server --data-dir ./data
 ```
 
+## See it run
+
+[`examples/foresight/run.sh`](../../examples/foresight/README.md) runs this
+guide against a real server in a couple of seconds. It loads the corpus
+above, draws the `support-agent`'s Fate Map as a tree with every branch's
+Wilson interval, and recomputes the fatal fork's interval and Fisher test
+from its counts. A scripted agent then starts a new run down the search
+loop: after its second empty search, `GET /v1/fate/runs/{run}` calls it
+`likely_failure` while it has no outcome yet. A policy with
+`min_success_odds: 0.5` stops it at the pre-call check before a third
+search, with the foresight reason, and a run on the clean-refund path is
+allowed every step. Last, it prints the map's calibration. The counts it
+prints are asserted against the corpus's ground truth, and it exits non-zero
+if any claim fails.
+
 ## Behaviour paths
 
 A run's **steps** — its LLM, tool and agent spans

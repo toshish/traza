@@ -1,15 +1,15 @@
 Demos
 =====
 
-Nine scripted demos, one claim each. Every number they print is measured while
+Eleven scripted demos, one claim each. Every number they print is measured while
 you watch — a timed request, a counter, a field the server answered with —
 and each script checks its own claims and exits non-zero if the store stops
 backing them. CI runs them all for the same reason.
 
 Each is one command from the repo root, works in a throwaway directory, and
 cleans up after itself. They build what they need on first run; `guard/`,
-`replay/` and `prove/` also run a prebuilt binary named by `TRAZA_BIN` (a
-path, or a command on `PATH`).
+`replay/`, `prove/`, `foresight/` and `coding-agents/` also run a prebuilt
+binary named by `TRAZA_BIN` (a path, or a command on `PATH`).
 
 | Demo | The claim it proves | Runs for |
 |---|---|---|
@@ -22,6 +22,8 @@ path, or a command on `PATH`).
 | [`guard/`](guard/README.md) | A looping agent stopped between steps: the ack says stop, the pre-call check refuses the next step, the kill switch stops a healthy run, a grant approves more budget — and the same fuse blocks a Claude Code session | ~3 s |
 | [`replay/`](replay/README.md) | A recorded run replays through the agent's own OpenAI-wire code with zero model calls; a changed prompt is refused, naming the step; a diff names where two runs parted | ~2 s |
 | [`prove/`](prove/README.md) | A hash chain over everything committed, recomputed with `hashlib`; an anchor; an erasure ledgered by digest, not by name; one flipped byte named offline, exit 2 | ~2 s |
+| [`foresight/`](foresight/README.md) | A run's fate, read from every run before it: the Fate Map's fatal fork with its Wilson interval, a live run called likely to fail before it has failed, a predictive fuse stopping it at the pre-call check while a healthy run goes through, and the map's own calibration | ~2 s |
+| [`coding-agents/`](coding-agents/README.md) | Claude Code and Codex transcripts imported with no setup: cost per sub-agent, the cache autopsy, an X-Ray of the instruction a compaction dropped, a test edited to pass found by a detector, lines blamed to the session, step and prompt that wrote them, and `--watch` following a live transcript | ~3 s |
 
 Pick by what you came to see:
 
@@ -29,6 +31,8 @@ Pick by what you came to see:
 - **"Show me it's a real database."** `crash/`, then `needle/`.
 - **"Show me the agent story."** `incident/`, then `mcp-demo/`.
 - **"Show me the flight recorder."** `guard/`, then `replay/`.
+- **"Show me what happens next."** `foresight/`.
+- **"Show me my coding agents."** `coding-agents/`.
 - **"Show me the obligations."** `vanish/`, then `prove/`.
 
 The dashboard demos (`swarm/` above all) want a built UI: `cd ui && npm ci &&

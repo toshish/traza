@@ -111,6 +111,11 @@ are the server's answers. The per-step prices are the agent's own arithmetic
 on the same pricing file, and the demo asserts that the server's cost for the
 run equals their sum. It exits non-zero if any claim fails.
 
+[`examples/foresight/run.sh`](../../examples/foresight/README.md) runs a
+[predictive fuse](foresight.md#predictive-fuses): a policy's
+`min_success_odds` stopping a run at the pre-call check because earlier runs
+on its path mostly failed, while a run on a healthy path is allowed.
+
 ## Runs
 
 A run is one unit of agent work within a tenant. Its id is the span's

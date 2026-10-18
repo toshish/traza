@@ -18,6 +18,21 @@ traza-server import claude-code --watch &     # and keep following live ones
 traza-server blame src/cart.rs:42             # who wrote line 42?
 ```
 
+## See it run
+
+[`examples/coding-agents/run.sh`](../../examples/coding-agents/README.md)
+imports four synthetic sessions — three Claude Code, one Codex, authored in
+the shapes below, never a real transcript — into a throwaway server. It
+shows what each agent and sub-agent cost (recomputed from the transcripts'
+own usage and the pricing file, and asserted equal), the
+[cache autopsy](xray.md#cache-autopsy) of a session whose cache expired
+during a pause and which was then compacted, the [X-Ray](xray.md) of the
+instruction that compaction dropped, the
+[detectors](tql.md#the-detector-library) finding a test edited to pass,
+`traza-server blame` naming the session, step and prompt behind three lines,
+and `--watch` delivering lines appended to a live transcript within a poll.
+It exits non-zero if any claim fails.
+
 ## What it reads
 
 | Source | Default `--path` | Files |

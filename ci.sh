@@ -48,15 +48,18 @@ python3 scripts/test-demos.py
 # The demos are documentation people run, so each is a gate rather than a
 # sample: they drive the real binary over the real endpoints and assert their
 # own claims, and a change that breaks a surface they show should not merge
-# green. Each runs at its documented smoke setting; guard, replay and prove
-# have no scale knob and run as they are, in seconds each.
+# green. Each runs at its documented smoke setting; guard, replay, prove,
+# foresight and coding-agents have no scale knob and run as they are, in
+# seconds each.
 #
 # They run through a symlink to this checkout whose path has a space in it:
 # a checkout can live under such a path, and a script that splits its own
 # path on spaces works from any path without one, so CI would never see it
-# break otherwise. guard, replay and prove run the binary TRAZA_BIN names, so
-# it is set here, never inherited: an older install exported in the caller's
-# shell must not stand in for the one just built.
+# break otherwise. guard, replay, prove, foresight and coding-agents run the
+# binary TRAZA_BIN names, so it is set here, never inherited: an older install
+# exported in the caller's shell must not stand in for the one just built.
+# foresight writes its corpus with the seed binary beside it, which the
+# release build above also built.
 if command -v python3 >/dev/null 2>&1; then
   demo_dir=$(mktemp -d "${TMPDIR:-/tmp}/traza-ci.XXXXXX")
   demos="$demo_dir/traza checkout"
@@ -81,6 +84,10 @@ if command -v python3 >/dev/null 2>&1; then
   echo "ci: replay demo ran"
   TRAZA_BIN="$built" "$demos/examples/prove/run.sh" >/dev/null
   echo "ci: prove demo ran"
+  TRAZA_BIN="$built" "$demos/examples/foresight/run.sh" >/dev/null
+  echo "ci: foresight demo ran"
+  TRAZA_BIN="$built" "$demos/examples/coding-agents/run.sh" >/dev/null
+  echo "ci: coding-agents demo ran"
 else
   echo "ci: skipping the demos (python3 not found)"
 fi

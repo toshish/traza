@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -161,6 +162,45 @@ class RedirectsAreRefused(unittest.TestCase):
                     self.assertEqual(front.requests[0]["headers"].get("Authorization"),
                                      "Bearer " + TOKEN)
                     self.assert_refused(result, location, elsewhere)
+
+    def test_the_foresight_harness_and_the_watch_poller_refuse(self):
+        foresight = load("foresight_agent", ROOT / "examples/foresight/agent.py")
+        coding = load("coding_agents_render", ROOT / "examples/coding-agents/render.py")
+        calls = {
+            "foresight check": lambda url: foresight.request(url, TOKEN, "POST", "/v1/fuses/check",
+                                                             {"run": "r1"}),
+            "foresight read": lambda url: foresight.request(url, TOKEN, "GET", "/v1/fate/runs/r1"),
+            "watch poll": lambda url: coding.request(url, TOKEN, "/v1/tapes/r1"),
+        }
+        with Server(200) as elsewhere:
+            location = "http://localhost:%d/elsewhere" % elsewhere.port
+            for status in STATUSES:
+                with Server(status, {"Location": location}, b"moved") as front:
+                    for name, call in calls.items():
+                        with self.subTest(status=status, call=name):
+                            try:
+                                call(front.url)
+                                refusal = "answered, not refused"
+                            except Exception as error:  # the refusal's type is the module's own
+                                refusal = str(error)
+                            followed = list(elsewhere.requests)
+                            elsewhere.requests.clear()
+                            self.assertEqual(followed, [], "a redirect was followed, token and all")
+                            self.assertIn(location, refusal)
+                    self.assertEqual(len(front.requests), len(calls))
+                    for sent in front.requests:
+                        self.assertEqual(sent["headers"].get("Authorization"), "Bearer " + TOKEN)
+
+    def test_the_foresight_agent_and_the_watch_poller_stop_with_a_message(self):
+        with Server(200) as elsewhere, tempfile.TemporaryDirectory() as tmp:
+            location = "http://localhost:%d/elsewhere" % elsewhere.port
+            with Server(302, {"Location": location}, b"moved") as front:
+                result = run_agent(ROOT / "examples/foresight/agent.py", "run", front.url, TOKEN,
+                                   "r1", "doomed", Path(tmp) / "state.json", Path(tmp) / "out-")
+                self.assert_refused(result, location, elsewhere)
+                result = run_agent(ROOT / "examples/coding-agents/render.py", "arrived", front.url,
+                                   TOKEN, "r1", 1, "%.6f" % time.time(), Path(tmp) / "tape.json")
+                self.assert_refused(result, location, elsewhere)
 
     def test_no_demo_sends_a_token_through_the_default_opener(self):
         # The default opener follows redirects. A demo that builds requests
