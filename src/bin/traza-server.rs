@@ -661,6 +661,8 @@ besides loopback)] \
 [--fate-max-nodes N (Fate Map tree nodes per build; default 50000)] \
 [--fate-cache-seconds N (how long a Fate Map build is served; 0 disables the cache and the \
 predictive fuses; default 300)] \
+[--fate-tenant-maps N (tenants whose default-window Fate Map, the one predictive fuses read, \
+stays cached; default 32)] \
 [--tape-max-bytes N (payload bytes one tape or replay inlines; default 8MiB)] \
 [--allow-unauthenticated-non-loopback] [--version] \
 [--restore BACKUP_DIR (install a backup into --data-dir, then serve it)]\n\
@@ -1027,6 +1029,10 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--fate-cache-seconds" => {
                 i += 1;
                 fate.cache_ttl = Duration::from_secs(number(i, "--fate-cache-seconds")?);
+            }
+            "--fate-tenant-maps" => {
+                i += 1;
+                fate.tenant_maps = (number(i, "--fate-tenant-maps")? as usize).max(1);
             }
             "--allow-unauthenticated-non-loopback" => {
                 allow_unauthenticated_non_loopback = true;

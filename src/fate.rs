@@ -161,8 +161,13 @@ pub const MAX_SIGNATURES: usize = 20_000;
 /// Bytes of a signature's name kept in a token.
 pub const MAX_NAME_BYTES: usize = 160;
 
-/// Builds the cache holds, least recently used evicted first.
+/// Builds other than the tenants' default-window ones (a task, an explicit
+/// window, the operator view) the cache holds, least recently used evicted
+/// first.
 pub const CACHE_ENTRIES: usize = 8;
+
+/// Default for [`FateConfig::tenant_maps`] (`--fate-tenant-maps`).
+pub const DEFAULT_TENANT_MAPS: usize = 32;
 
 /// Spans of one run read to compute its foresight.
 pub const FORESIGHT_RUN_SPANS: usize = 20_000;
@@ -227,6 +232,12 @@ pub struct FateConfig {
     /// (`--fate-cache-seconds`). Zero disables the cache — and with it the
     /// predictive fuses, which read only cached maps.
     pub cache_ttl: Duration,
+    /// Tenants whose default-window build stays cached at once
+    /// (`--fate-tenant-maps`): the map each tenant's predictive fuses read.
+    /// These live in a pool of their own that no other request can evict
+    /// from; past this many tenants the least recently used one's is
+    /// rebuilt when next asked for.
+    pub tenant_maps: usize,
 }
 
 impl Default for FateConfig {
@@ -235,6 +246,7 @@ impl Default for FateConfig {
             max_runs: DEFAULT_MAX_RUNS,
             max_nodes: DEFAULT_MAX_NODES,
             cache_ttl: Duration::from_secs(DEFAULT_CACHE_SECONDS),
+            tenant_maps: DEFAULT_TENANT_MAPS,
         }
     }
 }
@@ -2090,6 +2102,15 @@ fn build(
 // ----------------------------------------------------------------- cache
 
 /// Cached builds, single-flight per key, dropped wholesale by any erasure.
+///
+/// Two pools, each evicting least recently used within itself only: each
+/// tenant's default-window build — the one the predictive fuses read, and
+/// the default `/v1/fate/map` and `/v1/fate/runs` answer from — holds up to
+/// [`FateConfig::tenant_maps`] entries; every other build (a task, an
+/// explicit window, the operator view of every tenant) holds up to
+/// [`CACHE_ENTRIES`]. So no request, of any tenant, can push a tenant's
+/// fuse map out: only another tenant's fuse map can, and only past the
+/// tenant bound.
 pub(crate) struct FateCache {
     config: FateConfig,
     state: Mutex<CacheState>,
@@ -2100,6 +2121,12 @@ pub(crate) struct FateCache {
 struct CacheState {
     entries: HashMap<BuildKey, Entry>,
     building: HashSet<BuildKey>,
+    /// Builds running now, across keys: at most [`MAX_CONCURRENT_BUILDS`],
+    /// so the memory one build may hold composes into a process-wide bound.
+    active: usize,
+    /// The most builds that ever ran at once, for the bound's test.
+    #[cfg(test)]
+    peak: usize,
     demand: Vec<BuildKey>,
     /// Keys whose last background build failed, and when: retried after a
     /// cache lifetime, not every tick.
@@ -2116,8 +2143,21 @@ struct Entry {
     used: u64,
 }
 
-/// Clears a key's in-flight mark however the build ends, a panic included,
-/// so waiters are never left waiting on a build nobody is running.
+/// Builds run at once across keys at most; a build past it waits, under
+/// its own deadline, for one to finish.
+const MAX_CONCURRENT_BUILDS: usize = 2;
+
+impl BuildKey {
+    /// Whether this is a tenant's default-window build — the one the
+    /// predictive fuses read — and so lives in the tenant pool.
+    fn is_tenant_default(&self) -> bool {
+        self.scope.is_some() && self.task.is_none() && self.window == Window::Default
+    }
+}
+
+/// Clears a key's in-flight mark and gives back its build slot however the
+/// build ends, a panic included, so waiters are never left waiting on a
+/// build nobody is running.
 struct InFlight<'c> {
     cache: &'c FateCache,
     key: BuildKey,
@@ -2127,6 +2167,7 @@ impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         if let Ok(mut state) = self.cache.state.lock() {
             state.building.remove(&self.key);
+            state.active = state.active.saturating_sub(1);
         }
         self.cache.settled.notify_all();
     }
@@ -2152,7 +2193,8 @@ impl FateCache {
     }
 
     /// The build for `key`: cached while fresh, else built under `deadline`
-    /// — once, however many requests ask at the same moment.
+    /// — once, however many requests ask at the same moment, and with at
+    /// most [`MAX_CONCURRENT_BUILDS`] builds of any keys running at once.
     fn get_or_build(
         &self,
         store: &Store,
@@ -2171,7 +2213,7 @@ impl FateCache {
                     return Ok(Arc::clone(&entry.build));
                 }
             }
-            if !state.building.contains(key) {
+            if !state.building.contains(key) && state.active < MAX_CONCURRENT_BUILDS {
                 break;
             }
             let wait = match deadline {
@@ -2188,6 +2230,11 @@ impl FateCache {
                 .0;
         }
         state.building.insert(key.clone());
+        state.active += 1;
+        #[cfg(test)]
+        {
+            state.peak = state.peak.max(state.active);
+        }
         let epoch = state.epoch;
         drop(state);
         let in_flight = InFlight {
@@ -2208,20 +2255,33 @@ impl FateCache {
                     used,
                 },
             );
-            // Explicit windows go first: a dashboard asking for a fresh
-            // `until` on every poll must not push out the default-window
-            // maps the predictive fuses read.
-            while state.entries.len() > CACHE_ENTRIES {
-                let oldest = state
+            let tenant_pool = key.is_tenant_default();
+            let cap = if tenant_pool {
+                self.config.tenant_maps.max(1)
+            } else {
+                CACHE_ENTRIES
+            };
+            loop {
+                let pool = state
                     .entries
                     .iter()
-                    .min_by_key(|(key, entry)| (key.window == Window::Default, entry.used))
-                    .map(|(key, _)| key.clone());
+                    .filter(|(key, _)| key.is_tenant_default() == tenant_pool);
+                let (count, oldest) = pool.fold(
+                    (0, None::<(&BuildKey, u64)>),
+                    |(count, oldest), (key, entry)| {
+                        let oldest = match oldest {
+                            Some((_, used)) if used <= entry.used => oldest,
+                            _ => Some((key, entry.used)),
+                        };
+                        (count + 1, oldest)
+                    },
+                );
                 match oldest {
-                    Some(oldest) => {
+                    Some((oldest, _)) if count > cap => {
+                        let oldest = oldest.clone();
                         state.entries.remove(&oldest);
                     }
-                    None => break,
+                    _ => break,
                 }
             }
         }

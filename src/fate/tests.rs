@@ -1189,8 +1189,66 @@ fn explicit_windows_never_evict_the_maps_the_fuses_read() {
             .expect("builds");
     }
     let state = store.fate.lock().expect("lock");
-    assert_eq!(state.entries.len(), CACHE_ENTRIES);
     assert!(state.entries.contains_key(&default));
+}
+
+#[test]
+fn builds_beyond_the_concurrency_bound_wait_for_a_slot() {
+    let (fixture, now) = seeded("slots", crate::Config::default(), false);
+    let store = fixture.store();
+    // Two builds of other keys are running.
+    store.fate.lock().expect("lock").active = MAX_CONCURRENT_BUILDS;
+    let key = BuildKey::of(Some(""), None, Some((now - DEFAULT_WINDOW_NS, now)));
+    let deadline = Deadline::starting(Instant::now(), Some(Duration::from_millis(50)));
+    assert!(matches!(
+        store.fate.get_or_build(store, &key, now, deadline),
+        Err(Error::DeadlineExceeded(_))
+    ));
+    {
+        let state = store.fate.lock().expect("lock");
+        assert!(state.entries.is_empty(), "it waited rather than built");
+        assert!(!state.building.contains(&key));
+    }
+    store.fate.lock().expect("lock").active = 0;
+    store
+        .fate
+        .get_or_build(store, &key, now, None)
+        .expect("builds once a slot is free");
+    let state = store.fate.lock().expect("lock");
+    assert_eq!((state.active, state.peak), (0, 1));
+}
+
+#[test]
+fn another_tenants_requests_never_evict_the_map_a_tenants_fuses_read() {
+    let fixture = TempStore::open("cross-eviction", crate::Config::default());
+    let store = fixture.store();
+    let now = now();
+    store.ingest_batch(corpus(now, "", false)).expect("default");
+    store
+        .ingest_batch(corpus(now, "acme", false))
+        .expect("acme");
+    // The default tenant's fuses have their map.
+    let fuses = BuildKey::of(Some(""), None, None);
+    store
+        .fate
+        .get_or_build(store, &fuses, now, None)
+        .expect("builds");
+    // A credential bound to acme asks for maps of tasks that do not exist,
+    // each a cheap build of its own: none of them may push the default
+    // tenant's map out.
+    for task in 0..(CACHE_ENTRIES + 4) {
+        let mut request = MapRequest::new("support-agent");
+        request.task = Some(format!("{task:016x}"));
+        store.fate_map("acme", &request, now).expect("builds");
+    }
+    {
+        let state = store.fate.lock().expect("lock");
+        assert!(
+            state.entries.contains_key(&fuses),
+            "a request of another tenant evicted the fuses' map"
+        );
+    }
+    assert!(store.fate.peek(&fuses).is_some());
 }
 
 #[test]
