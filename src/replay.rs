@@ -1488,12 +1488,22 @@ impl Registry {
         now_ns: u64,
     ) -> Option<Value> {
         let call = self.arrived(now_ns);
+        let got_digest = provider.request_digest(request).ok().flatten();
         let origin = {
             let latest_erasure = store.erasures.latest_id().ok()?;
             let (mut replays, now_ns) = self.lock_at(call);
             let replay = self
                 .live(&mut replays, store, latest_erasure, id, binding, now_ns)
                 .ok()?;
+            // The same request refused again — a harness retrying — is
+            // answered from what was already worked out, not by another read.
+            if let Some(divergence) = &replay.diverged {
+                if divergence.step == step && divergence.got_digest == got_digest {
+                    if let Some(difference) = &divergence.difference {
+                        return Some(difference.clone());
+                    }
+                }
+            }
             replay
                 .llm
                 .iter()
@@ -1502,7 +1512,6 @@ impl Registry {
                 .clone()
         };
         let difference = first_difference(store, &origin, request, provider).ok()??;
-        let got_digest = provider.request_digest(request).ok().flatten();
         let latest_erasure = store.erasures.latest_id().ok()?;
         let (mut replays, now_ns) = self.lock_at(call);
         let replay = self
