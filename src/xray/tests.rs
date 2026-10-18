@@ -1804,6 +1804,9 @@ fn threads_are_bounded_and_a_dropped_conversation_is_not_rebuilt_from_nothing() 
         context: chunk::context_pieces(Some(&json!([msg("user", text)])), &[], MAX_CONTEXT_CHUNKS),
         response: chunk::response_pieces(&json!([msg("assistant", "ok")]), MAX_CONTEXT_CHUNKS).list,
         unavailable: None,
+        definitions_unavailable: None,
+        response_unresolved: false,
+        unresolved: false,
     };
     let span_of =
         |conversation: &str| delta_llm("x", 1, conversation, true, Value::Null, Value::Null);
@@ -1852,4 +1855,637 @@ fn threads_are_bounded_and_a_dropped_conversation_is_not_rebuilt_from_nothing() 
     assert!(huge.running.is_empty() && huge.bytes == 0);
     let read = huge.fold(&span_of("big"), read_of("next"));
     assert_eq!(read.unavailable, Some(NOT_REBUILT));
+}
+
+/// `count` distinct user turns.
+fn turns(count: usize) -> Vec<Value> {
+    (0..count)
+        .map(|index| msg("user", &format!("turn {index}")))
+        .collect()
+}
+
+#[test]
+fn a_divergence_past_the_chunk_bound_is_not_called_stable() {
+    let fixture = TempStore::open("xray-cut-stable", crate::Config::default());
+    // Two calls identical in their first 2,000 chunks, differing after.
+    let before = turns(MAX_CONTEXT_CHUNKS + 5);
+    let mut after = before.clone();
+    after[MAX_CONTEXT_CHUNKS + 2] = msg("user", "a different turn past the bound");
+    after.push(msg("user", "the next question"));
+    fixture
+        .store()
+        .ingest_batch(vec![
+            llm("cut1", "l0", 100, Value::Array(before), json!([])),
+            llm("cut1", "l1", 200, Value::Array(after), json!([])),
+        ])
+        .expect("ingests");
+    let store = fixture.store();
+    let autopsy = store
+        .cache_autopsy(Some(""), "cut1", AutopsyOptions::default())
+        .expect("reads")
+        .expect("found");
+    let step = &autopsy.steps[1];
+    assert_eq!(step.previous_step_index, Some(0));
+    assert_ne!(step.cause, Cause::Stable, "{}", step.explanation);
+    assert_eq!(step.cause, Cause::Unknown, "{}", step.explanation);
+    assert_eq!(step.prefix_chunks_shared, MAX_CONTEXT_CHUNKS);
+    assert_eq!(step.est_tokens_lost, 0);
+    assert!(step.chunks_truncated);
+    assert!(autopsy.chunks_truncated, "the autopsy says it was cut");
+    assert!(!autopsy.truncated, "every call was read");
+    assert!(
+        step.explanation
+            .contains("both this context and step 0's had more than 2,000 chunks"),
+        "{}",
+        step.explanation
+    );
+    let xray = xray_of(store, Some(""), "tr-cut1", "l1", options(20));
+    assert!(xray.chunks_truncated);
+    assert!(xray.cache.chunks_truncated);
+    assert_eq!(
+        xray.cache.cause,
+        Cause::Unknown,
+        "{}",
+        xray.cache.explanation
+    );
+
+    // A predecessor read whole that a cut context starts with is still
+    // stable: nothing past the cut can change that.
+    drop(fixture);
+    let fixture = TempStore::open("xray-cut-prefix", crate::Config::default());
+    let before = turns(MAX_CONTEXT_CHUNKS - 10);
+    let after = turns(MAX_CONTEXT_CHUNKS + 10);
+    fixture
+        .store()
+        .ingest_batch(vec![
+            llm("cut3", "l0", 100, Value::Array(before), json!([])),
+            llm("cut3", "l1", 200, Value::Array(after), json!([])),
+        ])
+        .expect("ingests");
+    let autopsy = fixture
+        .store()
+        .cache_autopsy(Some(""), "cut3", AutopsyOptions::default())
+        .expect("reads")
+        .expect("found");
+    let step = &autopsy.steps[1];
+    assert_eq!(step.cause, Cause::Stable, "{}", step.explanation);
+    assert!(step.chunks_truncated && autopsy.chunks_truncated);
+    assert!(!autopsy.steps[0].chunks_truncated);
+}
+
+#[test]
+fn absence_past_the_chunk_bound_is_not_a_verified_loss() {
+    let fixture = TempStore::open("xray-cut-loss", crate::Config::default());
+    // Exactly as many chunks as are analysed: read whole.
+    let before = turns(MAX_CONTEXT_CHUNKS);
+    // One instruction put ahead of all of it: the last turn falls past the
+    // bound, though nothing was removed.
+    let mut after = vec![msg(
+        "user",
+        "A new instruction placed ahead of the whole history, far longer than any turn",
+    )];
+    after.extend(before.iter().cloned());
+    fixture
+        .store()
+        .ingest_batch(vec![
+            llm("cut2", "l0", 100, Value::Array(before), json!([])),
+            llm("cut2", "l1", 200, Value::Array(after), json!([])),
+        ])
+        .expect("ingests");
+    let xray = xray_of(fixture.store(), Some(""), "tr-cut2", "l1", options(20));
+    assert!(xray.chunks_truncated);
+    assert_eq!(xray.previous.as_ref().map(|p| p.step_index), Some(0));
+    assert!(
+        xray.dropped_since_previous
+            .iter()
+            .all(|dropped| dropped.unverified),
+        "{:?}",
+        xray.dropped_since_previous
+    );
+    let lost: Vec<Option<&str>> = xray
+        .dropped_since_previous
+        .iter()
+        .map(|dropped| dropped.preview.as_deref())
+        .collect();
+    assert_eq!(lost, [Some("turn 1999")], "listed, as not proven lost");
+    // What was found is still a fact: the insertion ahead of the history,
+    // which rests on finds here and absences from a predecessor read whole.
+    assert_eq!(xray.cache.cause, Cause::VolatileContent);
+    assert_eq!(
+        xray.cache.first_divergent_chunk.as_ref().map(|d| d.change),
+        Some(Change::Inserted)
+    );
+
+    // A chunk found edited past nothing but a cut is still an edit, not an
+    // unverified loss.
+    drop(fixture);
+    let fixture = TempStore::open("xray-cut-edit", crate::Config::default());
+    let rule = |version: &str| format!("Always answer in English. Policy version {version}.");
+    let mut before = vec![msg("system", &rule("1.0.3"))];
+    before.extend(turns(10));
+    let mut after = vec![msg("system", &rule("1.0.4"))];
+    after.extend(turns(MAX_CONTEXT_CHUNKS + 1));
+    fixture
+        .store()
+        .ingest_batch(vec![
+            llm("cut4", "l0", 100, Value::Array(before), json!([])),
+            llm("cut4", "l1", 200, Value::Array(after), json!([])),
+        ])
+        .expect("ingests");
+    let xray = xray_of(fixture.store(), Some(""), "tr-cut4", "l1", options(20));
+    assert!(xray.chunks_truncated);
+    assert!(xray.dropped_since_previous.is_empty());
+    assert_eq!(xray.edited_since_previous.len(), 1);
+    assert_eq!(xray.edited_since_previous[0].diff.after, "1.0.4");
+}
+
+#[test]
+fn absence_from_an_unread_request_is_not_a_verified_loss() {
+    let config = crate::Config {
+        payload_threshold: Some(64),
+        ..crate::Config::default()
+    };
+    let fixture = TempStore::open("xray-unread-loss", config);
+    // The earlier call's messages are inline; the later call's are offloaded
+    // and, with resolve=false, not read. Both name one conversation, so they
+    // pair whatever they share.
+    let earlier = delta_llm(
+        "u0",
+        100,
+        "main",
+        false,
+        json!([
+            msg("system", "Be brief."),
+            msg("user", "Never touch migrations")
+        ]),
+        json!([]),
+    );
+    let mut later = delta_llm("u1", 200, "main", false, json!(null), json!([]));
+    later.attributes.insert(
+        "gen_ai.input.messages".into(),
+        json!(json!([
+            msg("system", "Be brief."),
+            msg("user", "Never touch migrations"),
+            msg("user", &"a long question ".repeat(10))
+        ])
+        .to_string()),
+    );
+    fixture
+        .store()
+        .ingest_batch(vec![earlier, later])
+        .expect("ingests");
+    let xray = xray_of(
+        fixture.store(),
+        Some(""),
+        "tr-d1",
+        "u1",
+        XrayOptions {
+            resolve: false,
+            ..options(20)
+        },
+    );
+    assert_eq!(
+        xray.context_unavailable,
+        Some("was offloaded and resolve=false")
+    );
+    assert_eq!(xray.previous.as_ref().map(|p| p.step_index), Some(0));
+    assert_eq!(xray.dropped_since_previous.len(), 2);
+    assert!(
+        xray.dropped_since_previous
+            .iter()
+            .all(|dropped| dropped.unverified),
+        "{:?}",
+        xray.dropped_since_previous
+    );
+    assert_eq!(xray.cache.cause, Cause::Unknown);
+    // Read, the same call lost nothing.
+    let read = xray_of(fixture.store(), Some(""), "tr-d1", "u1", options(20));
+    assert_eq!(read.context_unavailable, None);
+    assert!(read.dropped_since_previous.is_empty());
+
+    // Partly read: the system instructions are inline and resolve, the
+    // offloaded messages do not fit the budget. The system prompt is found;
+    // the turns are not, and are not called lost.
+    drop(fixture);
+    let config = crate::Config {
+        payload_threshold: Some(64),
+        ..crate::Config::default()
+    };
+    let fixture = TempStore::open("xray-partly-read-loss", config);
+    let earlier = delta_llm(
+        "p0",
+        100,
+        "main",
+        false,
+        json!([
+            msg("system", "Be brief."),
+            msg("user", "Never touch migrations")
+        ]),
+        json!([]),
+    );
+    let mut later = delta_llm("p1", 200, "main", false, json!(null), json!([]));
+    later.attributes.insert(
+        "gen_ai.system_instructions".into(),
+        json!([{"type": "text", "content": "Be brief."}]),
+    );
+    later.attributes.insert(
+        "gen_ai.input.messages".into(),
+        json!(json!([
+            msg("user", "Never touch migrations"),
+            msg("user", &"a long question ".repeat(10))
+        ])
+        .to_string()),
+    );
+    fixture
+        .store()
+        .ingest_batch(vec![earlier, later])
+        .expect("ingests");
+    let store = fixture.store();
+    let target = store
+        .xray_target(Some(""), "tr-d1", "p1", None)
+        .expect("reads")
+        .expect("found");
+    let starved = Limits {
+        read_bytes: 1,
+        ..Limits::DEFAULT
+    };
+    let xray = store
+        .xray_in(target, None, options(20), starved)
+        .expect("reads")
+        .expect("found");
+    assert_eq!(
+        xray.context_unavailable,
+        Some("was offloaded and could not be resolved")
+    );
+    assert_eq!(
+        xray.chunks[0].preview, "Be brief.",
+        "the part that was read"
+    );
+    let lost: Vec<(&str, bool)> = xray
+        .dropped_since_previous
+        .iter()
+        .map(|dropped| (dropped.preview.as_deref().unwrap_or(""), dropped.unverified))
+        .collect();
+    assert_eq!(lost, [("Never touch migrations", true)]);
+}
+
+#[test]
+fn conversations_are_told_apart_by_their_whole_id() {
+    let fixture = TempStore::open("xray-long-ids", crate::Config::default());
+    // Two ids that share their first 300 characters.
+    let shared = "c".repeat(300);
+    let (first, second) = (format!("{shared}-first"), format!("{shared}-second"));
+    fixture
+        .store()
+        .ingest_batch(vec![
+            delta_llm(
+                "a0",
+                100,
+                &first,
+                true,
+                json!([msg("user", "Task for the first")]),
+                json!([msg("assistant", "The first's answer")]),
+            ),
+            delta_llm(
+                "b0",
+                200,
+                &second,
+                true,
+                json!([msg("user", "Task for the second")]),
+                json!([msg("assistant", "The second's answer")]),
+            ),
+        ])
+        .expect("ingests");
+    let xray = xray_of(fixture.store(), Some(""), "tr-d1", "b0", options(20));
+    let texts: Vec<&str> = xray
+        .chunks
+        .iter()
+        .map(|chunk| chunk.preview.as_str())
+        .collect();
+    assert_eq!(texts, ["Task for the second"]);
+    assert!(xray.previous.is_none(), "{:?}", xray.previous);
+}
+
+#[test]
+fn a_delta_call_whose_conversation_cannot_be_read_is_partial() {
+    let config = crate::Config {
+        payload_threshold: Some(64),
+        ..crate::Config::default()
+    };
+    let fixture = TempStore::open("xray-unread-id", config);
+    // An id long enough to be offloaded: it cannot name the conversation.
+    let id = "conversation-".repeat(8);
+    let mut nameless = delta_llm(
+        "n1",
+        300,
+        "unused",
+        true,
+        json!([msg("user", "And then?")]),
+        json!([]),
+    );
+    nameless.attributes.remove(CONVERSATION_ATTRIBUTE);
+    fixture
+        .store()
+        .ingest_batch(vec![
+            delta_llm(
+                "o0",
+                100,
+                &id,
+                true,
+                json!([msg("user", "Fix the parser")]),
+                json!([msg("assistant", "Fixed.")]),
+            ),
+            delta_llm(
+                "o1",
+                200,
+                &id,
+                true,
+                json!([msg("user", "Now the lexer")]),
+                json!([]),
+            ),
+            nameless,
+        ])
+        .expect("ingests");
+    let store = fixture.store();
+    let stored = store.get_trace("tr-d1").expect("reads");
+    assert!(stored[0].attributes[CONVERSATION_ATTRIBUTE]["$payload"].is_string());
+    // Only what each call added was recorded, and the conversation it adds
+    // to cannot be found: its context is partial, not whole.
+    for span in ["o1", "n1"] {
+        let xray = xray_of(store, Some(""), "tr-d1", span, options(20));
+        assert!(xray.context_unavailable.is_some(), "{span}");
+        assert_eq!(xray.cache.cause, Cause::Unknown, "{span}");
+    }
+}
+
+#[test]
+fn an_unresolved_answer_leaves_the_delta_after_it_partial() {
+    let config = crate::Config {
+        payload_threshold: Some(64),
+        ..crate::Config::default()
+    };
+    let fixture = TempStore::open("xray-unresolved-answer", config);
+    let mut first = delta_llm(
+        "m0",
+        100,
+        "main",
+        true,
+        json!([msg("user", "Fix the parser")]),
+        json!(null),
+    );
+    // The answer is offloaded.
+    first.attributes.insert(
+        "gen_ai.output.messages".into(),
+        json!(json!([msg("assistant", &"a long answer ".repeat(10))]).to_string()),
+    );
+    let mut second = delta_llm(
+        "m1",
+        200,
+        "main",
+        true,
+        json!([msg("user", "Now the lexer")]),
+        json!([]),
+    );
+    second
+        .attributes
+        .insert("gen_ai.usage.input_tokens".into(), json!(50));
+    fixture
+        .store()
+        .ingest_batch(vec![first, second])
+        .expect("ingests");
+    let store = fixture.store();
+    // No room for any payload: the answer stays a reference.
+    let starved = Limits {
+        read_bytes: 1,
+        ..Limits::DEFAULT
+    };
+    let tape = store
+        .run_tape(Some(""), "d1", MAX_TAPE_SPANS, MAX_TAPE_SPANS, None)
+        .expect("reads");
+    let autopsy = store
+        .autopsy_in(
+            Some(""),
+            "d1",
+            &tape,
+            None,
+            AutopsyOptions::default(),
+            starved,
+        )
+        .expect("reads")
+        .expect("found");
+    let step = &autopsy.steps[1];
+    assert_eq!(step.cause, Cause::Unknown, "{}", step.explanation);
+    assert_eq!(step.calibration, None);
+    let target = store
+        .xray_target(Some(""), "tr-d1", "m1", None)
+        .expect("reads")
+        .expect("found");
+    let xray = store
+        .xray_in(target, None, options(20), starved)
+        .expect("reads")
+        .expect("found");
+    assert_eq!(
+        xray.context_unavailable,
+        Some(EARLIER_ANSWER_UNREADABLE),
+        "{:?}",
+        xray.chunks
+    );
+    assert_eq!(xray.cache.cause, Cause::Unknown);
+    assert_eq!(xray.cache.calibration, None);
+    // The call after it inherits the gap: its context carries the same
+    // placeholder.
+    let mut threads = Threads::default();
+    let read = |unresolved: bool| Read {
+        context: chunk::context_pieces(Some(&json!([msg("user", "q")])), &[], MAX_CONTEXT_CHUNKS),
+        response: Vec::new(),
+        unavailable: None,
+        definitions_unavailable: None,
+        response_unresolved: unresolved,
+        unresolved,
+    };
+    let span = delta_llm("x", 1, "main", true, Value::Null, Value::Null);
+    threads.fold(&span, read(true));
+    let second = threads.fold(&span, read(false));
+    assert_eq!(second.unavailable, Some(EARLIER_ANSWER_UNREADABLE));
+    let third = threads.fold(&span, read(false));
+    assert_eq!(third.unavailable, Some(EARLIER_UNREADABLE));
+
+    // With room to resolve the answer, the same call is read whole.
+    let autopsy = store
+        .cache_autopsy(Some(""), "d1", AutopsyOptions::default())
+        .expect("reads")
+        .expect("found");
+    assert_eq!(autopsy.steps[1].cause, Cause::Stable);
+    let xray = xray_of(store, Some(""), "tr-d1", "m1", options(20));
+    assert_eq!(xray.context_unavailable, None);
+    assert_eq!(xray.chunks.len(), 3);
+}
+
+#[test]
+fn unresolved_tool_definitions_neither_calibrate_nor_compare() {
+    let config = crate::Config {
+        payload_threshold: Some(64),
+        ..crate::Config::default()
+    };
+    let fixture = TempStore::open("xray-unresolved-definitions", config);
+    let definitions = json!([{"name": "read_file", "description": "Reads a file from disk",
+                              "parameters": {"type": "object"}}])
+    .to_string();
+    let history = [
+        msg("user", "Read the parser"),
+        call("c1", "read_file", json!({"path": "parser.rs"})),
+        result("c1", READ),
+    ];
+    let calls: Vec<Span> = [("l0", 100, 2), ("l1", 200, 3)]
+        .into_iter()
+        .map(|(id, start, upto)| {
+            let input = history[..upto].to_vec();
+            let mut span = llm("defs", id, start, Value::Array(input), json!([]));
+            span.attributes
+                .insert("gen_ai.tool.definitions".into(), json!(definitions));
+            span.attributes
+                .insert("gen_ai.usage.input_tokens".into(), json!(400));
+            span
+        })
+        .collect();
+    fixture.store().ingest_batch(calls).expect("ingests");
+    let store = fixture.store();
+    let stored = store.get_trace("tr-defs").expect("reads");
+    assert!(
+        stored[0].attributes["gen_ai.tool.definitions"]["$payload"].is_string(),
+        "the definitions were offloaded"
+    );
+    let starved = Limits {
+        read_bytes: 1,
+        ..Limits::DEFAULT
+    };
+    let tape = store
+        .run_tape(Some(""), "defs", MAX_TAPE_SPANS, MAX_TAPE_SPANS, None)
+        .expect("reads");
+    let autopsy = store
+        .autopsy_in(
+            Some(""),
+            "defs",
+            &tape,
+            None,
+            AutopsyOptions::default(),
+            starved,
+        )
+        .expect("reads")
+        .expect("found");
+    let step = &autopsy.steps[1];
+    assert_eq!(step.calibration, None, "{}", step.explanation);
+    assert_eq!(step.cause, Cause::Unknown, "{}", step.explanation);
+    assert!(
+        step.explanation
+            .contains("carried tool definitions that were offloaded"),
+        "{}",
+        step.explanation
+    );
+    let target = store
+        .xray_target(Some(""), "tr-defs", "l1", None)
+        .expect("reads")
+        .expect("found");
+    let xray = store
+        .xray_in(target, None, options(20), starved)
+        .expect("reads")
+        .expect("found");
+    assert_eq!(
+        xray.context_unavailable,
+        Some(definitions_unread(true)),
+        "{:?}",
+        xray.chunks
+    );
+
+    // Resolved, the definitions are read and the estimate calibrates.
+    let autopsy = store
+        .cache_autopsy(Some(""), "defs", AutopsyOptions::default())
+        .expect("reads")
+        .expect("found");
+    let step = &autopsy.steps[1];
+    assert_eq!(step.cause, Cause::Stable, "{}", step.explanation);
+    assert!(step.calibration.is_some());
+}
+
+#[test]
+fn an_unread_answer_is_not_taken_for_silence() {
+    let config = crate::Config {
+        payload_threshold: Some(64),
+        ..crate::Config::default()
+    };
+    let fixture = TempStore::open("xray-unread-said", config);
+    let read_call = call("c1", "read_file", json!({"path": "parser.rs"}));
+    let mut quoting = llm(
+        "said",
+        "l2",
+        300,
+        json!([msg("user", TASK), read_call.clone(), result("c1", READ)]),
+        json!(null),
+    );
+    // The answer that draws on the result is offloaded, and its quote lies
+    // past the reference's preview.
+    let answer = format!("{} zeta_marker_one is the culprit", "Looking. ".repeat(40));
+    quoting.attributes.insert(
+        "gen_ai.output.messages".into(),
+        json!(json!([msg("assistant", &answer)]).to_string()),
+    );
+    fixture
+        .store()
+        .ingest_batch(vec![
+            llm(
+                "said",
+                "l0",
+                100,
+                json!([msg("user", TASK)]),
+                json!([read_call.clone()]),
+            ),
+            tool(
+                "said",
+                "t1",
+                200,
+                "read_file",
+                "c1",
+                json!({"path": "parser.rs"}),
+                READ,
+            ),
+            quoting,
+            llm(
+                "said",
+                "l3",
+                400,
+                json!([
+                    msg("user", TASK),
+                    read_call,
+                    result("c1", READ),
+                    msg("user", "and now?")
+                ]),
+                json!([msg("assistant", "Done.")]),
+            ),
+        ])
+        .expect("ingests");
+    let store = fixture.store();
+    let starved = Limits {
+        read_bytes: 1,
+        ..Limits::DEFAULT
+    };
+    let target = store
+        .xray_target(Some(""), "tr-said", "l3", None)
+        .expect("reads")
+        .expect("found");
+    let xray = store
+        .xray_in(target, None, options(1), starved)
+        .expect("reads")
+        .expect("found");
+    let result = xray
+        .chunks
+        .iter()
+        .find(|chunk| chunk.kind == ChunkKind::ToolResult)
+        .expect("the result");
+    assert_eq!(result.age_steps, Some(2));
+    assert!(!result.stale, "an answer nobody could read may quote it");
+    assert!(xray.provenance_partial);
+    // Read, the answer quotes it: not stale either way, and complete.
+    let xray = xray_of(store, Some(""), "tr-said", "l3", options(1));
+    assert!(!xray.provenance_partial);
+    assert!(xray.chunks.iter().all(|chunk| !chunk.stale));
 }
