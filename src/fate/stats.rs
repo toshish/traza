@@ -17,7 +17,7 @@
 //!   "how undecided is the agent here" measure a hotspot is flagged on.
 
 /// The two-sided 95% normal quantile, Φ⁻¹(0.975).
-pub(crate) const Z95: f64 = 1.644_853_626_951_472;
+pub(crate) const Z95: f64 = 1.959_963_984_540_054;
 
 /// The Wilson score interval for `successes` of `trials` at 95%, as
 /// `(low, high)`. `(0, 1)` for no trials: nothing is known.
@@ -165,6 +165,33 @@ mod tests {
         assert_eq!(wilson(0, 0), (0.0, 1.0));
         let (l, h) = wilson(5, 5);
         assert!(h <= 1.0 && l > 0.5);
+    }
+
+    /// Φ, the standard normal CDF, by its Taylor series about zero:
+    /// `Φ(x) = ½ + φ(x)·Σ x^(2n+1) / (1·3·5···(2n+1))`, every term positive,
+    /// so summing to convergence is exact to a few ulps for moderate `x`.
+    fn normal_cdf(x: f64) -> f64 {
+        let density = (-x * x / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        let (mut term, mut sum, mut odd) = (x, x, 1.0);
+        while term.abs() > 1e-18 * sum.abs() {
+            odd += 2.0;
+            term *= x * x / odd;
+            sum += term;
+        }
+        0.5 + density * sum
+    }
+
+    #[test]
+    fn the_quantile_is_the_two_sided_ninety_five_percent_one() {
+        // Every interval this module labels "95%" stands on this constant:
+        // Φ(Z95) must be 0.975, not 0.95 (which 1.645 would give).
+        assert!((normal_cdf(0.0) - 0.5).abs() < 1e-15);
+        assert!((normal_cdf(1.0) - 0.841_344_746_068_543).abs() < 1e-13);
+        assert!(
+            (normal_cdf(Z95) - 0.975).abs() < 1e-12,
+            "Φ({Z95}) = {}",
+            normal_cdf(Z95)
+        );
     }
 
     #[test]
