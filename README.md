@@ -273,7 +273,7 @@ That is the whole setup. Data lands in `./data`, the dashboard is on <http://loc
 | `--restore DIR` | | Install a backup into `--data-dir`, then serve it. |
 | `TRAZA_TOKENS` | unset | Bearer auth: `rw:` and `ro:` scoped, plus `admin:` for erasure, backups and `/v1/admin/*`. Bind a credential to one tenant with `rw@acme:token`. Credentials can also be minted and revoked at runtime. |
 
-`--help` prints all fifty-five. The [configuration reference](docs/configuration.md) explains what each one costs.
+`--help` prints all fifty-six. The [configuration reference](docs/configuration.md) explains what each one costs.
 
 ### Examples
 
