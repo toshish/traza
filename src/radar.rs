@@ -16,7 +16,8 @@
 //! read (nothing is stored): the system prompt, the tool catalog, the
 //! requested and returned models, the sampling parameters, the service
 //! version and the telemetry SDK version (the `fingerprint` submodule names
-//! every key).
+//! every key). Values are compared by a 64-bit digest; their text is kept
+//! only to be shown, in bounded tables.
 //! A run carrying several values of one dimension — a planner model and an
 //! executor model — has the SET of them as its value.
 //!
@@ -30,31 +31,49 @@
 //! Per dimension, the cohort's runs are walked in start order through a
 //! sliding window of `clamp(n/8, 8, 50)` runs. A value becomes **dominant**
 //! when it holds at least half the window and leads the incumbent by
-//! `max(2, window/10)` runs; the change point is placed at the first run of
-//! the split that best separates incumbent from newcomer inside that window
-//! — for a clean deploy, exactly the first run on the new value. A value
-//! that never becomes dominant (a 5% canary, an A/B arm, a one-off) is not a
-//! change point; a newcomer that loses dominance again within one window is
-//! an excursion and its change point is withdrawn. A fresh value that has
-//! held every run since it appeared, at the very end of the sequence, is a
-//! change point from its third run on — a deploy too recent to fill half a
-//! window, and usually `insufficient_data`. A dimension where more
-//! than half the runs carry a value no other run shares is **volatile** —
-//! typically a prompt embedding something per-request that masking did not
-//! catch — and is reported as such instead of being searched.
+//! `max(2, window/10)` runs; that proposes a change point, placed at the
+//! first run of the split that best separates incumbent from newcomer inside
+//! that window — for a clean deploy, exactly the first run on the new value.
+//! A newcomer that loses dominance again within one window is an excursion
+//! and its proposal is withdrawn.
+//!
+//! A proposal is a change point only once **confirmed** on runs that took no
+//! part in proposing it, because a value drawn at random per run — an A/B
+//! split, a router's two models, a branch that sometimes calls a guardrail —
+//! wins a window by chance all the time. In the window of runs after the
+//! newcomer became dominant, the incumbent must be rare (at most a fifth of
+//! them) and the newcomer must hold the majority; and before the onset the
+//! newcomer must have been rare or the incumbent established (at least
+//! three fifths), over at least half a window. A proposal too recent to have
+//! that window after it is confirmed only if the newcomer was rare before
+//! and has held the majority since, with the incumbent rare. A fresh value
+//! that has held every run since it appeared, at the very end of the
+//! sequence, and was rare before, is a change point from its third run on —
+//! a deploy too recent to fill half a window, and usually
+//! `insufficient_data`.
+//!
+//! A dimension where more than half the runs carry a value no other run
+//! shares — typically a prompt embedding something per-request that masking
+//! did not catch — or that has more than [`MAX_CHANGES_PER_DIMENSION`]
+//! change points is **volatile**, and is reported as such instead of being
+//! searched.
 //!
 //! **Behaviour** changes are the ones no configuration explains: the
 //! distribution of the cohort's top-level paths (each run's first
 //! [`BEHAVIOR_PATH_DEPTH`] step tokens, consecutive repeats bucketed `x`,
 //! `x×2`, `x×3-5`, `x×6+` as the Fate Map buckets them) is compared between
-//! adjacent windows by Jensen–Shannon distance. A peak at or above the
-//! threshold (default [`DEFAULT_BEHAVIOR_THRESHOLD`]) that a deterministic
-//! permutation test calls significant (p < [`BEHAVIOR_ALPHA`]), with no
-//! configuration change within a window of it, is reported as dimension
-//! `behavior` — the provider changed under you. Every configuration change
-//! also carries the same distance between its two sides (`behavior_shift`),
-//! so "the prompt changed AND the agent now takes different paths" is
-//! visible.
+//! adjacent windows by Jensen–Shannon distance — by sample splitting: the
+//! even-indexed runs choose candidate splits (distance peaks at or above the
+//! threshold, default [`DEFAULT_BEHAVIOR_THRESHOLD`], none within a window of
+//! a configuration change), and the odd-indexed runs test them: their own
+//! distance must reach the threshold, and a deterministic permutation test
+//! must call it significant after Bonferroni's correction for the candidates
+//! tested (p < [`BEHAVIOR_ALPHA`]). That holds the chance of reporting any
+//! behaviour change in a cohort whose paths never changed at 1%. Such a
+//! change is reported as dimension `behavior` — the provider changed under
+//! you. Every reported configuration change also carries the distance
+//! between its two sides (`behavior_shift`), so "the prompt changed AND the
+//! agent now takes different paths" is visible.
 //!
 //! # Deltas and verdicts
 //!
@@ -62,19 +81,21 @@
 //! runs on its new value just after it, each side bounded by the
 //! neighbouring change points (co-changes within [`CO_CHANGE_RUNS`] runs
 //! excepted) and by [`MAX_SIDE_RUNS`]. Runs still active (last span within
-//! the session idle window) are left out: their cost and steps are partial.
-//! Rates (error rate: runs with at least one error span; success rate: runs
-//! that ended success, of those that ended at all) use the pooled
-//! two-proportion z-test; cost, steps and duration use Welch's t-test on the
-//! logarithm (cost over priced runs only; steps and duration as `ln(1+x)`),
-//! so one runaway run does not decide a verdict. Holm's correction holds the
-//! family-wise error rate across a change's five tests at 5%. The verdict is
-//! `regression` when a quality metric (error or success rate) got
-//! significantly worse — or, with quality unchanged, an efficiency metric
-//! did — `improvement` symmetrically, `neutral` when nothing is significant,
-//! and `insufficient_data` with fewer than [`MIN_RUNS_PER_SIDE`] runs on a
-//! side. Changes are ranked regressions first, by effect size (Cohen's h for
-//! rates, d for log-scale means).
+//! the session idle window of the earlier of now and `until`) are left out:
+//! their cost and steps may be partial. Rates (error rate: runs with at least
+//! one error span; success rate: runs that ended success, of those that
+//! ended at all) use the pooled two-proportion z-test; cost, steps and
+//! duration use Welch's t-test on the logarithm (cost over priced runs only;
+//! steps and duration as `ln(1+x)`), so one runaway run does not decide a
+//! verdict. Holm's correction holds the family-wise error rate across a
+//! change's five tests at 5%. The verdict is `regression` when a quality
+//! metric (error or success rate) got significantly worse — or, with quality
+//! unchanged, an efficiency metric did — `improvement` symmetrically,
+//! `neutral` when nothing is significant, and `insufficient_data` with fewer
+//! than [`MIN_RUNS_PER_SIDE`] runs on a side; `decided_by` says which kind of
+//! metric decided. Changes are ranked by verdict (regressions first), then
+//! quality-decided before efficiency-decided, then by effect size (Cohen's h
+//! for rates, Cohen's d — capped at 4 — for log-scale means), then newest.
 //!
 //! # What this is not
 //!
@@ -86,18 +107,22 @@
 //!
 //! # Bounds
 //!
-//! One read of the window under the query deadline. Only agent runs (at
-//! least one llm, tool or agent step) are analysed. At most [`max_runs`]
-//! runs (the newest agent runs; the window then starts later and says so),
-//! [`MAX_RUN_STEPS`] earliest steps per run, [`MAX_RUN_VALUES`] values per
-//! dimension per run, [`MAX_VALUES_PER_DIMENSION`] distinct values per
-//! dimension, [`MAX_AGENTS`] cohorts and [`MAX_CHANGES_PER_AGENT`] changes
-//! each. Tenant-scoped like every read: a bound caller folds its own tenant's
-//! spans and nothing else.
+//! Two passes over one snapshot of the window, and the analysis, under one
+//! query deadline. Only agent runs (at least one llm, tool or agent step)
+//! are analysed: at most [`max_runs`] of them, the newest by first step (the
+//! window then starts later and says so), each holding at most
+//! [`MAX_RUN_STEPS`] earliest steps, [`MAX_RUN_VALUES`] values per dimension
+//! and clipped strings. Display names are kept for at most
+//! [`MAX_VALUES_PER_DIMENSION`] values per dimension, [`MAX_VALUES_PER_OWNER`]
+//! of them per service, with [`MAX_SAMPLE_BYTES`] of diff samples; at most
+//! [`MAX_AGENTS`] cohorts are reported, with [`MAX_CHANGES_PER_AGENT`]
+//! changes each. Tenant-scoped like every read: a bound caller folds its own
+//! tenant's spans and nothing else, and every table is keyed by tenant.
 
 mod fingerprint;
 mod stats;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
@@ -108,7 +133,7 @@ use serde_json::{json, Map, Value};
 
 use crate::attribution::{self, Outcome};
 use crate::semconv::{self, StepKind};
-use crate::{Deadline, Error, Result, Span, SpanFilter, Store};
+use crate::{Deadline, Error, QueryCost, Result, Span, SpanFilter, Store};
 
 use fingerprint::{Fingerprint, Sample};
 
@@ -150,11 +175,27 @@ pub const BEHAVIOR_PATH_DEPTH: usize = 4;
 /// a sixth of runs moving to a new path.
 pub const DEFAULT_BEHAVIOR_THRESHOLD: f64 = 0.3;
 
-/// The permutation-test p-value a behaviour change candidate must beat.
+/// The chance, per cohort, of reporting a behaviour change in paths that
+/// never changed: the level each candidate's Bonferroni-corrected
+/// permutation p-value must beat.
 pub const BEHAVIOR_ALPHA: f64 = 0.01;
 
-/// Relabellings in a permutation test: resolution 1/200.
-pub const BEHAVIOR_PERMUTATIONS: usize = 199;
+/// Relabellings in a behaviour candidate's permutation test: resolution
+/// 1/2000, fine enough for [`BEHAVIOR_ALPHA`] corrected for
+/// [`MAX_BEHAVIOR_CANDIDATES`] candidates.
+pub const BEHAVIOR_PERMUTATIONS: usize = 1_999;
+
+/// Relabellings in the path-shift test across a configuration change
+/// (`behavior_shift`): resolution 1/200.
+pub const SHIFT_PERMUTATIONS: usize = 199;
+
+/// Behaviour candidates tested per cohort at most, strongest first.
+pub const MAX_BEHAVIOR_CANDIDATES: usize = 16;
+
+/// Change points one dimension of one cohort may have before it is
+/// reported as volatile instead: a value that changes this often is not a
+/// history of deploys.
+pub const MAX_CHANGES_PER_DIMENSION: usize = 100;
 
 /// Family-wise error rate of one change's metric tests (Holm).
 pub const VERDICT_ALPHA: f64 = 0.05;
@@ -166,14 +207,36 @@ pub const MAX_RUN_STEPS: usize = 32;
 /// shown with a trailing ` + …`.
 pub const MAX_RUN_VALUES: usize = 4;
 
-/// Distinct values per dimension per analysis; further values read as
-/// `(other)`.
+/// Distinct values per dimension one analysis keeps a display name (and a
+/// diff sample) for; a value past it is shown by its digest. Values are
+/// compared by digest, so this bounds what is shown, never what is found.
 pub const MAX_VALUES_PER_DIMENSION: usize = 2_048;
 
-const MAX_TOKENS: usize = 8_192;
+/// Of [`MAX_VALUES_PER_DIMENSION`], the names one tenant's service may take,
+/// so one agent with a per-request value cannot leave every other unnamed.
+pub const MAX_VALUES_PER_OWNER: usize = 256;
+
+/// Bytes of diff samples (prompt texts, catalog tool names, parameters)
+/// kept per dimension per analysis.
+pub const MAX_SAMPLE_BYTES: usize = 1 << 20;
+
+/// Step-token and tool names kept per analysis, and of those per service.
+const MAX_TOKEN_NAMES: usize = 8_192;
+const MAX_TOKEN_NAMES_PER_OWNER: usize = 1_024;
+/// Bytes of a trace or span id a run keeps for ordering.
+const MAX_ID_BYTES: usize = 128;
+/// Bytes of a run id kept as is; a longer one is kept as a prefix and a
+/// digest of the whole.
+const MAX_RUN_ID_BYTES: usize = 256;
+/// Bytes of a service, agent, step, tool or environment name kept.
+const MAX_NAME_BYTES: usize = 256;
+/// Bytes of a declared outcome kept: every word the outcome rule knows is
+/// shorter.
+const MAX_OUTCOME_BYTES: usize = 32;
 const MAX_TOOLS_PER_RUN: usize = 64;
 const MAX_ENVIRONMENTS_PER_RUN: usize = 4;
-const MAX_EVICTED_RUNS: usize = 1_000_000;
+/// llm steps extracted between the read's own deadline checks.
+const EXTRACTION_CHECK_INTERVAL: usize = 64;
 const TOOL_MIX_ROWS: usize = 8;
 const PATH_ROWS: usize = 5;
 const EXAMPLE_RUNS: usize = 3;
@@ -182,15 +245,26 @@ const DIFF_CHARS: usize = 80;
 const SHIFT_SIDE_RUNS: usize = 200;
 const MIN_BEHAVIOR_WINDOW: usize = 15;
 const MAX_BEHAVIOR_WINDOW: usize = 100;
-/// Behaviour candidates (distance peaks over the threshold) tested per
-/// cohort, strongest first.
-const MAX_BEHAVIOR_CANDIDATES: usize = 16;
 const MIN_DETECTION_WINDOW: usize = 8;
 const MAX_DETECTION_WINDOW: usize = 50;
+/// Confirming a change point: the share at or below which a value is rare
+/// (the incumbent after, the newcomer before) ...
+const CONFIRM_RARE_SHARE: f64 = 0.2;
+/// ... the share at or above which the incumbent was established before ...
+const CONFIRM_ESTABLISHED_SHARE: f64 = 0.6;
+/// ... the share the newcomer must hold after ...
+const CONFIRM_MAJORITY_SHARE: f64 = 0.5;
+/// ... or, in a window of at least [`CONFIRM_DROP_WINDOW`] runs, how far the
+/// incumbent's share must fall across the change when it was neither
+/// established nor the newcomer rare before (a mixed stage ending).
+const CONFIRM_DROP: f64 = 0.3;
+const CONFIRM_DROP_WINDOW: usize = 24;
 /// A dimension is volatile when this share of its runs carry a value no
 /// other run shares (and it has at least [`VOLATILE_MIN_RUNS`] runs).
 const VOLATILE_UNIQUE_SHARE: f64 = 0.5;
 const VOLATILE_MIN_RUNS: usize = 20;
+/// A behaviour change's `from`/`to` combo placeholder (paths are rendered
+/// from the sides instead).
 const OTHER: u32 = u32::MAX;
 
 static CONFIGURED_MAX_RUNS: OnceLock<usize> = OnceLock::new();
@@ -310,6 +384,16 @@ impl Verdict {
             Self::InsufficientData => "insufficient_data",
         }
     }
+}
+
+/// Which kind of metric decided a verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Basis {
+    /// Error rate or success rate: what the agent achieved.
+    Quality,
+    /// Cost, steps or duration: what achieving it cost.
+    Efficiency,
 }
 
 /// One change analysis's question.
@@ -489,7 +573,14 @@ pub struct Change {
     pub deltas: Deltas,
     /// What that adds up to.
     pub verdict: Verdict,
-    /// The effect size that decided the verdict (absolute; 0 when neutral).
+    /// Which kind of metric decided a `regression` or `improvement`: a
+    /// quality one (error or success rate) or, with quality unchanged, an
+    /// efficiency one. Absent for `neutral` and `insufficient_data`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<Basis>,
+    /// The effect size that decided the verdict (absolute; 0 when neutral):
+    /// Cohen's h for a rate, Cohen's d (capped at 4) for a log-scale mean.
+    /// Only comparable between changes the same [`Basis`] decided.
     pub effect_size: f64,
     /// One sentence a reader can check against the deltas.
     pub explanation: String,
@@ -532,6 +623,11 @@ pub struct AgentChanges {
     pub changes: Vec<Change>,
     /// Whether changes past [`MAX_CHANGES_PER_AGENT`] were cut.
     pub truncated: bool,
+    /// Whether a value, tool or path step of this agent is shown as `#` and
+    /// a 16-hex digest because its name did not fit the bounded name tables
+    /// ([`MAX_VALUES_PER_DIMENSION`], [`MAX_VALUES_PER_OWNER`]). Detection
+    /// compares digests, so nothing was missed; only the name is.
+    pub unnamed: bool,
 }
 
 /// A change analysis.
@@ -541,9 +637,9 @@ pub struct ChangeReport {
     pub since_ns: u64,
     /// Window end, Unix ns.
     pub until_ns: u64,
-    /// When the run cap applied: the start of the runs actually analysed
-    /// (every run starting after it is included in full; earlier ones are
-    /// not).
+    /// When the run cap applied: every agent run whose first step starts at
+    /// or after this instant is analysed in full, and no run whose first
+    /// step started before it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub covered_since_ns: Option<u64>,
     /// Spans read.
@@ -557,34 +653,31 @@ pub struct ChangeReport {
     /// not found among the window's analysed runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<RunContext>,
-    /// Whether any bound cut the answer: the run cap, the cohort cap.
+    /// Whether any bound cut the answer: the run cap, the cohort cap, or a
+    /// name table (an agent's `unnamed`).
     pub truncated: bool,
 }
 
 // --------------------------------------------------------------- accumulate
 
-/// A string interner with a cap: past it every new string is [`OTHER`].
+/// A string interner. The analysis uses it for top-level paths, of which
+/// there are at most as many as runs held.
 struct Interner {
     ids: HashMap<String, u32>,
     names: Vec<String>,
-    cap: usize,
 }
 
 impl Interner {
-    fn new(cap: usize) -> Self {
+    fn new() -> Self {
         Self {
             ids: HashMap::new(),
             names: Vec::new(),
-            cap,
         }
     }
 
     fn intern(&mut self, text: &str) -> u32 {
         if let Some(&id) = self.ids.get(text) {
             return id;
-        }
-        if self.names.len() >= self.cap {
-            return OTHER;
         }
         let id = self.names.len() as u32;
         self.names.push(text.to_owned());
@@ -593,78 +686,157 @@ impl Interner {
     }
 
     fn name(&self, id: u32) -> &str {
-        self.names
-            .get(id as usize)
-            .map_or("(other)", String::as_str)
+        self.names.get(id as usize).map_or("", String::as_str)
     }
 }
 
-/// One dimension's distinct values: identity, display and sample.
-struct ValueTable {
-    keys: Interner,
-    displays: Vec<String>,
-    samples: Vec<Option<Sample>>,
+/// `text` cut to at most `max` bytes, at a character boundary.
+fn clipped(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
-impl ValueTable {
-    fn new() -> Self {
+/// A run's id as the analysis holds it: the id itself, or — past
+/// [`MAX_RUN_ID_BYTES`] — its first bytes and a digest of the whole, so a
+/// planted megabyte session id costs no more to hold than a short one, and
+/// two long ids sharing a prefix stay two runs.
+fn run_key(run: String) -> String {
+    if run.len() <= MAX_RUN_ID_BYTES {
+        return run;
+    }
+    format!(
+        "{}…#{}",
+        clipped(&run, MAX_RUN_ID_BYTES - 20),
+        fingerprint::digest16(run.as_bytes())
+    )
+}
+
+/// A value's 64-bit identity, fixed by its definition (FNV-1a) so it is the
+/// same on every machine. Runs carry these digests, never the values' text:
+/// change detection compares identities only, so no table can overflow it.
+/// Every structure keyed by a digest is keyed by the tenant too, so a value
+/// one tenant crafted to collide with another's can only confuse its own
+/// answer.
+fn digest(text: &str) -> u64 {
+    stable_hash(&[text])
+}
+
+/// The bytes a sample holds.
+fn sample_bytes(sample: &Sample) -> usize {
+    match sample {
+        Sample::Text(text) => text.len(),
+        Sample::Names(names) => names.iter().map(String::len).sum(),
+        Sample::Params(params) => params
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum(),
+    }
+}
+
+/// The display names (and diff samples) of digests, bounded three ways: at
+/// most `cap` names, at most `quota` from one owner (one tenant's service),
+/// so that an agent with a per-request value cannot take the table from
+/// every other, and at most [`MAX_SAMPLE_BYTES`] of samples. A digest
+/// refused a name keeps its identity, is shown as `#` and its 16 hex digits,
+/// and the agent it is shown for says so (`unnamed`).
+struct NameTable {
+    names: HashMap<(u32, u64), String>,
+    samples: HashMap<(u32, u64), Sample>,
+    owners: HashMap<(u32, u64), usize>,
+    cap: usize,
+    quota: usize,
+    sample_bytes: usize,
+}
+
+impl NameTable {
+    fn new(cap: usize, quota: usize) -> Self {
         Self {
-            keys: Interner::new(MAX_VALUES_PER_DIMENSION),
-            displays: Vec::new(),
-            samples: Vec::new(),
+            names: HashMap::new(),
+            samples: HashMap::new(),
+            owners: HashMap::new(),
+            cap,
+            quota,
+            sample_bytes: 0,
         }
     }
 
-    fn intern(&mut self, fingerprint: Fingerprint) -> u32 {
-        let id = self.keys.intern(&fingerprint.key);
-        if id as usize == self.displays.len() {
-            self.displays.push(fingerprint.display);
-            self.samples.push(fingerprint.sample);
+    /// Names `value` in `tenant` (with its sample), unless it has a name
+    /// already or there is no room for one more from `owner`.
+    fn record(&mut self, tenant: u32, value: u64, owner: u64, name: &str, sample: Option<Sample>) {
+        let key = (tenant, value);
+        if self.names.contains_key(&key) || self.names.len() >= self.cap {
+            return;
         }
-        id
+        let held = self.owners.entry((tenant, owner)).or_insert(0);
+        if *held >= self.quota {
+            return;
+        }
+        *held += 1;
+        self.names.insert(key, name.to_owned());
+        if let Some(sample) = sample {
+            let bytes = sample_bytes(&sample);
+            if self.sample_bytes + bytes <= MAX_SAMPLE_BYTES {
+                self.sample_bytes += bytes;
+                self.samples.insert(key, sample);
+            }
+        }
     }
 
-    fn display(&self, id: u32) -> &str {
-        self.displays
-            .get(id as usize)
-            .map_or("(other)", String::as_str)
+    fn name(&self, tenant: u32, value: u64) -> Option<&str> {
+        self.names.get(&(tenant, value)).map(String::as_str)
     }
 
-    fn sample(&self, id: u32) -> Option<&Sample> {
-        self.samples.get(id as usize).and_then(Option::as_ref)
+    fn sample(&self, tenant: u32, value: u64) -> Option<&Sample> {
+        self.samples.get(&(tenant, value))
     }
+}
+
+/// How a digest without a name is shown.
+fn unnamed(value: u64) -> String {
+    format!("#{value:016x}")
 }
 
 struct Tables {
-    tokens: Interner,
-    tools: Interner,
-    environments: Interner,
-    values: Vec<ValueTable>,
+    tokens: NameTable,
+    tools: NameTable,
+    values: Vec<NameTable>,
 }
 
 impl Tables {
     fn new() -> Self {
         Self {
-            tokens: Interner::new(MAX_TOKENS),
-            tools: Interner::new(MAX_TOKENS),
-            environments: Interner::new(256),
+            tokens: NameTable::new(MAX_TOKEN_NAMES, MAX_TOKEN_NAMES_PER_OWNER),
+            tools: NameTable::new(MAX_TOKEN_NAMES, MAX_TOKEN_NAMES_PER_OWNER),
             values: Dimension::CONFIG
                 .iter()
-                .map(|_| ValueTable::new())
+                .map(|_| NameTable::new(MAX_VALUES_PER_DIMENSION, MAX_VALUES_PER_OWNER))
                 .collect(),
         }
+    }
+
+    /// Records one value of `dimension` and returns its identity.
+    fn value(&mut self, dimension: Dimension, tenant: u32, owner: u64, value: Fingerprint) -> u64 {
+        let id = digest(&value.key);
+        self.values[dimension.index()].record(tenant, id, owner, &value.display, value.sample);
+        id
     }
 }
 
 /// A run's distinct values of one dimension.
 #[derive(Clone, Debug, Default)]
 struct ValueSet {
-    ids: Vec<u32>,
+    ids: Vec<u64>,
     overflow: bool,
 }
 
 impl ValueSet {
-    fn add(&mut self, id: u32) {
+    fn add(&mut self, id: u64) {
         if self.ids.contains(&id) {
             return;
         }
@@ -676,23 +848,34 @@ impl ValueSet {
     }
 }
 
+/// A span's place in the canonical `(time, trace, span)` order, ids clipped
+/// to [`MAX_ID_BYTES`] so a planted id cannot make a run expensive to hold.
 type SpanKey = (u64, String, String);
 
 fn key_less(time: u64, span: &Span, than: &Option<SpanKey>) -> bool {
     match than {
         None => true,
         Some((t, trace, id)) => {
-            (time, span.trace_id.as_str(), span.span_id.as_str())
-                < (*t, trace.as_str(), id.as_str())
+            (
+                time,
+                clipped(&span.trace_id, MAX_ID_BYTES),
+                clipped(&span.span_id, MAX_ID_BYTES),
+            ) < (*t, trace.as_str(), id.as_str())
         }
     }
 }
 
 fn key_of(time: u64, span: &Span) -> SpanKey {
-    (time, span.trace_id.clone(), span.span_id.clone())
+    (
+        time,
+        clipped(&span.trace_id, MAX_ID_BYTES).to_owned(),
+        clipped(&span.span_id, MAX_ID_BYTES).to_owned(),
+    )
 }
 
-/// Everything one run contributes, folded span by span in bounded memory.
+/// Everything one run contributes, folded span by span in bounded memory:
+/// every string it holds is clipped ([`MAX_ID_BYTES`], [`MAX_NAME_BYTES`],
+/// [`MAX_OUTCOME_BYTES`]) and every list capped.
 #[derive(Default)]
 struct RunAcc {
     earliest: Option<SpanKey>,
@@ -701,15 +884,17 @@ struct RunAcc {
     first_step_agent: Option<String>,
     last: Option<SpanKey>,
     last_error: bool,
-    last_outcome: Option<String>,
+    /// The latest span declaring an outcome, and the declaration — clipped,
+    /// which keeps every outcome word [`attribution::session_outcome`]
+    /// recognizes intact (the longest is nine bytes).
     declared: Option<(SpanKey, String)>,
     errors: u32,
     cost: f64,
     steps: u32,
-    step_keys: Vec<(u64, u64, u32)>,
-    tools: Vec<(u32, u32)>,
+    step_keys: Vec<(u64, u64, u64)>,
+    tools: Vec<(u64, u32)>,
     values: [ValueSet; 7],
-    environments: Vec<u32>,
+    environments: Vec<u64>,
 }
 
 impl RunAcc {
@@ -717,56 +902,71 @@ impl RunAcc {
         self.earliest.as_ref().map_or(u64::MAX, |key| key.0)
     }
 
-    fn absorb(&mut self, span: &Span, llm: &semconv::LlmFacts, tables: &mut Tables) {
+    fn first_step_start(&self) -> u64 {
+        self.first_step.as_ref().map_or(u64::MAX, |key| key.0)
+    }
+
+    /// Folds one span in; whether it was an llm step, whose configuration
+    /// extraction is the expensive part of a read.
+    fn absorb(
+        &mut self,
+        span: &Span,
+        llm: &semconv::LlmFacts,
+        tables: &mut Tables,
+        tenant: u32,
+    ) -> bool {
         let error = span.status.eq_ignore_ascii_case("error");
         if error {
             self.errors += 1;
         }
         self.cost += llm.cost_usd.filter(|cost| cost.is_finite()).unwrap_or(0.0);
+        let service = clipped(&span.service, MAX_NAME_BYTES);
         if key_less(span.start_time_ns, span, &self.earliest) {
             self.earliest = Some(key_of(span.start_time_ns, span));
-            self.earliest_service.clone_from(&span.service);
+            service.clone_into(&mut self.earliest_service);
         }
-        let outcome = semconv::outcome(&span.attributes);
         if self.last.is_none() || !key_less(span.end_time_ns, span, &self.last) {
             self.last = Some(key_of(span.end_time_ns, span));
             self.last_error = error;
-            self.last_outcome.clone_from(&outcome);
         }
-        if let Some(text) = outcome {
+        if let Some(text) = semconv::outcome(&span.attributes) {
             let later = match &self.declared {
                 None => true,
                 Some((key, _)) => !key_less(span.end_time_ns, span, &Some(key.clone())),
             };
             if later {
-                self.declared = Some((key_of(span.end_time_ns, span), text));
+                self.declared = Some((
+                    key_of(span.end_time_ns, span),
+                    clipped(&text, MAX_OUTCOME_BYTES).to_owned(),
+                ));
             }
         }
         let attributes = &span.attributes;
         if let Some(environment) = fingerprint::environment(attributes) {
-            let id = tables.environments.intern(&environment);
+            let id = digest(clipped(&environment, MAX_NAME_BYTES));
             if !self.environments.contains(&id)
                 && self.environments.len() < MAX_ENVIRONMENTS_PER_RUN
             {
                 self.environments.push(id);
             }
         }
+        let owner = digest(service);
         if let Some(version) = fingerprint::service_version(attributes) {
-            let index = Dimension::ServiceVersion.index();
-            let id = tables.values[index].intern(version);
-            self.values[index].add(id);
+            let id = tables.value(Dimension::ServiceVersion, tenant, owner, version);
+            self.values[Dimension::ServiceVersion.index()].add(id);
         }
         if let Some(sdk) = fingerprint::sdk_version(attributes) {
-            let index = Dimension::SdkVersion.index();
-            let id = tables.values[index].intern(sdk);
-            self.values[index].add(id);
+            let id = tables.value(Dimension::SdkVersion, tenant, owner, sdk);
+            self.values[Dimension::SdkVersion.index()].add(id);
         }
         let (kind, signature, agent) = semconv::step_identity_with(span, llm);
         if !kind.is_step() {
-            return;
+            return false;
         }
         self.steps += 1;
-        let token = tables.tokens.intern(&signature);
+        let signature = clipped(&signature, MAX_NAME_BYTES);
+        let token = digest(signature);
+        tables.tokens.record(tenant, token, owner, signature, None);
         self.step_keys
             .push((span.start_time_ns, identity_hash(span), token));
         if self.step_keys.len() >= 2 * MAX_RUN_STEPS {
@@ -775,26 +975,28 @@ impl RunAcc {
         }
         if key_less(span.start_time_ns, span, &self.first_step) {
             self.first_step = Some(key_of(span.start_time_ns, span));
-            self.first_step_agent = agent;
+            self.first_step_agent = agent.map(|agent| clipped(&agent, MAX_NAME_BYTES).to_owned());
         }
         match kind {
             StepKind::Tool => {
-                let name = signature.strip_prefix("tool:").unwrap_or(&signature);
-                let id = tables.tools.intern(name);
+                let name = signature.strip_prefix("tool:").unwrap_or(signature);
+                let id = digest(name);
+                tables.tools.record(tenant, id, owner, name, None);
                 if let Some((_, count)) = self.tools.iter_mut().find(|(tool, _)| *tool == id) {
                     *count += 1;
                 } else if self.tools.len() < MAX_TOOLS_PER_RUN {
                     self.tools.push((id, 1));
                 }
+                false
             }
             StepKind::Llm => {
                 for (dimension, value) in fingerprint::llm_config(span) {
-                    let index = dimension.index();
-                    let id = tables.values[index].intern(value);
-                    self.values[index].add(id);
+                    let id = tables.value(dimension, tenant, owner, value);
+                    self.values[dimension.index()].add(id);
                 }
+                true
             }
-            _ => {}
+            _ => false,
         }
     }
 }
@@ -823,120 +1025,147 @@ fn stable_hash(parts: &[&str]) -> u64 {
     hash
 }
 
-fn run_hash(tenant: &str, run: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    tenant.hash(&mut hasher);
-    run.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// The fold's state: runs, the eviction record, and the interners.
-struct FoldState {
-    runs: HashMap<(String, String), RunAcc>,
-    /// Runs let go that had a step: their later spans are ignored.
-    evicted: HashSet<u64>,
-    /// Runs let go before any step of theirs was seen, with the earliest
-    /// start seen for each. Not agent runs as far as anyone knows, so letting
-    /// them go does not move the watermark — unless a step of theirs turns up
-    /// later, which makes them agent runs with missing spans.
-    stepless: HashMap<u64, u64>,
-    /// The highest first start of an agent run let go.
+/// The read's first pass: which agent runs the analysis holds. Only step
+/// spans count, so a store of plain request traces costs this pass nothing
+/// to remember.
+///
+/// Each run is ranked by the start of its first step. When more than twice
+/// the cap are held, every run but the newest `max_runs` is let go and the
+/// watermark rises to the latest first-step start let go — and every held
+/// run starting at or before it is let go too, as is any later step at or
+/// before it. A run only ever leaves when its first step is at or before the
+/// watermark, so every run whose first step starts after the final
+/// watermark is held at the end, and only those are; the second pass reads
+/// them whole.
+struct Selection {
+    firsts: HashMap<(String, String), u64>,
     watermark: Option<u64>,
-    overflow: bool,
-    spans: u64,
     max_runs: usize,
-    tables: Tables,
 }
 
-impl FoldState {
+impl Selection {
+    fn new(max_runs: usize) -> Self {
+        Self {
+            firsts: HashMap::new(),
+            watermark: None,
+            max_runs,
+        }
+    }
+
+    fn visit(&mut self, span: &Span) {
+        let llm = semconv::facts(&span.attributes);
+        if !semconv::step_kind_with(span, &llm).is_step() {
+            return;
+        }
+        let start = span.start_time_ns;
+        let key = (
+            span.tenant.clone(),
+            run_key(semconv::run_id(&span.attributes, &span.trace_id)),
+        );
+        if self.watermark.is_some_and(|mark| start <= mark) {
+            // Its first step is at or before the mark, wherever its others are.
+            self.firsts.remove(&key);
+            return;
+        }
+        let first = self.firsts.entry(key).or_insert(start);
+        *first = (*first).min(start);
+        if self.firsts.len() > 2 * self.max_runs {
+            self.prune();
+        }
+    }
+
+    /// Down to the newest `max_runs` (ties at the cut go too), raising the
+    /// watermark.
+    fn prune(&mut self) {
+        if self.firsts.len() <= self.max_runs {
+            return;
+        }
+        let mut starts: Vec<u64> = self.firsts.values().copied().collect();
+        // Newest first: the element at `max_runs` is the newest run let go.
+        let (_, mark, _) = starts.select_nth_unstable_by(self.max_runs, |a, b| b.cmp(a));
+        let mark = *mark;
+        self.watermark = Some(self.watermark.map_or(mark, |old| old.max(mark)));
+        self.firsts.retain(|_, start| *start > mark);
+    }
+
+    /// The runs held, by tenant, and the watermark.
+    fn finish(mut self) -> (HashMap<String, HashSet<String>>, Option<u64>) {
+        self.prune();
+        let mut held: HashMap<String, HashSet<String>> = HashMap::new();
+        for (tenant, run) in self.firsts.into_keys() {
+            held.entry(tenant).or_default().insert(run);
+        }
+        (held, self.watermark)
+    }
+}
+
+/// The read's second pass: every span of every run the first pass held,
+/// folded into its run.
+struct Accumulate {
+    /// Tenant → (its id in the name tables, run → accumulator).
+    runs: HashMap<String, (u32, HashMap<String, RunAcc>)>,
+    tables: Tables,
+    spans: u64,
+    extractions: usize,
+    /// The deadline passed during the fold: every later span is skipped, and
+    /// the read is refused when the fold returns.
+    expired: bool,
+    deadline: Option<Deadline>,
+}
+
+impl Accumulate {
+    fn new(held: HashMap<String, HashSet<String>>, deadline: Option<Deadline>) -> Self {
+        let mut tenants: Vec<String> = held.keys().cloned().collect();
+        tenants.sort();
+        let ids: HashMap<String, u32> = tenants
+            .into_iter()
+            .enumerate()
+            .map(|(id, tenant)| (tenant, id as u32))
+            .collect();
+        let runs = held
+            .into_iter()
+            .map(|(tenant, runs)| {
+                let id = ids[&tenant];
+                let runs = runs
+                    .into_iter()
+                    .map(|run| (run, RunAcc::default()))
+                    .collect();
+                (tenant, (id, runs))
+            })
+            .collect();
+        Self {
+            runs,
+            tables: Tables::new(),
+            spans: 0,
+            extractions: 0,
+            expired: false,
+            deadline,
+        }
+    }
+
     fn visit(&mut self, store: &Store, span: &Span) {
-        if self.overflow {
+        if self.expired {
             return;
         }
         self.spans += 1;
+        let Accumulate { runs, tables, .. } = self;
+        let Some((tenant, runs)) = runs.get_mut(span.tenant.as_str()) else {
+            return;
+        };
+        let run = run_key(semconv::run_id(&span.attributes, &span.trace_id));
+        let Some(acc) = runs.get_mut(&run) else {
+            return;
+        };
         let llm = store.facts(span);
-        let run = semconv::run_id(&span.attributes, &span.trace_id);
-        let key = (span.tenant.clone(), run);
-        if !self.runs.contains_key(&key) {
-            if self.watermark.is_some() || !self.stepless.is_empty() {
-                let hash = run_hash(&key.0, &key.1);
-                if self.evicted.contains(&hash) {
-                    return;
-                }
-                if let Some(first) = self.stepless.get(&hash).copied() {
-                    let first = first.min(span.start_time_ns);
-                    if semconv::step_kind_with(span, &llm).is_step() {
-                        // An agent run after all, missing the spans already
-                        // let go: it starts at or before `first`, so the
-                        // watermark moves past it and it is dropped whole.
-                        self.stepless.remove(&hash);
-                        self.raise(first);
-                        self.forget(hash);
-                    } else {
-                        self.stepless.insert(hash, first);
-                    }
-                    return;
-                }
-                // A run first seen at or before the watermark starts there
-                // or earlier, so it would be dropped anyway — and its later
-                // spans must not resurrect it as a shorter run.
-                if self
-                    .watermark
-                    .is_some_and(|mark| span.start_time_ns <= mark)
-                {
-                    self.forget(hash);
-                    return;
-                }
-            }
-            self.runs.insert(key.clone(), RunAcc::default());
-        }
-        let FoldState { runs, tables, .. } = self;
-        if let Some(acc) = runs.get_mut(&key) {
-            acc.absorb(span, &llm, tables);
-        }
-        if self.runs.len() > self.max_runs + self.max_runs / 4 + 1 {
-            self.evict();
-        }
-    }
-
-    fn raise(&mut self, start: u64) {
-        self.watermark = Some(self.watermark.map_or(start, |mark| mark.max(start)));
-    }
-
-    fn forget(&mut self, hash: u64) {
-        self.evicted.insert(hash);
-        self.check_overflow();
-    }
-
-    fn check_overflow(&mut self) {
-        if self.evicted.len() + self.stepless.len() > MAX_EVICTED_RUNS {
-            self.overflow = true;
-        }
-    }
-
-    /// Lets runs go, down to the cap: runs with no step first (they are not
-    /// agent runs, and a store of plain request traces must not crowd agent
-    /// runs out), then the agent runs that started earliest. Every one is
-    /// remembered so its later spans are ignored, and every agent run that
-    /// truly starts after the resulting watermark is still held whole; see
-    /// [`Store::changes`] for why that makes the cut exact.
-    fn evict(&mut self) {
-        let mut order: Vec<(bool, u64, (String, String))> = self
-            .runs
-            .iter()
-            .map(|(key, acc)| (acc.steps > 0, acc.first_start(), key.clone()))
-            .collect();
-        order.sort();
-        let excess = self.runs.len().saturating_sub(self.max_runs);
-        for (has_steps, start, key) in order.into_iter().take(excess) {
-            self.runs.remove(&key);
-            let hash = run_hash(&key.0, &key.1);
-            if has_steps {
-                self.raise(start);
-                self.forget(hash);
-            } else {
-                self.stepless.insert(hash, start);
-                self.check_overflow();
+        if acc.absorb(span, &llm, tables, *tenant) {
+            // The fold checks its deadline every few thousand records, which
+            // suits cheap visitors; an llm step costs a parse, a mask and a
+            // digest of its whole request, so this one checks more often.
+            self.extractions += 1;
+            if self.extractions % EXTRACTION_CHECK_INTERVAL == 0
+                && Deadline::check(self.deadline, 0).is_err()
+            {
+                self.expired = true;
             }
         }
     }
@@ -947,6 +1176,7 @@ impl FoldState {
 /// A finished run, as the analysis reads it.
 struct RunView {
     tenant: String,
+    tenant_id: u32,
     run: String,
     agent: String,
     start_ns: u64,
@@ -957,16 +1187,18 @@ struct RunView {
     steps: u32,
     duration_ns: u64,
     path: u32,
-    tools: Vec<(u32, u32)>,
+    /// Whether a step token of its path is shown by digest.
+    unnamed_path: bool,
+    tools: Vec<(u64, u32)>,
     values: [Option<u32>; 7],
-    environments: Vec<u32>,
+    environments: Vec<u64>,
 }
 
 /// One dimension's run-level values: the set of step values a run carried.
 #[derive(Default)]
 struct ComboTable {
-    ids: HashMap<(Vec<u32>, bool), u32>,
-    members: Vec<(Vec<u32>, bool)>,
+    ids: HashMap<(Vec<u64>, bool), u32>,
+    members: Vec<(Vec<u64>, bool)>,
 }
 
 impl ComboTable {
@@ -984,23 +1216,57 @@ impl ComboTable {
     }
 }
 
-/// Everything value-shaped the analysis renders from.
+/// The window, read: its runs and everything needed to render them.
+struct Window {
+    views: Vec<RunView>,
+    tables: Tables,
+    combos: Vec<ComboTable>,
+    paths: Interner,
+    spans: u64,
+    watermark: Option<u64>,
+}
+
+/// Everything value-shaped one cohort renders from.
 struct Context<'a> {
     tables: &'a Tables,
     combos: &'a [ComboTable],
     paths: &'a Interner,
     threshold: f64,
+    /// The cohort's tenant: every name is looked up in it.
+    tenant: u32,
+    /// Set when something was shown by digest for want of a name.
+    unnamed: Cell<bool>,
 }
 
 impl Context<'_> {
+    fn value_name(&self, index: usize, value: u64) -> String {
+        match self.tables.values[index].name(self.tenant, value) {
+            Some(name) => name.to_owned(),
+            None => {
+                self.unnamed.set(true);
+                unnamed(value)
+            }
+        }
+    }
+
+    fn tool_name(&self, tool: u64) -> String {
+        match self.tables.tools.name(self.tenant, tool) {
+            Some(name) => name.to_owned(),
+            None => {
+                self.unnamed.set(true);
+                unnamed(tool)
+            }
+        }
+    }
+
     fn display(&self, dimension: Dimension, combo: u32) -> String {
         let index = dimension.index();
         let Some((members, overflow)) = self.combos[index].members.get(combo as usize) else {
-            return "(other)".to_owned();
+            return String::new();
         };
-        let mut names: Vec<&str> = members
+        let mut names: Vec<String> = members
             .iter()
-            .map(|id| self.tables.values[index].display(*id))
+            .map(|value| self.value_name(index, *value))
             .collect();
         names.sort_unstable();
         let mut text = names.join(" + ");
@@ -1032,12 +1298,12 @@ impl Context<'_> {
         let (Some(old), Some(new)) = (members(from), members(to)) else {
             return (None, None);
         };
-        let removed: Vec<u32> = old.iter().copied().filter(|id| !new.contains(id)).collect();
-        let added: Vec<u32> = new.iter().copied().filter(|id| !old.contains(id)).collect();
+        let removed: Vec<u64> = old.iter().copied().filter(|id| !new.contains(id)).collect();
+        let added: Vec<u64> = new.iter().copied().filter(|id| !old.contains(id)).collect();
         match (removed.as_slice(), added.as_slice()) {
             ([before], [after]) => (
-                self.tables.values[index].sample(*before),
-                self.tables.values[index].sample(*after),
+                self.tables.values[index].sample(self.tenant, *before),
+                self.tables.values[index].sample(self.tenant, *after),
             ),
             _ => (None, None),
         }
@@ -1059,22 +1325,20 @@ impl Store {
     /// every tenant, each its own cohorts), per [`ChangeQuery`]. `now_ns`
     /// dates the session-idle rule (which runs are still active).
     ///
-    /// One fold of the window under the query deadline, then the analysis
-    /// the module describes, under the same budget. Only agent runs — runs
-    /// with at least one llm, tool or agent step — are analysed.
+    /// Two passes over one snapshot of the window, then the analysis the
+    /// module describes, all under one query deadline. Only agent runs —
+    /// runs with at least one llm, tool or agent step — are analysed.
     ///
-    /// **The run cap is exact, not approximate.** When the window holds more
-    /// than `max_runs` runs, the fold lets runs go: first runs with no step
-    /// so far (plain request traces must not crowd agent runs out), then the
-    /// agent runs that started earliest. Every run let go is remembered, so
-    /// none of its later spans can resurrect it as a shorter run; a step-less
-    /// run whose step turns up later is an agent run missing spans, and moves
-    /// the watermark past its start. An agent run is only ever let go when no
-    /// agent run still held started before it, so every agent run that truly
-    /// starts after the watermark is held whole; the runs at or before it are
-    /// then dropped too, and the report says where the analysed window
-    /// begins (`covered_since_ns`). Runs let go are remembered by a 64-bit
-    /// hash, at most a million of them; past that the request is refused.
+    /// **The run cap is exact, not approximate.** The first pass reads only
+    /// step spans and ranks each run by the start of its first step; it keeps
+    /// the newest `max_runs` and says where the cut fell (the watermark). The
+    /// second pass reads every span of exactly those runs — a run's
+    /// workflow root, its HTTP server span and its late spans included — so
+    /// every agent run whose first step starts after the watermark is
+    /// analysed whole, and no other run is. Plain request traces are never
+    /// remembered by either pass, so they cannot crowd agent runs out, and no
+    /// store is too big to ask about: a bigger window only costs more time,
+    /// which the deadline bounds.
     pub fn changes(
         &self,
         tenant: Option<&str>,
@@ -1090,201 +1354,275 @@ impl Store {
             ));
         }
         let deadline = self.query_deadline(Instant::now());
+        let window = self.read_window(tenant, query, now_ns, deadline)?;
+        analyse_window(&window, query, deadline)
+    }
+
+    /// Both passes of the read, and every run finished.
+    fn read_window(
+        &self,
+        tenant: Option<&str>,
+        query: &ChangeQuery,
+        now_ns: u64,
+        deadline: Option<Deadline>,
+    ) -> Result<Window> {
         let filter = SpanFilter {
             tenant: tenant.map(str::to_owned),
             since_ns: Some(query.since_ns),
             until_ns: Some(query.until_ns),
             ..SpanFilter::default()
         };
-        let mut state = FoldState {
-            runs: HashMap::new(),
-            evicted: HashSet::new(),
-            stepless: HashMap::new(),
-            watermark: None,
-            overflow: false,
-            spans: 0,
-            max_runs: query.max_runs.max(1),
-            tables: Tables::new(),
-        };
-        self.fold_spans_under(&filter, deadline, |span| state.visit(self, span))?;
-        if state.overflow {
-            return Err(Error::Invalid(format!(
-                "the window holds more than {MAX_EVICTED_RUNS} runs beyond the run cap; \
-                 narrow since/until"
-            )));
+        // One snapshot for both passes, so the second reads exactly the
+        // store the first ranked.
+        let view = self.snapshot()?;
+        let mut cost = QueryCost::default();
+        let mut selection = Selection::new(query.max_runs.max(1));
+        view.fold(&filter, deadline, &mut cost, &mut |span| {
+            selection.visit(span)
+        })?;
+        let (held, watermark) = selection.finish();
+        let mut accumulate = Accumulate::new(held, deadline);
+        view.fold(&filter, deadline, &mut cost, &mut |span| {
+            accumulate.visit(self, span);
+        })?;
+        if accumulate.expired {
+            Deadline::check(deadline, cost.segments_examined)?;
         }
-        let FoldState {
-            runs,
-            watermark,
-            spans,
-            tables,
-            ..
-        } = state;
-        let mut truncated = watermark.is_some();
+        // A run whose last span is within the idle window of `until` may
+        // have gone on past it: judged against the earlier of now and until.
+        finish_runs(accumulate, watermark, now_ns.min(query.until_ns), deadline)
+    }
+}
 
-        // Finish every run: its path, its outcome, its value sets.
-        let mut paths = Interner::new(usize::MAX);
-        let mut combos: Vec<ComboTable> = Dimension::CONFIG
-            .iter()
-            .map(|_| ComboTable::default())
-            .collect();
-        let mut views: Vec<RunView> = Vec::with_capacity(runs.len());
-        for ((run_tenant, run), mut acc) in runs {
-            // A run with no step is not an agent run; one at or before the
-            // watermark may be missing spans.
-            if acc.steps == 0 || watermark.is_some_and(|mark| acc.first_start() <= mark) {
+/// Every held run finished: its agent, outcome, path and value sets, in
+/// run-start order (so every id the analysis assigns is deterministic).
+fn finish_runs(
+    accumulate: Accumulate,
+    watermark: Option<u64>,
+    active_before_ns: u64,
+    deadline: Option<Deadline>,
+) -> Result<Window> {
+    let Accumulate {
+        runs,
+        tables,
+        spans,
+        ..
+    } = accumulate;
+    let mut held: Vec<(String, u32, String, RunAcc)> = Vec::new();
+    for (tenant, (tenant_id, runs)) in runs {
+        for (run, acc) in runs {
+            // A run whose first step is at or before the watermark is not
+            // analysed: the first pass may have let some of it go.
+            if acc.steps == 0 || watermark.is_some_and(|mark| acc.first_step_start() <= mark) {
                 continue;
             }
-            Deadline::check(deadline, 0)?;
-            let agent = acc
-                .first_step_agent
-                .take()
-                .unwrap_or_else(|| acc.earliest_service.clone());
-            let ended = run_outcome(&acc, now_ns);
-            acc.step_keys.sort_unstable();
-            acc.step_keys.truncate(MAX_RUN_STEPS);
-            let path = paths.intern(&top_path(&acc, &tables.tokens));
-            let mut values = [None; 7];
-            for dimension in Dimension::CONFIG {
-                let index = dimension.index();
-                let set = &acc.values[index];
-                if !set.ids.is_empty() {
-                    values[index] = Some(combos[index].intern(set));
-                }
-            }
-            let start_ns = acc.first_start();
-            let end_ns = acc.last.as_ref().map_or(start_ns, |key| key.0);
-            views.push(RunView {
-                tenant: run_tenant,
-                run,
-                agent,
-                start_ns,
-                complete: ended.reason != "still_active",
-                outcome: ended.outcome,
-                errored: acc.errors > 0,
-                cost: acc.cost,
-                steps: acc.steps,
-                duration_ns: end_ns.saturating_sub(start_ns),
-                path,
-                tools: acc.tools,
-                values,
-                environments: acc.environments,
-            });
+            held.push((tenant.clone(), tenant_id, run, acc));
         }
-
-        // A named run narrows the analysis to its own cohort.
-        let named: Option<&RunView> = match &query.run {
-            None => None,
-            Some(id) => {
-                let mut found = views.iter().filter(|view| view.run == *id);
-                let first = found.next();
-                if first.is_some() && found.next().is_some() {
-                    return Err(Error::Invalid(format!(
-                        "run {id} exists in more than one tenant; pass tenant= to choose one"
-                    )));
-                }
-                match first {
-                    Some(view) => Some(view),
-                    None => {
-                        Deadline::check(deadline, 0)?;
-                        return Ok(ChangeReport {
-                            since_ns: query.since_ns,
-                            until_ns: query.until_ns,
-                            covered_since_ns: watermark.map(|mark| mark.saturating_add(1)),
-                            spans_scanned: spans,
-                            runs_scanned: 0,
-                            agents: Vec::new(),
-                            run: None,
-                            truncated,
-                        });
-                    }
-                }
+    }
+    held.sort_by(|a, b| (a.3.first_start(), &a.0, &a.2).cmp(&(b.3.first_start(), &b.0, &b.2)));
+    let mut paths = Interner::new();
+    let mut combos: Vec<ComboTable> = Dimension::CONFIG
+        .iter()
+        .map(|_| ComboTable::default())
+        .collect();
+    let mut views = Vec::with_capacity(held.len());
+    for (position, (tenant, tenant_id, run, mut acc)) in held.into_iter().enumerate() {
+        if position % 1_024 == 0 {
+            Deadline::check(deadline, 0)?;
+        }
+        let agent = acc
+            .first_step_agent
+            .take()
+            .unwrap_or_else(|| acc.earliest_service.clone());
+        let ended = run_outcome(&acc, active_before_ns);
+        acc.step_keys.sort_unstable();
+        acc.step_keys.truncate(MAX_RUN_STEPS);
+        let (text, unnamed_path) = top_path(&acc, &tables.tokens, tenant_id);
+        let path = paths.intern(&text);
+        let mut values = [None; 7];
+        for dimension in Dimension::CONFIG {
+            let index = dimension.index();
+            let set = &acc.values[index];
+            if !set.ids.is_empty() {
+                values[index] = Some(combos[index].intern(set));
             }
-        };
+        }
+        let start_ns = acc.first_start();
+        let end_ns = acc.last.as_ref().map_or(start_ns, |key| key.0);
+        views.push(RunView {
+            tenant,
+            tenant_id,
+            run,
+            agent,
+            start_ns,
+            complete: ended.reason != "still_active",
+            outcome: ended.outcome,
+            errored: acc.errors > 0,
+            cost: acc.cost,
+            steps: acc.steps,
+            duration_ns: end_ns.saturating_sub(start_ns),
+            path,
+            unnamed_path,
+            tools: acc.tools,
+            values,
+            environments: acc.environments,
+        });
+    }
+    Ok(Window {
+        views,
+        tables,
+        combos,
+        paths,
+        spans,
+        watermark,
+    })
+}
 
-        // Filter, then group into cohorts in run-start order.
-        let environment = match &query.environment {
-            None => None,
-            Some(name) => Some(tables.environments.ids.get(name).copied()),
-        };
-        let mut cohorts: BTreeMap<(String, String), Vec<&RunView>> = BTreeMap::new();
-        for view in &views {
+/// The analysis of a read window, under the same deadline as the read.
+fn analyse_window(
+    window: &Window,
+    query: &ChangeQuery,
+    deadline: Option<Deadline>,
+) -> Result<ChangeReport> {
+    Deadline::check(deadline, 0)?;
+    let mut truncated = window.watermark.is_some();
+    let covered_since_ns = window.watermark.map(|mark| mark.saturating_add(1));
+    let environment = query
+        .environment
+        .as_deref()
+        .map(|name| digest(clipped(name, MAX_NAME_BYTES)));
+
+    // A named run narrows the analysis to its own cohort.
+    let named: Option<&RunView> = match &query.run {
+        None => None,
+        Some(id) => {
+            let key = run_key(id.clone());
+            let mut found = window.views.iter().filter(|view| view.run == key);
+            let first = found.next();
+            if first.is_some() && found.next().is_some() {
+                return Err(Error::Invalid(format!(
+                    "run {id} exists in more than one tenant; name its tenant to choose one"
+                )));
+            }
+            let Some(view) = first else {
+                return Ok(ChangeReport {
+                    since_ns: query.since_ns,
+                    until_ns: query.until_ns,
+                    covered_since_ns,
+                    spans_scanned: window.spans,
+                    runs_scanned: 0,
+                    agents: Vec::new(),
+                    run: None,
+                    truncated,
+                });
+            };
             if query
                 .agent
                 .as_ref()
                 .is_some_and(|agent| *agent != view.agent)
             {
-                continue;
+                return Err(Error::Invalid(format!(
+                    "run {id} is excluded by the agent filter: it belongs to another agent; \
+                     drop agent= to place it"
+                )));
             }
-            if named.is_some_and(|run| run.tenant != view.tenant || run.agent != view.agent) {
-                continue;
+            if environment.is_some_and(|wanted| !view.environments.contains(&wanted)) {
+                return Err(Error::Invalid(format!(
+                    "run {id} is excluded by the environment filter: it does not report that \
+                     environment; drop environment= to place it"
+                )));
             }
-            match environment {
-                Some(None) => continue,
-                Some(Some(id)) if !view.environments.contains(&id) => continue,
-                _ => {}
-            }
-            cohorts
-                .entry((view.tenant.clone(), view.agent.clone()))
-                .or_default()
-                .push(view);
+            Some(view)
         }
-        let mut cohorts: Vec<((String, String), Vec<&RunView>)> = cohorts.into_iter().collect();
-        if cohorts.len() > MAX_AGENTS {
-            cohorts.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-            cohorts.truncate(MAX_AGENTS);
-            truncated = true;
+    };
+
+    // Filter, then group into cohorts in run-start order.
+    let mut cohorts: BTreeMap<(String, String), Vec<&RunView>> = BTreeMap::new();
+    for view in &window.views {
+        if query
+            .agent
+            .as_ref()
+            .is_some_and(|agent| *agent != view.agent)
+        {
+            continue;
         }
-        let context = Context {
-            tables: &tables,
-            combos: &combos,
-            paths: &paths,
-            threshold: query.behavior_threshold,
-        };
-        let mut agents = Vec::with_capacity(cohorts.len());
-        let mut runs_scanned = 0;
-        for ((cohort_tenant, agent), mut runs) in cohorts {
-            runs.sort_by(|a, b| a.start_ns.cmp(&b.start_ns).then_with(|| a.run.cmp(&b.run)));
-            runs_scanned += runs.len();
-            agents.push(analyse(&cohort_tenant, &agent, &runs, &context, deadline)?);
+        if named.is_some_and(|run| run.tenant != view.tenant || run.agent != view.agent) {
+            continue;
         }
-        agents.sort_by(|a, b| {
-            let lead = |agent: &AgentChanges| {
-                agent
-                    .changes
-                    .first()
-                    .filter(|change| change.verdict == Verdict::Regression)
-                    .map_or(0.0, |change| change.effect_size)
-            };
-            lead(b)
-                .partial_cmp(&lead(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(b.changes.len().cmp(&a.changes.len()))
-                .then(b.runs.cmp(&a.runs))
-                .then_with(|| a.tenant.cmp(&b.tenant))
-                .then_with(|| a.agent.cmp(&b.agent))
-        });
-        // A named run that survived the filters is placed on its timeline.
-        let run = named.and_then(|view| {
-            agents
-                .iter()
-                .find(|agent| agent.tenant == view.tenant && agent.agent == view.agent)
-                .map(|agent| run_context(view, agent, &context))
-        });
-        // The final check: an analysis that finished past its budget is
-        // refused like one stopped at it.
-        Deadline::check(deadline, 0)?;
-        Ok(ChangeReport {
-            since_ns: query.since_ns,
-            until_ns: query.until_ns,
-            covered_since_ns: watermark.map(|mark| mark.saturating_add(1)),
-            spans_scanned: spans,
-            runs_scanned,
-            agents,
-            run,
-            truncated,
-        })
+        if environment.is_some_and(|wanted| !view.environments.contains(&wanted)) {
+            continue;
+        }
+        cohorts
+            .entry((view.tenant.clone(), view.agent.clone()))
+            .or_default()
+            .push(view);
     }
+    let mut cohorts: Vec<((String, String), Vec<&RunView>)> = cohorts.into_iter().collect();
+    if cohorts.len() > MAX_AGENTS {
+        cohorts.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+        cohorts.truncate(MAX_AGENTS);
+        truncated = true;
+    }
+    let context_for = |tenant: u32| Context {
+        tables: &window.tables,
+        combos: &window.combos,
+        paths: &window.paths,
+        threshold: query.behavior_threshold,
+        tenant,
+        unnamed: Cell::new(false),
+    };
+    let mut agents = Vec::with_capacity(cohorts.len());
+    let mut runs_scanned = 0;
+    let mut run = None;
+    for ((cohort_tenant, agent), mut runs) in cohorts {
+        // Already in start order; the run id breaks a tie the same way.
+        runs.sort_by(|a, b| a.start_ns.cmp(&b.start_ns).then_with(|| a.run.cmp(&b.run)));
+        runs_scanned += runs.len();
+        let context = context_for(runs[0].tenant_id);
+        let mut changes = analyse(&cohort_tenant, &agent, &runs, &context, deadline)?;
+        if let Some(view) = named.filter(|view| view.tenant == cohort_tenant && view.agent == agent)
+        {
+            run = Some(run_context(view, &changes, &context));
+        }
+        changes.unnamed = context.unnamed.get() || runs.iter().any(|run| run.unnamed_path);
+        truncated |= changes.unnamed;
+        agents.push(changes);
+    }
+    agents.sort_by(|a, b| {
+        let lead = |agent: &AgentChanges| {
+            agent
+                .changes
+                .first()
+                .filter(|change| change.verdict == Verdict::Regression)
+                .map(|change| (basis_rank(change), change.effect_size))
+        };
+        let led = match (lead(a), lead(b)) {
+            (Some(x), Some(y)) => {
+                x.0.cmp(&y.0)
+                    .then(y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal))
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        led.then(b.changes.len().cmp(&a.changes.len()))
+            .then(b.runs.cmp(&a.runs))
+            .then_with(|| a.tenant.cmp(&b.tenant))
+            .then_with(|| a.agent.cmp(&b.agent))
+    });
+    // The final check: an analysis that finished past its budget is
+    // refused like one stopped at it.
+    Deadline::check(deadline, 0)?;
+    Ok(ChangeReport {
+        since_ns: query.since_ns,
+        until_ns: query.until_ns,
+        covered_since_ns,
+        spans_scanned: window.spans,
+        runs_scanned,
+        agents,
+        run,
+        truncated,
+    })
 }
 
 /// One run placed on its agent's timeline: its fingerprint, and the latest
@@ -1349,7 +1687,8 @@ fn run_context(view: &RunView, agent: &AgentChanges, context: &Context<'_>) -> R
 /// How a run ended, by [`attribution::session_outcome`] itself: the fold
 /// kept the two spans that rule reads — the one that ended last, and the
 /// latest one declaring an outcome — so it is handed exactly those.
-fn run_outcome(acc: &RunAcc, now_ns: u64) -> attribution::SessionOutcome {
+/// `active_before_ns` is the instant the idle rule measures from.
+fn run_outcome(acc: &RunAcc, active_before_ns: u64) -> attribution::SessionOutcome {
     let mini = |key: &SpanKey, error: bool, outcome: Option<&str>| {
         let mut attributes = Map::new();
         if let Some(text) = outcome {
@@ -1376,20 +1715,27 @@ fn run_outcome(acc: &RunAcc, now_ns: u64) -> attribution::SessionOutcome {
     };
     let mut spans = Vec::with_capacity(2);
     if let Some(last) = &acc.last {
-        spans.push(mini(last, acc.last_error, acc.last_outcome.as_deref()));
+        // The last span's own declaration, if it made one, is the latest.
+        let declared = acc
+            .declared
+            .as_ref()
+            .filter(|(key, _)| key == last)
+            .map(|(_, text)| text.as_str());
+        spans.push(mini(last, acc.last_error, declared));
     }
     if let Some((key, text)) = &acc.declared {
         if Some(key) != acc.last.as_ref() {
             spans.push(mini(key, false, Some(text)));
         }
     }
-    attribution::session_outcome(&spans, now_ns, crate::mcp::SESSION_IDLE_NS)
+    attribution::session_outcome(&spans, active_before_ns, crate::mcp::SESSION_IDLE_NS)
 }
 
 /// A run's top-level path: its first [`BEHAVIOR_PATH_DEPTH`] step tokens,
-/// consecutive repeats bucketed, then ` > …` when more steps follow.
-fn top_path(acc: &RunAcc, tokens: &Interner) -> String {
-    let mut buckets: Vec<(u32, usize)> = Vec::new();
+/// consecutive repeats bucketed, then ` > …` when more steps follow; and
+/// whether a token in it had no name.
+fn top_path(acc: &RunAcc, tokens: &NameTable, tenant: u32) -> (String, bool) {
+    let mut buckets: Vec<(u64, usize)> = Vec::new();
     for &(_, _, token) in &acc.step_keys {
         match buckets.last_mut() {
             Some((last, count)) if *last == token => *count += 1,
@@ -1398,13 +1744,20 @@ fn top_path(acc: &RunAcc, tokens: &Interner) -> String {
     }
     let kept_all = acc.steps as usize <= acc.step_keys.len();
     let more = buckets.len() > BEHAVIOR_PATH_DEPTH || !kept_all;
+    let mut missing = false;
     let mut parts: Vec<String> = buckets
         .iter()
         .take(BEHAVIOR_PATH_DEPTH)
         .map(|&(token, count)| {
-            let name = tokens.name(token);
+            let name = match tokens.name(tenant, token) {
+                Some(name) => name.to_owned(),
+                None => {
+                    missing = true;
+                    unnamed(token)
+                }
+            };
             match count {
-                1 => name.to_owned(),
+                1 => name,
                 2 => format!("{name}×2"),
                 3..=5 => format!("{name}×3-5"),
                 _ => format!("{name}×6+"),
@@ -1412,12 +1765,12 @@ fn top_path(acc: &RunAcc, tokens: &Interner) -> String {
         })
         .collect();
     if parts.is_empty() {
-        return "(no steps)".to_owned();
+        return ("(no steps)".to_owned(), false);
     }
     if more {
         parts.push("…".to_owned());
     }
-    parts.join(" > ")
+    (parts.join(" > "), missing)
 }
 
 /// The sliding detection window for `runs` values.
@@ -1425,13 +1778,29 @@ fn detection_window(runs: usize) -> usize {
     (runs / 8).clamp(MIN_DETECTION_WINDOW, MAX_DETECTION_WINDOW)
 }
 
-/// Change points in one dimension's value sequence: `(onset, from, to)`,
-/// per the module's rule. Pure, so the rule is testable on its own.
-fn change_points(values: &[u32], window: usize) -> Vec<(usize, u32, u32)> {
+/// The share of `values` equal to `value`; `0` for none.
+fn share(values: &[u32], value: u32) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().filter(|v| **v == value).count() as f64 / values.len() as f64
+}
+
+/// What the dominance walk proposes: switches `(onset, from, to, detected)`
+/// — `detected` the index at which the newcomer became dominant — and the
+/// walk's final incumbent with its run count.
+struct Walk {
+    switches: Vec<(usize, u32, u32, usize)>,
+    current: Option<u32>,
+    current_runs: usize,
+}
+
+/// The dominance walk of the module docs, which proposes change points.
+fn dominance_walk(values: &[u32], window: usize) -> Walk {
     let mut counts: HashMap<u32, usize> = HashMap::new();
     let mut current: Option<u32> = None;
     let mut current_runs = 0usize;
-    let mut points: Vec<(usize, u32, u32)> = Vec::new();
+    let mut switches: Vec<(usize, u32, u32, usize)> = Vec::new();
     let margin = (window / 10).max(2);
     for (index, &value) in values.iter().enumerate() {
         *counts.entry(value).or_insert(0) += 1;
@@ -1475,35 +1844,100 @@ fn change_points(values: &[u32], window: usize) -> Vec<(usize, u32, u32)> {
             .iter()
             .filter(|v| **v == leader)
             .count();
-        if points.is_empty() && current_runs < MIN_ESTABLISHED_RUNS {
+        if switches.is_empty() && current_runs < MIN_ESTABLISHED_RUNS {
             // Still settling: the first value never established itself.
             current = Some(leader);
             current_runs = leader_runs;
             continue;
         }
-        if let Some(&(last_onset, last_from, last_to)) = points.last() {
+        if let Some(&(last_onset, last_from, last_to, _)) = switches.last() {
             if last_to == incumbent && last_from == leader && onset.abs_diff(last_onset) < window {
                 // An excursion that came back within a window: withdrawn.
-                points.pop();
+                switches.pop();
                 current = Some(leader);
                 current_runs = values[..=index].iter().filter(|v| **v == leader).count();
                 continue;
             }
         }
-        points.push((onset, incumbent, leader));
+        switches.push((onset, incumbent, leader, index));
         current = Some(leader);
         current_runs = leader_runs;
     }
+    Walk {
+        switches,
+        current,
+        current_runs,
+    }
+}
+
+/// Whether a proposed switch is a change rather than a mixture's noise.
+///
+/// In the window of runs AFTER the newcomer became dominant — runs that took
+/// no part in proposing it — the incumbent must be rare and the newcomer
+/// must hold the majority. Before the onset (at least half a window of it)
+/// the newcomer must have been rare, or the incumbent established, or — in
+/// a cohort whose window is at least [`CONFIRM_DROP_WINDOW`] runs, long
+/// enough for its shares to mean something — the incumbent's share must
+/// have fallen by [`CONFIRM_DROP`]: the end of a gradual rollout that held a
+/// mixed stage. A switch too recent to have the window after it is
+/// confirmed only if the newcomer was rare before and has held the majority
+/// since, with the incumbent rare. `floor` is the previous confirmed onset:
+/// history before it belongs to an older value.
+fn confirmed(
+    values: &[u32],
+    (onset, from, to, detected): (usize, u32, u32, usize),
+    window: usize,
+    floor: usize,
+) -> bool {
+    let start = onset.saturating_sub(window).max(floor).min(onset);
+    let before = &values[start..onset];
+    if before.len() < (window / 2).max(MIN_ESTABLISHED_RUNS) {
+        return false;
+    }
+    let fresh = share(before, to) <= CONFIRM_RARE_SHARE;
+    let established = share(before, from) >= CONFIRM_ESTABLISHED_SHARE;
+    let after_start = (detected + 1).min(values.len());
+    let after = &values[after_start..(after_start + window).min(values.len())];
+    if after.len() >= window {
+        let completed = window >= CONFIRM_DROP_WINDOW
+            && share(before, from) - share(after, from) >= CONFIRM_DROP;
+        (fresh || established || completed)
+            && share(after, from) <= CONFIRM_RARE_SHARE
+            && share(after, to) >= CONFIRM_MAJORITY_SHARE
+    } else {
+        let since = &values[onset..];
+        fresh
+            && share(since, from) <= CONFIRM_RARE_SHARE
+            && share(since, to) >= CONFIRM_MAJORITY_SHARE
+    }
+}
+
+/// Change points in one dimension's value sequence: `(onset, from, to)`,
+/// per the module's rule. Pure, so the rule is testable on its own.
+fn change_points(values: &[u32], window: usize) -> Vec<(usize, u32, u32)> {
+    let walk = dominance_walk(values, window);
+    let mut points: Vec<(usize, u32, u32)> = Vec::new();
+    let mut floor = 0;
+    for &switch in &walk.switches {
+        if confirmed(values, switch, window, floor) {
+            points.push((switch.0, switch.1, switch.2));
+            floor = switch.0;
+        }
+    }
     // A fresh value at the very end: every run since it appeared carries it,
-    // but there are not yet enough of them to fill half a window. A deploy an
-    // hour ago is exactly this, and it is the change an operator asks about.
-    if let (Some(incumbent), Some(&last)) = (current, values.last()) {
+    // it was rare before, but there are not yet enough of its runs to fill
+    // half a window. A deploy an hour ago is exactly this, and it is the
+    // change an operator asks about.
+    if let (Some(incumbent), Some(&last)) = (walk.current, values.last()) {
         let tail = values.iter().rev().take_while(|v| **v == last).count();
+        let onset = values.len() - tail;
+        let before = &values[onset.saturating_sub(window)..onset];
         if last != incumbent
             && tail >= MIN_ESTABLISHED_RUNS
-            && (current_runs >= MIN_ESTABLISHED_RUNS || !points.is_empty())
+            && (walk.current_runs >= MIN_ESTABLISHED_RUNS || !walk.switches.is_empty())
+            && share(before, last) <= CONFIRM_RARE_SHARE
         {
-            points.push((values.len() - tail, incumbent, last));
+            points.push((onset, incumbent, last));
         }
     }
     points
@@ -1558,22 +1992,14 @@ struct BehaviorPoint {
     shift: Shift,
 }
 
-/// Behaviour change points over a cohort's path sequence, per the module's
-/// rule: Jensen–Shannon peaks between adjacent windows, at or above the
-/// threshold, significant by permutation, and not within a window of a
-/// configuration change.
-fn behavior_points(
+/// Jensen–Shannon distance between adjacent windows of `paths` at every
+/// split, by sliding counts: `(split, distance)`.
+fn split_scores(
     paths: &[u32],
-    config_onsets: &[usize],
-    threshold: f64,
-    seed: u64,
+    window: usize,
     deadline: Option<Deadline>,
-) -> Result<Vec<BehaviorPoint>> {
+) -> Result<Vec<(usize, f64)>> {
     let n = paths.len();
-    let window = (n / 6).clamp(MIN_BEHAVIOR_WINDOW, MAX_BEHAVIOR_WINDOW);
-    if n < 2 * window {
-        return Ok(Vec::new());
-    }
     let mut left = stats::counts(&paths[..window]);
     let mut right = stats::counts(&paths[window..2 * window]);
     let bump = |counts: &mut HashMap<u32, usize>, key: u32, up: bool| {
@@ -1596,11 +2022,44 @@ fn behavior_points(
         }
         let distance = stats::js_distance(&left, window, &right, window).unwrap_or(0.0);
         scores.push((split, distance));
-        if split % 512 == 0 {
+        if (split - window) % 512 == 0 {
             Deadline::check(deadline, 0)?;
         }
     }
-    let mut candidates: Vec<(usize, f64)> = Vec::new();
+    Ok(scores)
+}
+
+/// Behaviour change points over a cohort's path sequence, per the module's
+/// rule — by **sample splitting**, because choosing the strongest of
+/// thousands of splits and then testing that same split as if it had been
+/// fixed in advance would call noise significant most of the time.
+///
+/// The even-indexed runs choose: each run of splits whose distance between
+/// adjacent windows reaches the threshold contributes its peak; peaks are
+/// taken strongest first, at least a window apart, none within a window of
+/// a configuration change, at most [`MAX_BEHAVIOR_CANDIDATES`]. The
+/// odd-indexed runs, which took no part in choosing, then test each
+/// candidate: their windows either side of it must reach the threshold too,
+/// and a seeded permutation test of those windows must give a p-value
+/// below [`BEHAVIOR_ALPHA`] after Bonferroni's correction for the number of
+/// candidates tested. Under the independence the module assumes, that holds
+/// the chance of reporting any behaviour change in a cohort whose paths
+/// never changed at 1%.
+fn behavior_points(
+    paths: &[u32],
+    config_onsets: &[usize],
+    threshold: f64,
+    seed: u64,
+    deadline: Option<Deadline>,
+) -> Result<Vec<BehaviorPoint>> {
+    let even: Vec<u32> = paths.iter().step_by(2).copied().collect();
+    let odd: Vec<u32> = paths.iter().skip(1).step_by(2).copied().collect();
+    let window = (even.len() / 6).clamp(MIN_BEHAVIOR_WINDOW, MAX_BEHAVIOR_WINDOW);
+    if even.len() < 2 * window {
+        return Ok(Vec::new());
+    }
+    let scores = split_scores(&even, window, deadline)?;
+    let mut peaks: Vec<(usize, f64)> = Vec::new();
     let mut index = 0;
     while index < scores.len() {
         if scores[index].1 < threshold {
@@ -1614,46 +2073,111 @@ fn behavior_points(
             }
             index += 1;
         }
-        candidates.push(best);
+        peaks.push(best);
     }
-    candidates.sort_by(|a, b| {
+    peaks.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.0.cmp(&b.0))
     });
-    // A cohort whose paths are noisy can cross the threshold in many short
-    // regions; only the strongest few are worth a permutation test each.
-    candidates.truncate(MAX_BEHAVIOR_CANDIDATES);
-    let mut accepted: Vec<BehaviorPoint> = Vec::new();
-    for (split, distance) in candidates {
-        if accepted
-            .iter()
-            .any(|point| point.onset.abs_diff(split) < window)
+    // Candidates, fixed before any test runs (which is what lets the
+    // correction count them): full-sequence onset, and the number of odd
+    // runs before it.
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
+    let mut kept: Vec<usize> = Vec::new();
+    for (split, _) in peaks {
+        if candidates.len() == MAX_BEHAVIOR_CANDIDATES {
+            break;
+        }
+        let onset = 2 * split;
+        if kept.iter().any(|other| other.abs_diff(split) < window)
             || config_onsets
                 .iter()
-                .any(|onset| onset.abs_diff(split) < window)
+                .any(|config| config.abs_diff(onset) < 2 * window)
         {
             continue;
         }
+        kept.push(split);
+        // Odd run j sits at 2j + 1, so `onset / 2` of them come before it.
+        let odd_before = onset / 2;
+        if odd_before >= window && odd_before + window <= odd.len() {
+            candidates.push((onset, odd_before));
+        }
+    }
+    let tested = candidates.len();
+    let mut accepted = Vec::new();
+    for (onset, odd_before) in candidates {
         Deadline::check(deadline, 0)?;
-        let p_value = stats::js_permutation_p(
-            &paths[split - window..split],
-            &paths[split..split + window],
-            distance,
+        let left = &odd[odd_before - window..odd_before];
+        let right = &odd[odd_before..odd_before + window];
+        let observed = stats::js_of(left, right).unwrap_or(0.0);
+        if observed < threshold {
+            continue;
+        }
+        let give_up = BEHAVIOR_ALPHA / tested as f64;
+        let p_value = stats::js_permutation_test(
+            left,
+            right,
+            observed,
             BEHAVIOR_PERMUTATIONS,
-            seed ^ (split as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            seed ^ (onset as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            Some(give_up),
         );
-        if p_value < BEHAVIOR_ALPHA {
+        let adjusted = (p_value * tested as f64).min(1.0);
+        if adjusted < BEHAVIOR_ALPHA {
             accepted.push(BehaviorPoint {
-                onset: split,
+                onset: locate(paths, onset, 2 * window),
                 shift: Shift {
-                    js_distance: distance,
-                    p_value,
+                    js_distance: observed,
+                    p_value: adjusted,
                 },
             });
         }
     }
     Ok(accepted)
+}
+
+/// Where exactly a behaviour change chosen at even run `onset` begins: the
+/// odd run just before it may already be on the new side. Of the two splits,
+/// the one whose adjacent windows (`width` runs each) differ more; the even
+/// split on a tie.
+fn locate(paths: &[u32], onset: usize, width: usize) -> usize {
+    let distance = |split: usize| {
+        let left = &paths[split.saturating_sub(width)..split];
+        let right = &paths[split..(split + width).min(paths.len())];
+        stats::js_of(left, right).unwrap_or(0.0)
+    };
+    if onset >= 2 && distance(onset - 1) > distance(onset) {
+        onset - 1
+    } else {
+        onset
+    }
+}
+
+/// Where a change's verdict basis ranks it: quality first.
+fn basis_rank(change: &Change) -> u8 {
+    match change.decided_by {
+        Some(Basis::Quality) => 0,
+        Some(Basis::Efficiency) => 1,
+        None => 2,
+    }
+}
+
+/// The ranking of the module docs: regressions first, then improvements,
+/// neutral and insufficient data; within each, changes a quality metric
+/// decided before those an efficiency metric decided; then larger effects,
+/// then newer, then by dimension.
+fn rank(a: &Change, b: &Change) -> std::cmp::Ordering {
+    a.verdict
+        .cmp(&b.verdict)
+        .then(basis_rank(a).cmp(&basis_rank(b)))
+        .then(
+            b.effect_size
+                .partial_cmp(&a.effect_size)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+        .then(b.at_ns.cmp(&a.at_ns))
+        .then(a.dimension.cmp(&b.dimension))
 }
 
 /// One cohort's analysis.
@@ -1689,7 +2213,14 @@ fn analyse(
                 context.display(dimension, now),
             );
         }
-        for (onset, from, to) in change_points(&values, window) {
+        let points = change_points(&values, window);
+        if points.len() > MAX_CHANGES_PER_DIMENSION {
+            // A configuration that changes this often is a per-run value
+            // with a slower rhythm, not a history of deploys.
+            volatile.push(dimension);
+            continue;
+        }
+        for (onset, from, to) in points {
             raw.push(RawChange {
                 dimension,
                 onset: sequence[onset].0,
@@ -1698,8 +2229,8 @@ fn analyse(
                 shift: None,
             });
         }
+        Deadline::check(deadline, 0)?;
     }
-    Deadline::check(deadline, 0)?;
     let paths: Vec<u32> = runs.iter().map(|run| run.path).collect();
     let config_onsets: Vec<usize> = raw.iter().map(|change| change.onset).collect();
     let seed = stable_hash(&[tenant, agent]);
@@ -1712,25 +2243,42 @@ fn analyse(
             shift: Some(point.shift),
         });
     }
+    raw.sort_by(|a, b| a.onset.cmp(&b.onset).then(a.dimension.cmp(&b.dimension)));
+    let onsets: Vec<usize> = raw.iter().map(|change| change.onset).collect();
 
-    let mut changes = Vec::with_capacity(raw.len());
-    for (position, change) in raw.iter().enumerate() {
+    let mut built: Vec<(Change, Vec<u32>, Vec<u32>)> = Vec::with_capacity(raw.len());
+    for position in 0..raw.len() {
         Deadline::check(deadline, 0)?;
-        changes.push(build_change(position, change, &raw, runs, context, seed));
+        built.push(build_change(position, &raw, &onsets, runs, context));
     }
-    changes.sort_by(|a, b| {
-        a.verdict
-            .cmp(&b.verdict)
-            .then(
-                b.effect_size
-                    .partial_cmp(&a.effect_size)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-            .then(b.at_ns.cmp(&a.at_ns))
-            .then(a.dimension.cmp(&b.dimension))
-    });
-    let truncated = changes.len() > MAX_CHANGES_PER_AGENT;
-    changes.truncate(MAX_CHANGES_PER_AGENT);
+    built.sort_by(|a, b| rank(&a.0, &b.0));
+    let truncated = built.len() > MAX_CHANGES_PER_AGENT;
+    built.truncate(MAX_CHANGES_PER_AGENT);
+    // The path shift across each reported configuration change: a fixed
+    // split (the change's own), so its permutation test needs no correction
+    // — and it is run only for the changes reported.
+    let mut changes = Vec::with_capacity(built.len());
+    for (mut change, left, right) in built {
+        if change.behavior_shift.is_none()
+            && left.len() >= MIN_RUNS_PER_SIDE
+            && right.len() >= MIN_RUNS_PER_SIDE
+        {
+            Deadline::check(deadline, 0)?;
+            let distance = stats::js_of(&left, &right).unwrap_or(0.0);
+            let p_value = stats::js_permutation_p(
+                &left,
+                &right,
+                distance,
+                SHIFT_PERMUTATIONS,
+                seed ^ change.at_ns.rotate_left(17) ^ change.dimension.index() as u64,
+            );
+            change.behavior_shift = Some(Shift {
+                js_distance: distance,
+                p_value,
+            });
+        }
+        changes.push(change);
+    }
     let summary = summarize(agent, runs.len(), &changes, &volatile);
     Ok(AgentChanges {
         agent: agent.to_owned(),
@@ -1743,44 +2291,39 @@ fn analyse(
         volatile,
         changes,
         truncated,
+        unnamed: false,
     })
 }
 
-/// One change point with its sides, deltas, verdict and detail.
+/// One change point with its sides, deltas, verdict and detail — and the
+/// two sides' paths (nearest the change, at most [`SHIFT_SIDE_RUNS`] each),
+/// for the shift test run on the changes that are reported. `raw` is sorted
+/// by onset, and `onsets` is its onsets.
 fn build_change(
     position: usize,
-    change: &RawChange,
     raw: &[RawChange],
+    onsets: &[usize],
     runs: &[&RunView],
     context: &Context<'_>,
-    seed: u64,
-) -> Change {
+) -> (Change, Vec<u32>, Vec<u32>) {
+    let change = &raw[position];
     let onset = change.onset;
-    let mut co_changes: Vec<Dimension> = raw
+    // Co-changes are neighbours in onset order.
+    let low = onsets.partition_point(|&other| other + CO_CHANGE_RUNS < onset);
+    let high = onsets.partition_point(|&other| other <= onset + CO_CHANGE_RUNS);
+    let mut co_changes: Vec<Dimension> = raw[low..high]
         .iter()
         .enumerate()
-        .filter(|(other, candidate)| {
-            *other != position
-                && candidate.dimension != change.dimension
-                && candidate.onset.abs_diff(onset) <= CO_CHANGE_RUNS
+        .filter(|(offset, candidate)| {
+            low + offset != position && candidate.dimension != change.dimension
         })
         .map(|(_, candidate)| candidate.dimension)
         .collect();
     co_changes.sort();
     co_changes.dedup();
     // Sides stop at the neighbouring change points, co-changes excepted.
-    let previous = raw
-        .iter()
-        .map(|candidate| candidate.onset)
-        .filter(|&other| other + CO_CHANGE_RUNS < onset)
-        .max()
-        .unwrap_or(0);
-    let next = raw
-        .iter()
-        .map(|candidate| candidate.onset)
-        .filter(|&other| other > onset + CO_CHANGE_RUNS)
-        .min()
-        .unwrap_or(runs.len());
+    let previous = if low > 0 { onsets[low - 1] } else { 0 };
+    let next = onsets.get(high).copied().unwrap_or(runs.len());
     let on_value = |run: &RunView, value: u32| match change.dimension {
         Dimension::Behavior => true,
         dimension => run.values[dimension.index()] == Some(value),
@@ -1801,35 +2344,18 @@ fn build_change(
     after.truncate(MAX_SIDE_RUNS);
 
     let (deltas, tests) = deltas(&before, &after, context);
-    let (verdict, effect_size, explanation) = verdict(&before, &after, &tests, &deltas);
-
-    let shift = change.shift.or_else(|| {
-        (before.len() >= MIN_RUNS_PER_SIDE && after.len() >= MIN_RUNS_PER_SIDE).then(|| {
-            let left: Vec<u32> = before
-                .iter()
-                .rev()
-                .take(SHIFT_SIDE_RUNS)
-                .map(|run| run.path)
-                .collect();
-            let right: Vec<u32> = after
-                .iter()
-                .take(SHIFT_SIDE_RUNS)
-                .map(|run| run.path)
-                .collect();
-            let distance = stats::js_of(&left, &right).unwrap_or(0.0);
-            let p_value = stats::js_permutation_p(
-                &left,
-                &right,
-                distance,
-                BEHAVIOR_PERMUTATIONS,
-                seed ^ (onset as u64).rotate_left(17) ^ change.dimension.index() as u64,
-            );
-            Shift {
-                js_distance: distance,
-                p_value,
-            }
-        })
-    });
+    let (verdict, decided_by, effect_size, explanation) = verdict(&before, &after, &tests, &deltas);
+    let left: Vec<u32> = before
+        .iter()
+        .rev()
+        .take(SHIFT_SIDE_RUNS)
+        .map(|run| run.path)
+        .collect();
+    let right: Vec<u32> = after
+        .iter()
+        .take(SHIFT_SIDE_RUNS)
+        .map(|run| run.path)
+        .collect();
 
     let (from, to, detail) = match change.dimension {
         Dimension::Behavior => {
@@ -1845,7 +2371,7 @@ fn build_change(
             )
         }
     };
-    Change {
+    let change = Change {
         at_ns: runs[onset].start_ns,
         dimension: change.dimension,
         from,
@@ -1854,10 +2380,11 @@ fn build_change(
         runs_after: after.len(),
         deltas,
         verdict,
+        decided_by,
         effect_size,
         explanation,
         co_changes,
-        behavior_shift: shift,
+        behavior_shift: change.shift,
         detail,
         example_runs: ExampleRuns {
             before: before
@@ -1872,7 +2399,8 @@ fn build_change(
                 .map(|run| run.run.clone())
                 .collect(),
         },
-    }
+    };
+    (change, left, right)
 }
 
 /// One metric's test, for the verdict.
@@ -2074,7 +2602,7 @@ fn mean_delta(
 
 fn tool_mix(before: &[&RunView], after: &[&RunView], context: &Context<'_>) -> Vec<ToolShare> {
     let totals = |side: &[&RunView]| {
-        let mut counts: HashMap<u32, u64> = HashMap::new();
+        let mut counts: HashMap<u64, u64> = HashMap::new();
         let mut total = 0u64;
         for run in side {
             for &(tool, count) in &run.tools {
@@ -2085,20 +2613,20 @@ fn tool_mix(before: &[&RunView], after: &[&RunView], context: &Context<'_>) -> V
         (counts, total)
     };
     let ((b, bt), (a, at)) = (totals(before), totals(after));
-    let share = |counts: &HashMap<u32, u64>, total: u64, tool: u32| {
+    let share = |counts: &HashMap<u64, u64>, total: u64, tool: u64| {
         if total == 0 {
             0.0
         } else {
             counts.get(&tool).copied().unwrap_or(0) as f64 / total as f64
         }
     };
-    let mut tools: Vec<u32> = b.keys().chain(a.keys()).copied().collect();
+    let mut tools: Vec<u64> = b.keys().chain(a.keys()).copied().collect();
     tools.sort_unstable();
     tools.dedup();
     let mut rows: Vec<ToolShare> = tools
         .into_iter()
         .map(|tool| ToolShare {
-            tool: context.tables.tools.name(tool).to_owned(),
+            tool: context.tool_name(tool),
             before_share: share(&b, bt, tool),
             after_share: share(&a, at, tool),
         })
@@ -2114,16 +2642,18 @@ fn tool_mix(before: &[&RunView], after: &[&RunView], context: &Context<'_>) -> V
     rows
 }
 
-/// The verdict, its effect size and its sentence.
+/// The verdict, the kind of metric that decided it, its effect size and its
+/// sentence.
 fn verdict(
     before: &[&RunView],
     after: &[&RunView],
     tests: &[MetricTest],
     deltas: &Deltas,
-) -> (Verdict, f64, String) {
+) -> (Verdict, Option<Basis>, f64, String) {
     if before.len() < MIN_RUNS_PER_SIDE || after.len() < MIN_RUNS_PER_SIDE {
         return (
             Verdict::InsufficientData,
+            None,
             0.0,
             format!(
                 "{} before and {} after; a verdict needs at least {MIN_RUNS_PER_SIDE} finished \
@@ -2145,28 +2675,45 @@ fn verdict(
     };
     let (quality_worse, quality_better) = (chosen(true, true), chosen(true, false));
     let (efficiency_worse, efficiency_better) = (chosen(false, true), chosen(false, false));
-    let (verdict, deciding, others): (Verdict, Vec<&MetricTest>, Vec<&MetricTest>) =
-        if !quality_worse.is_empty() {
-            let mut others = quality_better.clone();
-            others.extend(efficiency_better.iter().copied());
-            (Verdict::Regression, quality_worse, others)
-        } else if !quality_better.is_empty() {
-            (
-                Verdict::Improvement,
-                quality_better,
-                efficiency_worse.clone(),
-            )
-        } else if !efficiency_worse.is_empty() {
-            (
-                Verdict::Regression,
-                efficiency_worse,
-                efficiency_better.clone(),
-            )
-        } else if !efficiency_better.is_empty() {
-            (Verdict::Improvement, efficiency_better, Vec::new())
-        } else {
-            (Verdict::Neutral, Vec::new(), Vec::new())
-        };
+    type Decision<'t> = (
+        Verdict,
+        Option<Basis>,
+        Vec<&'t MetricTest>,
+        Vec<&'t MetricTest>,
+    );
+    let (verdict, decided_by, deciding, others): Decision<'_> = if !quality_worse.is_empty() {
+        let mut others = quality_better.clone();
+        others.extend(efficiency_better.iter().copied());
+        (
+            Verdict::Regression,
+            Some(Basis::Quality),
+            quality_worse,
+            others,
+        )
+    } else if !quality_better.is_empty() {
+        (
+            Verdict::Improvement,
+            Some(Basis::Quality),
+            quality_better,
+            efficiency_worse.clone(),
+        )
+    } else if !efficiency_worse.is_empty() {
+        (
+            Verdict::Regression,
+            Some(Basis::Efficiency),
+            efficiency_worse,
+            efficiency_better.clone(),
+        )
+    } else if !efficiency_better.is_empty() {
+        (
+            Verdict::Improvement,
+            Some(Basis::Efficiency),
+            efficiency_better,
+            Vec::new(),
+        )
+    } else {
+        (Verdict::Neutral, None, Vec::new(), Vec::new())
+    };
     let effect = deciding
         .iter()
         .map(|test| test.effect.abs())
@@ -2205,7 +2752,7 @@ fn verdict(
             text
         }
     };
-    (verdict, effect, explanation)
+    (verdict, decided_by, effect, explanation)
 }
 
 /// The from/to paths of a behaviour change and the paths whose share moved.
@@ -2453,7 +3000,8 @@ pub fn handles(path: &str) -> bool {
 /// Parameters: `agent`, `environment`, `since` and `until` (Unix ns;
 /// default the thirty days up to now), `behavior_threshold` (`(0, 1]`),
 /// `run` (place one run on its agent's timeline; `404` when it is not among
-/// the window's agent runs), and `tenant` (an unbound caller's scope; absent
+/// the window's agent runs, `400` when `agent` or `environment` excludes it
+/// or two tenants share its id), and `tenant` (an unbound caller's scope; absent
 /// is every tenant). Unknown or repeated parameters are `400`; a bound
 /// caller naming another tenant is `403 {"error", "required": "unbound"}`.
 pub fn serve(
@@ -3300,7 +3848,7 @@ mod tests {
     }
 
     #[test]
-    fn a_run_whose_step_arrives_after_it_was_let_go_is_dropped_not_shortened() {
+    fn a_run_whose_root_is_read_long_before_its_step_is_read_whole() {
         let fixture = TempStore::open("radar-late-step", crate::Config::default());
         let store = fixture.store();
         // Sealed first, so the fold reads it first: each agent run's workflow
@@ -3346,21 +3894,27 @@ mod tests {
             ..query()
         };
         let report = store.changes(None, &capped, NOW).expect("analyses");
-        // Every agent run's wrapper was let go before its step was seen: the
-        // runs are dropped whole and the cut says so, rather than analysed
-        // as runs that began at their model call.
-        assert!(report.truncated);
-        assert_eq!(report.covered_since_ns, Some(BASE + 9 * MINUTE + 1));
-        assert_eq!(report.runs_scanned, 0);
-        assert!(report.agents.is_empty());
-        // With room for every run, all ten are read whole.
-        let report = store.changes(None, &query(), NOW).expect("analyses");
-        assert!(!report.truncated);
+        // Ten agent runs and a cap of ten: the thirty request traces are no
+        // agent runs and cost the cap nothing, and each run's wrapper, read
+        // long before its model call, still starts it.
+        assert!(!report.truncated, "{report:#?}");
+        assert_eq!(report.covered_since_ns, None);
         assert_eq!(report.runs_scanned, 10);
         assert_eq!(
             report.agents[0].first_run_ns, BASE,
             "the wrapper starts the run"
         );
+        // One fewer than the runs: exactly the oldest is let go, by its
+        // model call's start.
+        let tight = ChangeQuery {
+            max_runs: 9,
+            ..query()
+        };
+        let report = store.changes(None, &tight, NOW).expect("analyses");
+        assert!(report.truncated);
+        assert_eq!(report.covered_since_ns, Some(BASE + 101));
+        assert_eq!(report.runs_scanned, 9);
+        assert_eq!(report.agents[0].first_run_ns, BASE + MINUTE);
     }
 
     #[test]
@@ -3580,6 +4134,589 @@ mod tests {
         }
     }
 
+    /// xorshift64*, for seeded synthetic sequences.
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        /// An index drawn from `weights` (which sum to 1).
+        fn pick(&mut self, weights: &[f64]) -> u32 {
+            let draw = (self.next() >> 11) as f64 / (1u64 << 53) as f64;
+            let mut total = 0.0;
+            for (index, weight) in weights.iter().enumerate() {
+                total += weight;
+                if draw < total {
+                    return index as u32;
+                }
+            }
+            weights.len() as u32 - 1
+        }
+    }
+
+    /// One run of one llm step (with `model`) and `tools` tool steps, every
+    /// span 15 ns long, for the agent `service`.
+    fn simple_run(
+        service: &str,
+        id: &str,
+        start: u64,
+        model: &str,
+        prompt: &str,
+        tools: usize,
+        failed: bool,
+    ) -> Vec<Span> {
+        let span = |span_id: String, offset: u64, attributes: Value| Span {
+            trace_id: format!("trace-{id}"),
+            span_id,
+            tenant: String::new(),
+            parent_span_id: None,
+            name: "step".to_owned(),
+            start_time_ns: start + offset,
+            end_time_ns: start + offset + 15,
+            status: "ok".to_owned(),
+            service: service.to_owned(),
+            attributes: attributes.as_object().cloned().unwrap_or_default(),
+            events: Vec::new(),
+            links: Vec::new(),
+            extra: Map::new(),
+        };
+        let mut spans = vec![span(
+            "a-llm".to_owned(),
+            0,
+            json!({
+                "session.id": id,
+                "gen_ai.operation.name": "chat",
+                "gen_ai.request.model": model,
+                "gen_ai.response.model": model,
+                "gen_ai.input.messages": json!([
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": "hi"}
+                ]).to_string(),
+            }),
+        )];
+        for index in 0..tools {
+            spans.push(span(
+                format!("b-tool-{index}"),
+                0,
+                json!({"session.id": id, "gen_ai.operation.name": "execute_tool",
+                       "gen_ai.tool.name": "lookup"}),
+            ));
+        }
+        if failed {
+            spans[0].status = "error".to_owned();
+        }
+        spans
+    }
+
+    #[test]
+    fn a_stable_model_split_with_constant_runs_reports_nothing() {
+        // A router sends each run to one of two models at random, forever;
+        // every run is exactly two steps and 15 ns long. Nothing changed, so
+        // nothing is a change, and constant metrics are no regression.
+        let fixture = TempStore::open("radar-stable-split", crate::Config::default());
+        let store = fixture.store();
+        let mut seeded = Seeded(0x5eed_0001);
+        let mut spans = Vec::new();
+        for index in 0..800u64 {
+            let model = ["model-a", "model-b"][seeded.pick(&[0.5, 0.5]) as usize];
+            spans.extend(simple_run(
+                "router-bot",
+                &format!("run-{index:04}"),
+                BASE + index * MINUTE,
+                model,
+                "Route the request.",
+                1,
+                false,
+            ));
+        }
+        store.ingest_batch(spans).expect("ingests");
+        let report = store.changes(None, &query(), NOW).expect("analyses");
+        let agent = &report.agents[0];
+        assert_eq!(agent.runs, 800);
+        assert!(agent.changes.is_empty(), "{:#?}", agent.changes);
+    }
+
+    #[test]
+    fn a_quality_regression_outranks_a_one_step_efficiency_change() {
+        // 1.0 → 1.1 took the error rate from 5% to 40%; 1.1 → 1.2 added one
+        // tool call to every run and nothing else. The quality regression is
+        // the headline.
+        let fixture = TempStore::open("radar-rank", crate::Config::default());
+        let store = fixture.store();
+        let mut spans = Vec::new();
+        for index in 0..180u64 {
+            let (version, tools, failed): (&str, &[&str], bool) = match index {
+                0..=59 => ("1.0", &["search"], index % 20 == 0),
+                60..=119 => ("1.1", &["search"], index % 5 < 2),
+                _ => ("1.2", &["search", "search"], index % 5 < 2),
+            };
+            spans.extend(
+                RunSpec {
+                    tenant: "",
+                    id: format!("run-{index:03}"),
+                    start: BASE + index * MINUTE,
+                    prompt: "Prompt.",
+                    version,
+                    tools,
+                    failed,
+                    environment: None,
+                }
+                .spans(),
+            );
+        }
+        store.ingest_batch(spans).expect("ingests");
+        let report = store.changes(None, &query(), NOW).expect("analyses");
+        let agent = &report.agents[0];
+        let top = &agent.changes[0];
+        assert_eq!(top.dimension, Dimension::ServiceVersion, "{top:#?}");
+        assert_eq!((top.from.as_str(), top.to.as_str()), ("1.0", "1.1"));
+        assert_eq!(top.verdict, Verdict::Regression);
+        let efficiency = agent
+            .changes
+            .iter()
+            .find(|change| change.to == "1.2")
+            .expect("the extra step is a change too");
+        assert_eq!(efficiency.verdict, Verdict::Regression, "{efficiency:#?}");
+        assert!(efficiency.effect_size <= stats::MAX_COHENS_D);
+        assert!(
+            agent.summary.contains("(1.0 → 1.1)"),
+            "the headline is the quality regression: {}",
+            agent.summary
+        );
+    }
+
+    #[test]
+    fn agent_runs_behind_workflow_roots_survive_the_run_cap() {
+        // Every run's first span is an OpenLLMetry workflow root (not a
+        // step), sealed and read before any of the runs' model calls.
+        let fixture = TempStore::open("radar-roots", crate::Config::default());
+        let store = fixture.store();
+        let roots: Vec<Span> = (0..200u64)
+            .map(|index| {
+                let mut span = plain_span(
+                    &format!("agent-{index}"),
+                    BASE + index * MINUTE,
+                    json!({"session.id": format!("agent-{index}"),
+                           "traceloop.span.kind": "workflow"}),
+                );
+                span.service = "support-bot".to_owned();
+                span
+            })
+            .collect();
+        store.ingest_batch(roots).expect("ingests");
+        store.flush().expect("seals");
+        let steps: Vec<Span> = (0..200u64)
+            .map(|index| {
+                let mut span = plain_span(
+                    &format!("agent-{index}"),
+                    BASE + index * MINUTE + 100,
+                    json!({"session.id": format!("agent-{index}"),
+                           "gen_ai.operation.name": "chat",
+                           "gen_ai.request.model": "m"}),
+                );
+                span.span_id = format!("agent-{index}-llm");
+                span
+            })
+            .collect();
+        store.ingest_batch(steps).expect("ingests");
+        let capped = ChangeQuery {
+            max_runs: 100,
+            ..query()
+        };
+        let report = store.changes(None, &capped, NOW).expect("analyses");
+        assert!(report.truncated);
+        assert_eq!(report.runs_scanned, 100, "the newest hundred, whole");
+        assert_eq!(report.covered_since_ns, Some(BASE + 99 * MINUTE + 101));
+        assert_eq!(
+            report.agents[0].first_run_ns,
+            BASE + 100 * MINUTE,
+            "each run starts at its root"
+        );
+    }
+
+    #[test]
+    fn a_noisy_agent_does_not_hide_another_agents_prompt_edit() {
+        // noisy-bot's prompt differs on every run (too varied to search);
+        // it is read first and has more distinct prompts than one table of
+        // names holds. support-bot's prompt edit must still be found, diffed.
+        let fixture = TempStore::open("radar-noisy", crate::Config::default());
+        let store = fixture.store();
+        let word = |mut index: u64| {
+            let mut text = String::new();
+            for _ in 0..4 {
+                text.push((b'a' + (index % 26) as u8) as char);
+                index /= 26;
+            }
+            text
+        };
+        let noisy: Vec<Span> = (0..2_100u64)
+            .flat_map(|index| {
+                simple_run(
+                    "noisy-bot",
+                    &format!("noisy-{index:04}"),
+                    BASE + index * 1_000_000,
+                    "m",
+                    &format!("Answer about {}.", word(index)),
+                    0,
+                    false,
+                )
+            })
+            .collect();
+        store.ingest_batch(noisy).expect("ingests");
+        store.flush().expect("seals");
+        two_eras(
+            store,
+            "",
+            ("Always escalate refunds.", "1.0", &["search"]),
+            ("Never escalate refunds.", "1.0", &["search"]),
+            |index| index % 20 == 0,
+            |index| index % 5 < 2,
+        );
+        let report = store.changes(None, &query(), NOW).expect("analyses");
+        let noisy = report
+            .agents
+            .iter()
+            .find(|agent| agent.agent == "noisy-bot")
+            .expect("noisy-bot");
+        assert_eq!(noisy.volatile, [Dimension::SystemPrompt]);
+        let support = report
+            .agents
+            .iter()
+            .find(|agent| agent.agent == "support-bot")
+            .expect("support-bot");
+        let prompt = support
+            .changes
+            .iter()
+            .find(|change| change.dimension == Dimension::SystemPrompt)
+            .expect("the edit is found");
+        assert_eq!(prompt.verdict, Verdict::Regression);
+        let diff = &prompt.detail.as_ref().expect("diffed")["diff"];
+        assert_eq!(diff["before"], "Always");
+        assert_eq!(diff["after"], "Never");
+        assert!(
+            !support.unnamed,
+            "support-bot keeps its names: {support:#?}"
+        );
+    }
+
+    #[test]
+    fn stationary_paths_are_not_a_behaviour_change() {
+        // Runs drawn independently from one path distribution, forever: any
+        // behaviour change found here is a false alarm. The rate is held at
+        // 1% per cohort, so at most one of these may alarm.
+        let mut seeded = Seeded(0x5eed_0002);
+        let skewed = [0.4, 0.2, 0.1, 0.1, 0.05, 0.05, 0.05, 0.05];
+        let even = [0.05; 20];
+        let mut alarms = 0;
+        for (cohorts, runs, weights) in [(12, 600, &skewed[..]), (4, 2_000, &even[..])] {
+            for cohort in 0..cohorts {
+                let paths: Vec<u32> = (0..runs).map(|_| seeded.pick(weights)).collect();
+                let found =
+                    behavior_points(&paths, &[], DEFAULT_BEHAVIOR_THRESHOLD, cohort as u64, None)
+                        .expect("no deadline");
+                alarms += usize::from(!found.is_empty());
+            }
+        }
+        assert!(alarms <= 1, "{alarms} of 16 stationary cohorts alarmed");
+    }
+
+    #[test]
+    fn random_mixtures_are_not_change_points() {
+        // An A/B split, a 70/30 split and a three-way split, drawn at random
+        // per run, forever: none is a configuration change.
+        let mut seeded = Seeded(0x5eed_0003);
+        let mut alarmed = Vec::new();
+        for (sequences, runs, weights) in [
+            (5, 1_000, &[0.5, 0.5][..]),
+            (5, 1_000, &[0.7, 0.3][..]),
+            (3, 2_000, &[0.34, 0.33, 0.33][..]),
+            (3, 5_000, &[0.5, 0.5][..]),
+        ] {
+            for _ in 0..sequences {
+                let values: Vec<u32> = (0..runs).map(|_| seeded.pick(weights)).collect();
+                let points = change_points(&values, detection_window(runs));
+                if !points.is_empty() {
+                    alarmed.push((runs, points));
+                }
+            }
+        }
+        assert!(alarmed.len() <= 1, "{alarmed:?}");
+    }
+
+    #[test]
+    fn an_environment_past_the_256th_is_still_filterable() {
+        let fixture = TempStore::open("radar-environments", crate::Config::default());
+        let store = fixture.store();
+        let mut spans = Vec::new();
+        for index in 0..300u64 {
+            spans.extend(
+                RunSpec {
+                    tenant: "",
+                    id: format!("run-{index:03}"),
+                    start: BASE + index * MINUTE,
+                    prompt: "Prompt.",
+                    version: "1.0",
+                    tools: &["search"],
+                    failed: false,
+                    environment: Some(&format!("pr-{index:03}")),
+                }
+                .spans(),
+            );
+        }
+        store.ingest_batch(spans).expect("ingests");
+        let preview = ChangeQuery {
+            environment: Some("pr-299".to_owned()),
+            ..query()
+        };
+        let report = store.changes(None, &preview, NOW).expect("analyses");
+        assert_eq!(report.agents.len(), 1, "{report:#?}");
+        assert_eq!(report.agents[0].runs, 1);
+    }
+
+    #[test]
+    fn runs_cut_off_by_a_past_until_are_not_compared_as_finished() {
+        let fixture = TempStore::open("radar-until", crate::Config::default());
+        let store = fixture.store();
+        two_eras(
+            store,
+            "",
+            ("Prompt.", "1.0", &["search"]),
+            ("Prompt.", "2.0", &["search"]),
+            |_| false,
+            |_| false,
+        );
+        // The window ends just after the last run's spans, a month before
+        // now: the runs ending within the idle window before `until` may
+        // have gone on after it.
+        let cut = ChangeQuery {
+            until_ns: BASE + 119 * MINUTE + 600,
+            ..query()
+        };
+        let report = store.changes(None, &cut, NOW).expect("analyses");
+        let version = find(&report, Dimension::ServiceVersion).expect("found");
+        assert_eq!(version.runs_before, 60);
+        assert!(version.runs_after < 60, "{}", version.runs_after);
+        assert!(version.runs_after >= 40, "{}", version.runs_after);
+    }
+
+    #[test]
+    fn a_named_run_its_filters_exclude_is_refused_by_name() {
+        let fixture = TempStore::open("radar-run-filtered", crate::Config::default());
+        let store = fixture.store();
+        two_eras(
+            store,
+            "",
+            ("Prompt.", "1.0", &["search"]),
+            ("Prompt.", "2.0", &["search"]),
+            |_| false,
+            |_| false,
+        );
+        let excluded = ChangeQuery {
+            run: Some("-run-061".to_owned()),
+            agent: Some("billing-bot".to_owned()),
+            ..query()
+        };
+        match store.changes(None, &excluded, NOW) {
+            Err(Error::Invalid(reason)) => {
+                assert!(reason.contains("agent filter"), "{reason}");
+                // The refusal names only what the caller sent: an error is
+                // not framed as telemetry, so stored text stays out of it.
+                assert!(!reason.contains("support-bot"), "{reason}");
+            }
+            other => panic!("expected a refusal naming the filter, got {other:?}"),
+        }
+        let reply = serve(
+            store,
+            "GET",
+            ROUTE,
+            &format!("run=-run-061&environment=prod&since={}", BASE - MINUTE),
+            None,
+            NOW,
+        );
+        assert_eq!(reply.status, 400, "{:?}", reply.body);
+        assert!(
+            reply.body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("environment")),
+            "{:?}",
+            reply.body
+        );
+    }
+
+    #[test]
+    fn the_first_pass_remembers_no_run_without_a_step_and_at_most_twice_the_cap() {
+        let mut selection = Selection::new(10);
+        for index in 0..20_000u64 {
+            selection.visit(&plain_span(
+                &format!("plain-{index}"),
+                BASE + index,
+                json!({}),
+            ));
+        }
+        assert!(selection.firsts.is_empty(), "request traces cost nothing");
+        for index in 0..100u64 {
+            selection.visit(&plain_span(
+                &format!("agent-{index}"),
+                BASE + index * MINUTE,
+                json!({"gen_ai.operation.name": "chat", "gen_ai.request.model": "m"}),
+            ));
+            assert!(selection.firsts.len() <= 2 * 10 + 1);
+        }
+        let (held, mark) = selection.finish();
+        assert_eq!(held[""].len(), 10);
+        assert_eq!(mark, Some(BASE + 89 * MINUTE));
+        assert!(held[""].contains("trace:agent-99") && !held[""].contains("trace:agent-89"));
+        // A held run whose earlier step turns up at or before the mark
+        // started there: it is let go, not shortened.
+        let step = |trace: &str, start: u64| {
+            plain_span(
+                trace,
+                start,
+                json!({"gen_ai.operation.name": "chat", "gen_ai.request.model": "m"}),
+            )
+        };
+        let mut selection = Selection::new(1);
+        for (trace, start) in [("a", 10), ("b", 20), ("c", 30)] {
+            selection.visit(&step(trace, start));
+        }
+        assert_eq!(selection.watermark, Some(20));
+        assert_eq!(selection.firsts.len(), 1, "c is held");
+        let mut early = step("c", 5);
+        early.span_id = "c-early".to_owned();
+        selection.visit(&early);
+        let (held, mark) = selection.finish();
+        assert!(held.is_empty(), "{held:?}");
+        assert_eq!(mark, Some(20));
+    }
+
+    #[test]
+    fn what_a_run_holds_is_clipped_whatever_its_spans_carry() {
+        // Every string a span could plant in an accumulator, 100 KB long.
+        let huge = "x".repeat(100_000);
+        let mut span = plain_span(
+            &huge,
+            BASE,
+            json!({
+                "session.id": "r",
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.name": huge,
+                "gen_ai.agent.name": huge,
+                semconv::OUTCOME_KEYS[0]: huge,
+                "service.version": huge,
+                "deployment.environment.name": huge,
+            }),
+        );
+        span.span_id.clone_from(&huge);
+        span.service.clone_from(&huge);
+        let mut tables = Tables::new();
+        let mut acc = RunAcc::default();
+        acc.absorb(&span, &semconv::facts(&span.attributes), &mut tables, 0);
+        assert_eq!(acc.steps, 1);
+        for key in [&acc.earliest, &acc.first_step, &acc.last] {
+            let (_, trace, id) = key.as_ref().expect("kept");
+            assert!(trace.len() <= MAX_ID_BYTES && id.len() <= MAX_ID_BYTES);
+        }
+        assert!(acc.earliest_service.len() <= MAX_NAME_BYTES);
+        assert!(acc
+            .first_step_agent
+            .as_ref()
+            .is_some_and(|agent| agent.len() <= MAX_NAME_BYTES));
+        let (_, declared) = acc.declared.as_ref().expect("declared");
+        assert!(declared.len() <= MAX_OUTCOME_BYTES);
+        for table in [&tables.tokens, &tables.tools] {
+            assert!(table
+                .names
+                .values()
+                .all(|name| name.len() <= MAX_NAME_BYTES));
+        }
+        let versions = &tables.values[Dimension::ServiceVersion.index()];
+        assert!(versions
+            .names
+            .values()
+            .all(|name| name.chars().count() <= fingerprint::MAX_VALUE_CHARS + 1));
+        // A long run id is held as a bounded key that still tells runs apart.
+        let one = run_key(format!("{huge}-1"));
+        let two = run_key(format!("{huge}-2"));
+        assert!(one.len() <= MAX_RUN_ID_BYTES && two.len() <= MAX_RUN_ID_BYTES);
+        assert_ne!(one, two);
+        assert_eq!(run_key("short".to_owned()), "short");
+    }
+
+    #[test]
+    fn the_read_stops_extracting_once_its_deadline_has_passed() {
+        let fixture = TempStore::open("radar-read-expiry", crate::Config::default());
+        let expired = Some(Deadline::capped(None, std::time::Duration::ZERO));
+        let held: HashMap<String, HashSet<String>> =
+            [(String::new(), ["r".to_owned()].into_iter().collect())]
+                .into_iter()
+                .collect();
+        let mut fold = Accumulate::new(held, expired);
+        for index in 0..200u64 {
+            let mut span = plain_span(
+                "t",
+                BASE + index,
+                json!({"session.id": "r", "gen_ai.operation.name": "chat",
+                       "gen_ai.request.model": "m"}),
+            );
+            span.span_id = format!("s{index}");
+            fold.visit(fixture.store(), &span);
+        }
+        assert!(fold.expired);
+        let acc = &fold.runs[""].1["r"];
+        assert_eq!(
+            acc.steps as usize, EXTRACTION_CHECK_INTERVAL,
+            "nothing is extracted after the check that found the deadline passed"
+        );
+    }
+
+    #[test]
+    fn the_analysis_honours_the_deadline_after_a_read_that_did() {
+        // The read finishes inside its budget; the analysis is handed one
+        // already spent, and every stage of it refuses on its own.
+        let fixture = TempStore::open("radar-analysis-deadline", crate::Config::default());
+        let store = fixture.store();
+        two_eras(
+            store,
+            "",
+            ("Use search.", "1.0", &["search"]),
+            ("Use browse.", "2.0", &["browse", "browse"]),
+            |_| false,
+            |index| index % 5 < 2,
+        );
+        let window = store
+            .read_window(None, &query(), NOW, None)
+            .expect("reads within budget");
+        let spent = Some(Deadline::capped(None, std::time::Duration::ZERO));
+        assert!(analyse_window(&window, &query(), None).is_ok());
+        assert!(matches!(
+            analyse_window(&window, &query(), spent),
+            Err(Error::DeadlineExceeded(_))
+        ));
+        let runs: Vec<&RunView> = window.views.iter().collect();
+        let context = Context {
+            tables: &window.tables,
+            combos: &window.combos,
+            paths: &window.paths,
+            threshold: DEFAULT_BEHAVIOR_THRESHOLD,
+            tenant: 0,
+            unnamed: Cell::new(false),
+        };
+        assert!(matches!(
+            analyse("", "support-bot", &runs, &context, spent),
+            Err(Error::DeadlineExceeded(_))
+        ));
+        let paths: Vec<u32> = (0..600).map(|index| (index % 3) as u32).collect();
+        assert!(matches!(
+            behavior_points(&paths, &[], DEFAULT_BEHAVIOR_THRESHOLD, 1, spent),
+            Err(Error::DeadlineExceeded(_))
+        ));
+    }
+
     #[test]
     fn change_points_follow_dominance_not_appearance() {
         let ones = |n: usize, value: u32| vec![value; n];
@@ -3623,6 +4760,15 @@ mod tests {
             change_points(&concat(&[ones(60, 0), ones(4, 1), ones(1, 0)]), 20).is_empty(),
             "not if the last run went back"
         );
+        // Nor when the value was common all along: three in a row at the end
+        // of an even split is chance, not a deploy.
+        let mut split_tail: Vec<u32> = (0..200).map(|i| i % 2).collect();
+        split_tail.extend([0, 1, 1, 1]);
+        assert!(
+            change_points(&split_tail, 50).is_empty(),
+            "{:?}",
+            change_points(&split_tail, 50)
+        );
         // A rollout that ramps up is placed where the new value took over.
         let mut ramp = ones(40, 0);
         ramp.extend((0..20).map(|i| u32::from(i % 4 == 0)));
@@ -3630,15 +4776,47 @@ mod tests {
         let points = change_points(&ramp, 12);
         assert_eq!(points.len(), 1, "{points:?}");
         assert!((40..=62).contains(&points[0].0), "{points:?}");
+        // A rollout that held a half-and-half stage for a while is a change
+        // when it completes: the old value's share fell from half to none.
+        let mut staged = ones(200, 0);
+        staged.extend((0..100).map(|i| i % 2));
+        staged.extend(ones(200, 1));
+        let points = change_points(&staged, 50);
+        assert_eq!(points.len(), 1, "{points:?}");
+        assert_eq!((points[0].1, points[0].2), (0, 1));
+        assert!((200..=300).contains(&points[0].0), "{points:?}");
+        // Once the new value holds, a window's mixture of both is not
+        // enough on its own: a stage too short to judge is no completion.
+        let mut short = ones(30, 0);
+        short.extend((0..10).map(|i| i % 2));
+        short.extend(ones(30, 1));
+        assert_eq!(change_points(&short, 8).len(), 1, "a takeover all the same");
+        // A mixture that was always there, then a deploy of a third value.
+        let mixed: Vec<u32> = (0..300).map(|i| i % 2).collect();
+        let mut deployed = mixed.clone();
+        deployed.extend(ones(200, 2));
+        let points = change_points(&deployed, 50);
+        assert_eq!(points.len(), 1, "{points:?}");
+        assert_eq!((points[0].0, points[0].2), (300, 2));
+        // A deploy that left more than a fifth of runs on the old value is
+        // a mixture, not a change: the radar reports takeovers.
+        let mut lingering = ones(200, 0);
+        lingering.extend((0..200).map(|i| u32::from(i % 3 != 0)));
+        assert!(change_points(&lingering, 50).is_empty());
     }
 
     #[test]
     fn top_paths_bucket_repeats_and_mark_continuations() {
-        let mut tokens = Interner::new(16);
-        let llm = tokens.intern("llm:m");
-        let a = tokens.intern("tool:a");
-        let b = tokens.intern("tool:b");
-        let run = |sequence: &[u32], steps: u32| RunAcc {
+        let mut tokens = NameTable::new(16, 16);
+        let named = |tokens: &mut NameTable, name: &str| {
+            let id = digest(name);
+            tokens.record(0, id, 0, name, None);
+            id
+        };
+        let llm = named(&mut tokens, "llm:m");
+        let a = named(&mut tokens, "tool:a");
+        let b = named(&mut tokens, "tool:b");
+        let run = |sequence: &[u64], steps: u32| RunAcc {
             step_keys: sequence
                 .iter()
                 .enumerate()
@@ -3647,21 +4825,33 @@ mod tests {
             steps,
             ..RunAcc::default()
         };
+        let path = |acc: &RunAcc| top_path(acc, &tokens, 0);
         assert_eq!(
-            top_path(&run(&[llm, a, a, a, llm, b, llm], 7), &tokens),
-            "llm:m > tool:a×3-5 > llm:m > tool:b > …"
+            path(&run(&[llm, a, a, a, llm, b, llm], 7)),
+            ("llm:m > tool:a×3-5 > llm:m > tool:b > …".to_owned(), false)
         );
         assert_eq!(
-            top_path(&run(&[llm, a, a, llm], 4), &tokens),
+            path(&run(&[llm, a, a, llm], 4)).0,
             "llm:m > tool:a×2 > llm:m"
         );
-        assert_eq!(top_path(&run(&[a; 7], 7), &tokens), "tool:a×6+");
+        assert_eq!(path(&run(&[a; 7], 7)).0, "tool:a×6+");
         assert_eq!(
-            top_path(&run(&[llm, llm], 90), &tokens),
+            path(&run(&[llm, llm], 90)).0,
             "llm:m×2 > …",
             "steps beyond those kept are a continuation"
         );
-        assert_eq!(top_path(&run(&[], 0), &tokens), "(no steps)");
+        assert_eq!(path(&run(&[], 0)).0, "(no steps)");
+        // A token without a name is shown by digest, and says so; another
+        // tenant's names are not this tenant's.
+        let stranger = digest("tool:never-named");
+        assert_eq!(
+            path(&run(&[llm, stranger], 2)),
+            (format!("llm:m > #{stranger:016x}"), true)
+        );
+        assert!(
+            top_path(&run(&[llm], 1), &tokens, 1).1,
+            "tenant 1 has no names"
+        );
     }
 
     #[test]

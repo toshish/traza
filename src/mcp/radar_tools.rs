@@ -59,6 +59,13 @@ pub(super) fn definitions() -> Vec<Tool> {
                     "type": "string",
                     "description": "Only runs reporting this deployment.environment.",
                 },
+                "tenant": {
+                    "type": "string",
+                    "description": "For an unbound credential: only this tenant's runs (a \
+                                    run id two tenants share needs it). Default: every \
+                                    tenant. A bound credential reads its own tenant and may \
+                                    only name that one.",
+                },
                 "since": time_property("Window start. Default 30 days ago."),
                 "until": time_property("Window end. Default now."),
                 "limit": {
@@ -92,9 +99,36 @@ pub(super) fn call(
 ) -> ToolResult {
     known_keys(
         arguments,
-        &["agent", "run_id", "environment", "since", "until", "limit"],
+        &[
+            "agent",
+            "run_id",
+            "environment",
+            "since",
+            "until",
+            "limit",
+            "tenant",
+        ],
         "what_changed",
     )?;
+    // The check_run_guard rule: a bound credential reads its own tenant and
+    // may only name that one; an unbound one may narrow to any.
+    let scope = match (context.scope(), optional_string(arguments, "tenant")?) {
+        (Some(bound), Some(named)) if named != bound => {
+            return Err(ToolError(
+                "This credential is bound to a different tenant; omit 'tenant'.".to_owned(),
+            ))
+        }
+        (Some(bound), _) => Some(bound.to_owned()),
+        (None, Some(named)) => {
+            if !named.is_empty() && !crate::valid_tenant(&named) {
+                return Err(ToolError(
+                    "'tenant' must be lowercase [a-z0-9][a-z0-9._-], at most 64 bytes.".to_owned(),
+                ));
+            }
+            Some(named)
+        }
+        (None, None) => None,
+    };
     let mut query = ChangeQuery::recent(context.now_ns);
     if let Some(until) = optional_time(arguments, "until", context)? {
         query.until_ns = until;
@@ -112,7 +146,7 @@ pub(super) fn call(
         .clamp(1, MAX_CHANGES);
     let report = server
         .store
-        .changes(context.scope(), &query, context.now_ns)
+        .changes(scope.as_deref(), &query, context.now_ns)
         .map_err(|error| match error {
             crate::Error::DeadlineExceeded(_) => ToolError(
                 "The change analysis exhausted the server's compute budget before finishing, \
@@ -149,12 +183,12 @@ pub(super) fn call(
         count(regressions as u64, "regression"),
         match report.covered_since_ns {
             Some(mark) => format!(
-                " TRUNCATED: the window held more runs than this server analyses, so only \
-                 runs starting at or after {} were read; narrow 'since' and 'until' to see \
-                 earlier ones.",
+                " TRUNCATED: the window held more agent runs than this server analyses, so \
+                 only runs whose first step started at or after {} were read; narrow 'since' \
+                 and 'until' to see earlier ones.",
                 rfc3339(mark)
             ),
-            None if report.truncated => {
+            None if report.truncated && report.agents.len() >= crate::radar::MAX_AGENTS => {
                 " TRUNCATED: more agents than one answer reports; the busiest are shown.".to_owned()
             }
             None => String::new(),
@@ -188,6 +222,14 @@ pub(super) fn call(
          compare_runs."
             .to_owned(),
     ];
+    if report.agents.iter().any(|agent| agent.unnamed) {
+        notes.push(
+            "Some values are shown as '#' and 16 hex digits: the analysis keeps names for a \
+             bounded number of distinct values, and these did not fit. They are still \
+             compared exactly; only their names are missing."
+                .to_owned(),
+        );
+    }
     if report.agents.is_empty() {
         notes.push(
             "No runs in this window match. Widen 'since', or check the agent name with \
@@ -485,6 +527,7 @@ fn agent_structured(agent: &AgentChanges, limit: usize) -> Value {
                 "from": change.from,
                 "to": change.to,
                 "verdict": change.verdict,
+                "decided_by": change.decided_by,
                 "effect_size": change.effect_size,
                 "explanation": change.explanation,
                 "runs_before": change.runs_before,
@@ -507,6 +550,7 @@ fn agent_structured(agent: &AgentChanges, limit: usize) -> Value {
         "summary": agent.summary,
         "current": agent.current,
         "volatile": agent.volatile,
+        "unnamed": agent.unnamed,
         "changes": changes,
         "more_changes": agent.changes.len() > limit || agent.truncated,
     }))
@@ -519,11 +563,13 @@ fn output_schema() -> Value {
             "agents": {
                 "type": "array",
                 "description": "Per agent: agent, tenant, runs, summary, current (each \
-                                dimension's value now), volatile, more_changes, and changes — \
-                                ranked, each with at_ns, dimension, from, to, verdict, \
-                                effect_size, explanation, runs_before, runs_after, co_changes, \
-                                error_rate, success_rate, cost_per_run, steps_per_run, \
-                                behavior_shift, detail and example_runs.",
+                                dimension's value now), volatile, unnamed (some value shown \
+                                by digest), more_changes, and changes — ranked, each with \
+                                at_ns, dimension, from, to, verdict, decided_by (quality or \
+                                efficiency), effect_size, explanation, runs_before, \
+                                runs_after, co_changes, error_rate, success_rate, \
+                                cost_per_run, steps_per_run, behavior_shift, detail and \
+                                example_runs.",
             },
             "since_ns": {"type": "integer"},
             "until_ns": {"type": "integer"},
@@ -558,6 +604,11 @@ mod tests {
     /// attempt, then 60 more that fail far more often.
     fn seeded(label: &str, tenant: &str) -> TempStore {
         let fixture = TempStore::open(label, crate::Config::default());
+        seed(fixture.store(), tenant);
+        fixture
+    }
+
+    fn seed(store: &crate::Store, tenant: &str) {
         let mut spans = Vec::new();
         for index in 0..120u64 {
             let prompt = if index < 60 {
@@ -597,8 +648,7 @@ mod tests {
                 });
             }
         }
-        fixture.store().ingest_batch(spans).expect("ingests");
-        fixture
+        store.ingest_batch(spans).expect("ingests");
     }
 
     fn call_tool(
@@ -728,6 +778,41 @@ mod tests {
     }
 
     #[test]
+    fn an_unbound_caller_resolves_a_run_id_two_tenants_share_with_tenant() {
+        let fixture = seeded("mcp-radar-shared", "acme");
+        seed(fixture.store(), "globex");
+        let ambiguous = call_tool(
+            fixture.store(),
+            json!({"since": BASE - MINUTE, "run_id": "run-077"}),
+            32 * 1024,
+            None,
+        );
+        assert_eq!(ambiguous["isError"], json!(true));
+        assert!(
+            text(&ambiguous).contains("more than one tenant"),
+            "{ambiguous}"
+        );
+        let named = call_tool(
+            fixture.store(),
+            json!({"since": BASE - MINUTE, "run_id": "run-077", "tenant": "globex"}),
+            32 * 1024,
+            None,
+        );
+        assert_eq!(named["isError"], json!(false), "{named}");
+        let structured = &named["structuredContent"];
+        assert_eq!(structured["run"]["tenant"], json!("globex"));
+        assert_eq!(structured["agents"][0]["tenant"], json!("globex"));
+        assert_eq!(structured["agents"].as_array().map(Vec::len), Some(1));
+        let invalid = call_tool(
+            fixture.store(),
+            json!({"tenant": "Not A Tenant"}),
+            32 * 1024,
+            None,
+        );
+        assert_eq!(invalid["isError"], json!(true));
+    }
+
+    #[test]
     fn what_changed_is_scoped_to_the_callers_tenant_and_refuses_typos() {
         let fixture = seeded("mcp-radar-tenant", "acme");
         let foreign = call_tool(
@@ -751,7 +836,16 @@ mod tests {
         );
         let typo = call_tool(fixture.store(), json!({"agnet": "x"}), 32 * 1024, None);
         assert_eq!(typo["isError"], json!(true));
-        assert!(text(&typo).contains("Accepted: agent, run_id, environment, since, until, limit"));
+        assert!(text(&typo)
+            .contains("Accepted: agent, run_id, environment, since, until, limit, tenant"));
+        let foreign = call_tool(
+            fixture.store(),
+            json!({"tenant": "globex"}),
+            32 * 1024,
+            Some("acme"),
+        );
+        assert_eq!(foreign["isError"], json!(true));
+        assert!(text(&foreign).contains("bound to a different tenant"));
         let backwards = call_tool(
             fixture.store(),
             json!({"since": "1h", "until": "2h"}),

@@ -216,13 +216,19 @@ The reasoning behind these is worth knowing:
   error rate, success rate, cost and steps moved across it, with p-values and
   a verdict, regressions first. It also names example runs on each side,
   which you can open with `get_run_tape` or compare with `compare_runs`. It
-  takes `agent`, `environment`, `since`, `until` and `limit` (changes per
-  agent, default 5, at most 20). With `run_id`, it also places that run on
+  takes `agent`, `environment`, `since`, `until`, `limit` (changes per
+  agent, default 5, at most 20) and, for an unbound credential, `tenant` (a
+  bound credential naming another tenant is refused). Each change says
+  whether a quality or an efficiency metric decided its verdict
+  (`decided_by`), and quality regressions rank first. With `run_id`, it also
+  places that run on
   its agent's timeline: its configuration, and the change points it ran
   downstream of (for example, "this failed run used the system prompt
   introduced by Tuesday's regression"). It returns `structuredContent` with
   each agent's summary, current configuration and top changes, plus `run`
-  when one was named. Agent names,
+  when one was named. A run id two tenants share needs `tenant`; a run the
+  `agent` or `environment` filter excludes is refused by name rather than
+  reported missing. Agent names,
   values, prompt text, tool names and run ids render inside the telemetry
   block.
 

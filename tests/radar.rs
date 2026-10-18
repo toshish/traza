@@ -355,7 +355,27 @@ fn bad_questions_are_refused_and_the_run_cap_is_stated() {
         .filter(|index| base + index * MINUTE >= mark)
         .count();
     assert_eq!(report["runs_scanned"], json!(kept));
-    assert!((1..=26).contains(&kept), "{kept}");
+    assert_eq!(kept, 20, "exactly the cap: the newest twenty runs, whole");
+    assert_eq!(mark, base + 99 * MINUTE + 1);
+
+    // A run the filters exclude is refused by name, not "not found".
+    let (status, body) = server.json(
+        "GET",
+        &format!(
+            "/v1/changes?{}&run=ticket-110&agent=billing-bot",
+            window(base)
+        ),
+        None,
+        &[],
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("excluded by the agent filter"),
+        "{body}"
+    );
 
     // A cap of zero is refused at startup, where the operator sees it.
     let dir = std::env::temp_dir().join(format!("traza-radar-cap-{}", std::process::id()));
@@ -367,6 +387,49 @@ fn bad_questions_are_refused_and_the_run_cap_is_stated() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--radar-max-runs must be at least 1"));
+}
+
+#[test]
+fn copied_build_attributes_never_push_an_export_over_the_attribute_cap() {
+    // Each span carries exactly four attributes of its own; the resource
+    // carries the five build attributes that are copied onto it.
+    let server = Server::spawn(&["--max-span-attributes", "4"]);
+    let base = now_ns() - 2 * DAY;
+    let era = Era {
+        tenant: None,
+        first: 0,
+        last: 3,
+        version: "1.4.2",
+        prompt: "Prompt.",
+        fails: rarely,
+    };
+    let mut body = era.otlp(base);
+    body["resourceSpans"][0]["resource"]["attributes"]
+        .as_array_mut()
+        .expect("resource attributes")
+        .push(attribute("deployment.environment", "prod"));
+    let (status, reply) = server.json("POST", "/v1/traces", Some(&body), &[]);
+    assert_eq!(status, 200, "the copies are additive: {reply}");
+    let (status, trace) = server.json("GET", &format!("/v1/traces/{:032x}", 1), None, &[]);
+    assert_eq!(status, 200, "{trace}");
+    let attributes = trace["spans"][0]["attributes"]
+        .as_object()
+        .expect("attributes");
+    assert_eq!(attributes.len(), 9, "four of its own and five copied");
+    // The cap still holds for what the span itself carries.
+    body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+        .as_array_mut()
+        .expect("span attributes")
+        .push(attribute("one.too.many", "x"));
+    let (status, reply) = server.json("POST", "/v1/traces", Some(&body), &[]);
+    assert_eq!(status, 400, "{reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("5 attributes exceeds the max-span-attributes cap of 4"),
+        "{reply}"
+    );
 }
 
 #[test]

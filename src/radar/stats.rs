@@ -24,6 +24,9 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
+/// The largest |Cohen's d| reported (see [`cohens_d`]).
+pub(crate) const MAX_COHENS_D: f64 = 4.0;
+
 /// Standard normal cumulative distribution function `Φ(x)`.
 pub(crate) fn normal_cdf(x: f64) -> f64 {
     0.5 * erfc(-x / std::f64::consts::SQRT_2)
@@ -199,34 +202,69 @@ pub(crate) fn two_proportion(x1: usize, n1: usize, x2: usize, n2: usize) -> Opti
     })
 }
 
-/// Mean and sample variance (n − 1 denominator).
+/// Differences smaller than this, relative to the magnitude of the values
+/// compared, are floating-point rounding and not data.
+const RELATIVE_TOLERANCE: f64 = 1e-12;
+
+/// The absolute tolerance for comparing two means (and a standard deviation
+/// against zero): [`RELATIVE_TOLERANCE`] of the larger magnitude, at least
+/// of 1.
+fn tolerance(m1: f64, m2: f64) -> f64 {
+    RELATIVE_TOLERANCE * m1.abs().max(m2.abs()).max(1.0)
+}
+
+/// Mean and sample variance (n − 1 denominator), computed relative to the
+/// first value so they are shift-invariant: a constant sample has exactly
+/// its value as mean and exactly zero variance, whatever its length. (A
+/// plain `Σx / n` rounds differently for 356 copies of `ln 3` than for 122,
+/// and the residue would read as spread.)
 pub(crate) fn mean_variance(values: &[f64]) -> Option<(f64, f64)> {
-    if values.is_empty() {
-        return None;
-    }
+    let first = *values.first()?;
     let n = values.len() as f64;
-    let mean = values.iter().sum::<f64>() / n;
+    let offset = values.iter().map(|value| value - first).sum::<f64>() / n;
+    let mean = first + offset;
     if values.len() < 2 {
         return Some((mean, 0.0));
     }
-    let variance = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n - 1.0);
+    let variance = values
+        .iter()
+        .map(|value| {
+            let deviation = (value - first) - offset;
+            deviation * deviation
+        })
+        .sum::<f64>()
+        / (n - 1.0);
     Some((mean, variance))
+}
+
+/// A variance that is rounding residue — a standard deviation below the
+/// tolerance of the means it belongs to — as exactly zero.
+fn settled(variance: f64, tolerance: f64) -> f64 {
+    if variance < tolerance * tolerance {
+        0.0
+    } else {
+        variance
+    }
 }
 
 /// Welch's unequal-variance t-test of `after` against `before`, with
 /// Welch–Satterthwaite degrees of freedom. `None` with fewer than two values
 /// on a side. Two sides with no variance at all are `p = 1` when their means
-/// agree and `p = 0` when they do not: a deterministic difference.
+/// agree and `p = 0` when they do not: a deterministic difference. "No
+/// variance" and "agree" are judged with a relative tolerance of `1e-12`,
+/// so rounding is never mistaken for spread or for a difference.
 pub(crate) fn welch(before: &[f64], after: &[f64]) -> Option<TestResult> {
     if before.len() < 2 || after.len() < 2 {
         return None;
     }
     let (m1, v1) = mean_variance(before)?;
     let (m2, v2) = mean_variance(after)?;
+    let tolerance = tolerance(m1, m2);
+    let (v1, v2) = (settled(v1, tolerance), settled(v2, tolerance));
     let (n1, n2) = (before.len() as f64, after.len() as f64);
     let se2 = v1 / n1 + v2 / n2;
     if se2 <= 0.0 {
-        let p_value = if (m2 - m1).abs() <= f64::EPSILON * m1.abs().max(m2.abs()).max(1.0) {
+        let p_value = if (m2 - m1).abs() <= tolerance {
             1.0
         } else {
             0.0
@@ -252,24 +290,30 @@ pub(crate) fn cohens_h(before: f64, after: f64) -> f64 {
 }
 
 /// Cohen's d between two samples (pooled standard deviation), signed
-/// `after − before`; `0` when there is no spread to scale by.
+/// `after − before`, clamped to `±`[`MAX_COHENS_D`]: past about 4 the two
+/// sides barely overlap, and an unbounded d would let one deterministic
+/// difference drown every other effect size. With no spread at all, equal
+/// means are `0` and different ones the cap — a difference every run shows
+/// is as large an effect as can be stated. Spread and equality are judged
+/// with the tolerance [`welch`] uses.
 pub(crate) fn cohens_d(before: &[f64], after: &[f64]) -> f64 {
     let (Some((m1, v1)), Some((m2, v2))) = (mean_variance(before), mean_variance(after)) else {
         return 0.0;
     };
+    let tolerance = tolerance(m1, m2);
     let (n1, n2) = (before.len() as f64, after.len() as f64);
     let pooled = if n1 + n2 > 2.0 {
         (((n1 - 1.0) * v1 + (n2 - 1.0) * v2) / (n1 + n2 - 2.0)).sqrt()
     } else {
         0.0
     };
-    if pooled > 0.0 {
-        (m2 - m1) / pooled
-    } else if (m2 - m1).abs() > 0.0 {
-        // No spread but a difference: as large an effect as can be stated.
-        (m2 - m1).signum() * 10.0
-    } else {
+    let difference = m2 - m1;
+    if difference.abs() <= tolerance {
         0.0
+    } else if pooled < tolerance {
+        difference.signum() * MAX_COHENS_D
+    } else {
+        (difference / pooled).clamp(-MAX_COHENS_D, MAX_COHENS_D)
     }
 }
 
@@ -341,6 +385,26 @@ pub(crate) fn counts<K: Eq + Hash + Copy>(labels: &[K]) -> HashMap<K, usize> {
     counts
 }
 
+/// The Jensen–Shannon distance of two count vectors over the same dense
+/// labels, with their totals; `0` when either side is empty.
+fn js_of_counts(left: &[usize], left_total: usize, right: &[usize], right_total: usize) -> f64 {
+    if left_total == 0 || right_total == 0 {
+        return 0.0;
+    }
+    let (lt, rt) = (left_total as f64, right_total as f64);
+    let term = |p: f64, m: f64| if p > 0.0 { p * (p / m).log2() } else { 0.0 };
+    let mut divergence = 0.0;
+    for (&l, &r) in left.iter().zip(right) {
+        if l == 0 && r == 0 {
+            continue;
+        }
+        let (p, q) = (l as f64 / lt, r as f64 / rt);
+        let m = 0.5 * (p + q);
+        divergence += 0.5 * term(p, m) + 0.5 * term(q, m);
+    }
+    divergence.clamp(0.0, 1.0).sqrt()
+}
+
 /// A deterministic permutation test of a Jensen–Shannon distance: the share
 /// of `permutations` random relabellings of `left ++ right` whose distance is
 /// at least `observed`, as `(1 + hits) / (1 + permutations)` — never zero,
@@ -356,8 +420,39 @@ pub(crate) fn js_permutation_p<K: Eq + Hash + Copy>(
     permutations: usize,
     seed: u64,
 ) -> f64 {
-    let mut pooled: Vec<K> = left.iter().chain(right).copied().collect();
+    js_permutation_test(left, right, observed, permutations, seed, None)
+}
+
+/// [`js_permutation_p`], stopping early once the p-value can no longer fall
+/// below `give_up`: the value returned then is the p-value so far, a lower
+/// bound on the full one and itself at or above `give_up`. A caller that only
+/// needs to know whether `p < give_up` pays for the full run only when it
+/// is. Labels are mapped to dense indices once, so each relabelling costs
+/// one shuffle and one count.
+pub(crate) fn js_permutation_test<K: Eq + Hash + Copy>(
+    left: &[K],
+    right: &[K],
+    observed: f64,
+    permutations: usize,
+    seed: u64,
+    give_up: Option<f64>,
+) -> f64 {
+    let mut ids: HashMap<K, usize> = HashMap::new();
+    let mut pooled: Vec<usize> = left
+        .iter()
+        .chain(right)
+        .map(|label| {
+            let next = ids.len();
+            *ids.entry(*label).or_insert(next)
+        })
+        .collect();
+    let labels = ids.len();
+    let mut totals = vec![0usize; labels];
+    for &label in &pooled {
+        totals[label] += 1;
+    }
     let split = left.len();
+    let right_total = pooled.len() - split;
     let mut state = seed | 1;
     let mut next = move || {
         state ^= state >> 12;
@@ -365,15 +460,28 @@ pub(crate) fn js_permutation_p<K: Eq + Hash + Copy>(
         state ^= state >> 27;
         state.wrapping_mul(0x2545_f491_4f6c_dd1d)
     };
+    let mut left_counts = vec![0usize; labels];
+    let mut right_counts = vec![0usize; labels];
     let mut hits = 0usize;
     for _ in 0..permutations {
         for index in (1..pooled.len()).rev() {
             let other = (next() % (index as u64 + 1)) as usize;
             pooled.swap(index, other);
         }
-        let distance = js_of(&pooled[..split], &pooled[split..]).unwrap_or(0.0);
+        left_counts.iter_mut().for_each(|count| *count = 0);
+        for &label in &pooled[..split] {
+            left_counts[label] += 1;
+        }
+        for ((right, total), left) in right_counts.iter_mut().zip(&totals).zip(&left_counts) {
+            *right = total - left;
+        }
+        let distance = js_of_counts(&left_counts, split, &right_counts, right_total);
         if distance >= observed - 1e-12 {
             hits += 1;
+            let floor = (1 + hits) as f64 / (1 + permutations) as f64;
+            if give_up.is_some_and(|give_up| floor >= give_up) {
+                return floor;
+            }
         }
     }
     (1 + hits) as f64 / (1 + permutations) as f64
@@ -487,6 +595,65 @@ mod tests {
     }
 
     #[test]
+    fn constant_sides_are_no_difference_whatever_their_lengths() {
+        // A single-call agent: every run's ln(1 + steps) is ln 2, every
+        // run's duration the same. Summing 356 copies and 122 copies of one
+        // value rounds differently, and that rounding must not read as a
+        // variance, a difference, or an effect.
+        for value in [3f64.ln(), 2f64.ln_1p(), (15.0f64 / 1e6).ln_1p(), 0.1 + 0.2] {
+            let before = vec![value; 356];
+            let after = vec![value; 122];
+            let (mean, variance) = mean_variance(&before).expect("non-empty");
+            assert_eq!((mean, variance), (value, 0.0), "{value}");
+            let result = welch(&before, &after).expect("two sides");
+            assert_eq!(result.p_value, 1.0, "{value}: {result:?}");
+            assert_eq!(result.statistic, 0.0, "{value}: {result:?}");
+            assert_eq!(cohens_d(&before, &after), 0.0, "{value}");
+        }
+        // Two values one ulp apart are one value: 0.1 + 0.2 and 0.3, mixed in
+        // different proportions on each side.
+        let (a, b) = (0.1 + 0.2, 0.3);
+        assert_ne!(a, b);
+        let before: Vec<f64> = (0..200).map(|i| if i % 2 == 0 { a } else { b }).collect();
+        let after: Vec<f64> = (0..200).map(|i| if i % 4 == 0 { b } else { a }).collect();
+        let result = welch(&before, &after).expect("two sides");
+        assert_eq!(result.p_value, 1.0, "{result:?}");
+        assert_eq!(cohens_d(&before, &after), 0.0);
+        // Where the residue survives the arithmetic — a side of 1 and of
+        // 1 + 4ε has a "variance" of about 1e-31, and the means differ by 2ε —
+        // the tolerance still reads it as no spread and no difference.
+        let near = 1.0 + 4.0 * f64::EPSILON;
+        let before: Vec<f64> = (0..200)
+            .map(|i| if i % 2 == 0 { 1.0 } else { near })
+            .collect();
+        let after = vec![near; 200];
+        let (_, variance) = mean_variance(&before).expect("non-empty");
+        assert!(variance > 0.0, "the residue is there: {variance:e}");
+        let result = welch(&before, &after).expect("two sides");
+        assert_eq!(result.p_value, 1.0, "{result:?}");
+        assert_eq!(cohens_d(&before, &after), 0.0);
+    }
+
+    #[test]
+    fn a_difference_with_no_spread_is_certain_and_its_effect_is_bounded() {
+        // Every run took 3 steps, then every run took 4: a deterministic
+        // difference, as large an effect as can be stated — and no larger
+        // than the cap, so it cannot drown every other effect size.
+        let before = vec![3f64.ln_1p(); 50];
+        let after = vec![4f64.ln_1p(); 70];
+        let result = welch(&before, &after).expect("two sides");
+        assert_eq!(result.p_value, 0.0);
+        assert!(result.statistic > 0.0);
+        assert_eq!(cohens_d(&before, &after), MAX_COHENS_D);
+        assert_eq!(cohens_d(&after, &before), -MAX_COHENS_D);
+        // A near-constant side keeps a real (bounded) effect.
+        let mut spread = vec![1.0; 99];
+        spread.push(1.5);
+        let d = cohens_d(&spread, &[2.0; 100]);
+        assert!(d > 0.0 && d <= MAX_COHENS_D, "{d}");
+    }
+
+    #[test]
     fn the_two_proportion_test_matches_scipy() {
         let result = two_proportion(30, 100, 45, 100).expect("computes");
         close(result.statistic, 2.190_890_230_020_664_7, 1e-12);
@@ -558,6 +725,19 @@ mod tests {
             p,
             1.0 / 200.0,
             "a total shift is as significant as 199 draws can say"
+        );
+        // Stopping early changes no verdict: a shift stays as significant,
+        // and no shift stops at a value at or above the give-up line.
+        assert_eq!(
+            js_permutation_test(&left, &right, observed, 199, 7, Some(0.01)),
+            p
+        );
+        let observed = js_of(&same[..20], &same[20..]).unwrap_or(0.0);
+        let early = js_permutation_test(&same[..20], &same[20..], observed, 1_999, 7, Some(0.01));
+        assert!(early >= 0.01, "{early}");
+        assert!(
+            early <= js_permutation_p(&same[..20], &same[20..], observed, 1_999, 7),
+            "a lower bound on the full p-value"
         );
     }
 }
