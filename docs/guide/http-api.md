@@ -150,6 +150,10 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `GET` | [`/v1/xray/{trace_id}/{span_id}`](#get-v1xraytrace_idspan_id) | A model call's context window: chunks, provenance, staleness, duplicates, compaction loss |
 | `GET` | [`/v1/cache/{run}`](#get-v1cacherun) | Cache Autopsy: why each call's prompt cache held or broke, and what it cost |
 | `GET` | [`/v1/changes`](#get-v1changes) | What changed in each agent, when, and what it did: ranked change points with deltas and verdicts |
+| `GET` | [`/v1/trajectories/search`](#get-v1trajectoriessearch) | Runs whose steps match a TQL pattern, most recent first |
+| `GET` | [`/v1/trajectories/explain`](#get-v1trajectoriesexplain) | How a TQL pattern was read |
+| `GET` | [`/v1/detectors`](#get-v1detectors) | The detector library |
+| `GET` | [`/v1/detectors/findings`](#get-v1detectorsfindings) | The detector library run over a window |
 | `POST` | [`/v1/annotations`](#post-v1annotations) | Attach a score or feedback record |
 | `GET` | [`/v1/annotations`](#get-v1annotations) | Query annotations |
 | `POST` | [`/v1/datasets`](#post-v1datasets) | Create a dataset |
@@ -1703,6 +1707,127 @@ excludes. An analysis that does not finish within the request's
 counted in `traza_query_deadline_exceeded_total`. A bigger window costs
 more time, not more memory: plain request traces are never held, and at most
 `--radar-max-runs` agent runs are.
+
+---
+
+## Trajectory queries and detectors
+
+TQL matches a pattern over a run's steps the way a regex matches characters;
+the detector library is a set of named patterns. The language, its semantics
+and its limits are in the [TQL guide](tql.md). Every route here is a `GET`
+(any other method is `405`). A query the parser refuses is `400` with the
+1-based character column:
+
+```json
+{"column":12,"error":"column 12: unknown field `stauts`; did you mean `status`? Fields: …"}
+```
+
+URL-encode the query: an unencoded `+` arrives as a space. Each search
+response echoes the pattern as it was read in `query`.
+
+### `GET /v1/trajectories/search`
+
+Runs whose steps match `q`, the window's most recent runs first.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `q` | string, required | The TQL query |
+| `since`, `until` | integer ns | Window over span start times (`since_ns` / `until_ns` also accepted). Default: the last 30 days, no end |
+| `agent` | string | Only runs whose first step names this agent, else whose earliest span has this service |
+| `outcome` | `any` / `success` / `failure` / `abandoned` / `unknown` | Only runs that ended this way. Default `any` |
+| `limit` | integer | Matching runs to return. Default 50, capped at 500 |
+| `run` | string | Search this one run and list every occurrence; the window and `agent` do not apply (in the operator view, a run id two tenants share is read as their union — name the `tenant`) |
+| `tenant` | string | Tenant scope; omitted, an unbound caller reads every tenant, each run within its own |
+
+```sh
+curl -sG 'http://localhost:8080/v1/trajectories/search' \
+  --data-urlencode 'q=test[error] ..> edit[file~"(^|/)tests?/"] ..> test[not error]' \
+  --data-urlencode 'since=1772323199999999999'
+```
+
+```json
+{"matches":[{"agent":"coder","captures":{},"captures_truncated":false,"count":1,"count_capped":false,"first_step":1,"inexact":false,"last_activity_ns":1772323205000000000,"last_step":4,"outcome":"success","run":"tampered","run_truncated":false,"spans":[{"kind":"tool","name":"Bash","span_id":"tampered-1","step_index":1,"trace_id":"tr-tampered"},{"kind":"tool","name":"Edit","span_id":"tampered-3","step_index":3,"trace_id":"tr-tampered"},{"kind":"tool","name":"Bash","span_id":"tampered-4","step_index":4,"trace_id":"tr-tampered"}],"spans_truncated":false,"steps":6,"tenant":""}],"next_until_ns":null,"query":"test[error] ..> edit[file~\"(^|/)tests?/\"] ..> test[not error]","runs_in_window":3,"runs_scanned":3,"runs_skipped":0,"since_ns":1772323199999999999,"spans_skipped":0,"stopped":null,"truncated":false,"until_ns":null,"window_capped":false}
+```
+
+Each match carries the run, its `tenant`, `agent` and `outcome` (the
+[session outcome](#get-v1recall) rule; `unknown` while active or past the
+span budget), the first occurrence's `spans` — the steps its atoms matched,
+`{trace_id, span_id, step_index, kind, name}`, at most 100, gap steps not
+listed — its `captures` (each value cut to its first 1 KiB, with
+`captures_truncated` set when one was), `first_step` and `last_step` (the
+covered range, gap steps included), `count` (non-overlapping occurrences, at
+most 1,000, with `count_capped`), `steps`, `last_activity_ns`, `run_truncated`
+(the run had more than 20,000 spans and was matched on its beginning) and
+`inexact` (a matcher cap — 4,096 live paths, the environments one step may
+fork, 65,536 remembered states — dropped alternatives in this run). With
+`run=`, a match also lists `occurrences` (at most 100), each `{first_step,
+last_step, spans, spans_truncated, captures, captures_truncated}`; an unknown
+run, or one in another tenant, is an empty `matches`, not a `404`.
+
+The scan keeps the window's 5,000 most recent runs (`runs_in_window`;
+`window_capped` when there were more), then reads each whole — every step,
+not only those in the window — until `limit` runs matched. `runs_scanned`
+counts the candidates examined (those the `agent` filter left out included).
+`stopped` is `"limit"` or `"deadline"` when the scan ended before the last
+candidate. `next_until_ns`, set when runs went unchecked, is the instant to
+pass as `until` to continue: the latest activity of the newest run not
+checked, or, for a capped window the scan finished, of the oldest run it kept
+(a run active on both sides of that instant can appear twice). `truncated`
+says matches may be missing for any of these reasons. `spans_skipped` counts
+spans left out because their run id does not read back to them (a session id
+of the `trace:<id>` form naming another trace, or none); `runs_skipped`,
+candidates whose id was refused when read. The query deadline covers the
+request, inside every predicate and regex too: enumerating the window refuses
+with `400` when it runs out; the scan answers what it found with
+`"stopped": "deadline"`.
+
+### `GET /v1/trajectories/explain`
+
+Parses and compiles `q` without reading the store: the canonical rendering
+(grouping made explicit), capture names, the fields read, the atom count, the
+fewest and most steps a match covers (`null`: unbounded), `within`, and the
+compiled program's size.
+
+```sh
+curl -sG 'http://localhost:8080/v1/trajectories/explain' \
+  --data-urlencode 'q=edit[file=@f] (..> edit[file=@f]){4,} within 10'
+```
+
+```json
+{"atoms":2,"captures":["f"],"fields":["file"],"instructions":24,"max_steps":null,"min_steps":5,"query":"edit[file=@f] (..> edit[file=@f]){4,} within 10","within":{"steps":10}}
+```
+
+### `GET /v1/detectors`
+
+The detector library: `{"detectors": [{name, title, severity, summary,
+query}]}` — `test_tampering`, `hallucinated_tool`, `give_up_loop`,
+`edit_thrash`, `ping_pong`, `context_blowup`, `retry_without_change`,
+`tool_error_streak`, `unverified_finish`. Each `query` is ordinary TQL. Takes
+no parameters.
+
+### `GET /v1/detectors/findings`
+
+The library run over the window's 2,000 most recent runs.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `since`, `until` | integer ns | Window, as for search. Default: the last 30 days |
+| `agent` | string | Only runs of this agent |
+| `detector` | string | Only these detectors: a comma list, or repeated. An unknown name is `400` |
+| `tenant` | string | Tenant scope |
+
+Per detector: `name`, `title`, `severity`, `summary`, `query`,
+`runs_matched`, `occurrences`, `outcomes` (`{success, failure, abandoned,
+unknown}` of the matched runs), `success_rate` (successes over runs whose
+outcome is known; `null` when none is), up to five `examples` (newest first,
+shaped like search matches) and `last_seen_ns`. Beside them: `baseline` and
+`baseline_success_rate` over every checked run, `runs_checked` (the runs the
+detectors ran on — the baseline's total, and the denominator for
+`runs_matched`), `runs_scanned` (candidates examined, those the `agent`
+filter left out included), `runs_in_window`, `window_capped`, `stopped`,
+`next_until_ns`, `truncated`, `spans_skipped`, `runs_skipped`, `since_ns`,
+`until_ns`. Detectors with findings come first, by severity, then by runs
+matched. The [guide](tql.md#findings) has a worked response.
 
 ---
 

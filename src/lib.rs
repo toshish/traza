@@ -51,6 +51,7 @@ pub mod semconv;
 pub mod steer;
 pub mod tail;
 pub mod tape;
+pub mod tql;
 pub mod ui;
 pub mod usage;
 mod wal;

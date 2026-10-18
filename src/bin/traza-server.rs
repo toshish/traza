@@ -68,6 +68,9 @@ use traza::{CompactionConfig, Config, Durability, Profile, Span, SpanCursor, Spa
 // Tapes, replays, diffs and recall: their routes live beside this file.
 #[path = "traza-server/replay_routes.rs"]
 mod replay_routes;
+// Trajectory queries and the detector library.
+#[path = "traza-server/tql_routes.rs"]
+mod tql_routes;
 
 // Agent Blame: its route lives beside this file.
 #[path = "traza-server/blame_routes.rs"]
@@ -202,6 +205,7 @@ impl RouteClass {
             ("GET", "/v1/diff" | "/v1/recall") => Self::Stats,
             ("GET", path) if path.starts_with("/v1/fate/") => Self::Stats,
             ("GET", traza::radar::ROUTE) => Self::Stats,
+            ("GET", path) if tql_routes::handles(path) => Self::Stats,
             _ => Self::Other,
         }
     }
@@ -2442,6 +2446,17 @@ fn serve_request(
             path,
             query,
             &request.body,
+            engine,
+            metrics,
+            principal,
+        );
+    }
+    if tql_routes::handles(path) {
+        return tql_routes::serve(
+            responder,
+            &request.method,
+            path,
+            query,
             engine,
             metrics,
             principal,

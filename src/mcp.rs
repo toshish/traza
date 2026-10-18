@@ -43,16 +43,16 @@ use crate::{semconv, Error, Span, SpanCursor, SpanFilter, SpanSort, Store};
 
 // get_run_tape, compare_runs and recall_runs live beside this file.
 mod replay_tools;
-// foresee_run lives beside this file too.
-mod fate_tools;
-mod steer_tools;
-// blame_line lives beside this file.
+// v0.28's tools live beside this file too: foresee_run (the Fate Map),
+// list_live_runs and run_topology (steering), blame_line (Agent Blame),
+// xray_step (the context X-Ray), what_changed (the change radar) and
+// find_behavior (TQL trajectory search and detectors).
 mod blame_tools;
-// xray_step lives beside this file.
-mod xray_tools;
-
-// what_changed (the change radar) lives beside this file too.
+mod fate_tools;
 mod radar_tools;
+mod steer_tools;
+mod tql_tools;
+mod xray_tools;
 
 /// The MCP endpoint path served by `traza-server`.
 pub const ENDPOINT: &str = "/v1/mcp";
@@ -643,6 +643,7 @@ impl<'a> Server<'a> {
         tools.extend(blame_tools::definitions());
         tools.extend(xray_tools::definitions());
         tools.extend(radar_tools::definitions());
+        tools.extend(tql_tools::definitions());
         if self.annotation_tool_available(access) {
             tools.push(tool(
                 "record_annotation",
@@ -776,6 +777,7 @@ impl<'a> Server<'a> {
             name if radar_tools::handles(name) => {
                 radar_tools::call(self, name, arguments, &context)
             }
+            name if tql_tools::handles(name) => tql_tools::call(self, arguments, &context),
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
             }
