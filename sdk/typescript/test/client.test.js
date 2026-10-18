@@ -890,5 +890,61 @@ describe("@trazadb/sdk against traza-server", () => {
       assert.equal(stringifyJson(new Array(2)), "[null,null]");
       assert.equal(stringifyJson({ steps: [, 7n] }), '{"steps":[null,7]}');
     });
+
+    it("writes an array to the length it had when writing began, as JSON.stringify does", () => {
+      // A toJSON hook may change the array that holds it. Re-reading the
+      // length on every element followed each push, so this hook kept the
+      // writer going until memory ran out — before any request timer exists
+      // to stop it.
+      const grow = () => {
+        const a = [
+          {
+            toJSON() {
+              a.push(this);
+              return 1;
+            },
+          },
+        ];
+        return a;
+      };
+      assert.equal(stringifyJson(grow()), "[1]");
+      assert.equal(stringifyJson(grow()), JSON.stringify(grow()));
+      // Shrinking reads the vacated index as a hole, which is null.
+      const shrink = () => {
+        const a = [
+          {
+            toJSON() {
+              a.length = 0;
+              return 1;
+            },
+          },
+          2n,
+        ];
+        return a;
+      };
+      assert.equal(stringifyJson(shrink()), "[1,null]");
+    });
+
+    it("reads each member when it is written, as JSON.stringify does", () => {
+      // Members are read in turn, not all up front, so a hook's change to a
+      // later member is what is written.
+      const build = () => {
+        const o = {
+          a: {
+            toJSON() {
+              o.b = 2;
+              delete o.c;
+              o.d = 4;
+              return 1;
+            },
+          },
+          b: 1,
+          c: 3,
+        };
+        return o;
+      };
+      assert.equal(stringifyJson(build()), '{"a":1,"b":2}');
+      assert.equal(stringifyJson(build()), JSON.stringify(build()));
+    });
   });
 });
