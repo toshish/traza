@@ -74,7 +74,8 @@ pub const GOLDEN: &str = "traza.golden";
 pub const MAX_EDITS: usize = 64;
 
 /// Spans carrying [`FORK_PARENT`] one listing examines. Past it the listing
-/// is built from the earliest tagged spans and says it was truncated.
+/// is built from the earliest-starting tagged spans — the oldest forks are
+/// kept and the newest may be missing — and says it was truncated.
 pub const MAX_FORK_SPANS: usize = 10_000;
 
 /// Forks one listing returns when the caller names no limit.
@@ -541,13 +542,18 @@ pub struct Goldens {
     pub truncated: bool,
 }
 
-/// Whether a golden marker's value says `true`, `false`, or nothing: a
-/// boolean, or the strings `true` / `false` in any case.
+/// Whether a golden annotation's value says `true`, `false`, or nothing: a
+/// boolean, or exactly the string `"true"` / `"false"`.
+///
+/// The same rule a span attribute is held to — the store's attribute match
+/// takes the boolean `true` or the exact string `"true"` — so a value marks
+/// a run the same way on either path. `"True"` (Python's `str(True)`) marks
+/// nothing on either.
 fn golden_flag(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(flag) => Some(*flag),
-        Value::String(text) if text.eq_ignore_ascii_case("true") => Some(true),
-        Value::String(text) if text.eq_ignore_ascii_case("false") => Some(false),
+        Value::String(text) if text == "true" => Some(true),
+        Value::String(text) if text == "false" => Some(false),
         _ => None,
     }
 }
@@ -596,9 +602,14 @@ impl Store {
             limit: Some(max_spans.saturating_add(1)),
             ..SpanFilter::default()
         };
+        // Unsorted, in the store's span order — oldest start first — since a
+        // sorted read would have to hold every match: past the cap the
+        // listing is built from the EARLIEST tagged spans, so the newest
+        // forks are the ones it can miss, and it says it was truncated.
         let mut tagged = self.query_under(&filter, deadline)?;
         let mut truncated = tagged.len() > max_spans;
         tagged.truncate(max_spans);
+        let spans_examined = tagged.len();
 
         let mut merged_into_parent = 0;
         let mut groups: HashMap<(String, String), ForkGroup> = HashMap::new();
@@ -613,6 +624,9 @@ impl Store {
                 .or_insert_with(|| ForkGroup::new(span.tenant.clone(), fork_run))
                 .absorb(span);
         }
+        // Folded: the spans themselves, prompts and all, are not held through
+        // the reads and diffs below.
+        drop(tagged);
         let mut groups: Vec<ForkGroup> = groups.into_values().collect();
         groups.sort_by(|left, right| {
             right
@@ -644,7 +658,7 @@ impl Store {
             parent,
             forks,
             merged_into_parent,
-            spans_examined: tagged.len(),
+            spans_examined,
             truncated: truncated || out_of_budget,
         }))
     }
@@ -741,12 +755,13 @@ impl Store {
     /// [`MAX_GOLDEN_LIMIT`]).
     ///
     /// A run is golden when a span of it recorded [`GOLDEN`] as `true` (the
-    /// boolean or the string), or when the newest annotation named
-    /// [`GOLDEN`] on its session (`session_id`) or its trace (`trace_id`
-    /// with no span, which names the run `trace:<trace_id>`) says `true`. A
-    /// newer annotation saying `false` un-marks a run, whatever its spans
-    /// say: the annotation is the later decision. Span-subject annotations
-    /// and values that are neither true nor false decide nothing.
+    /// boolean, or exactly the string `"true"`), or when the newest
+    /// annotation named [`GOLDEN`] on its session (`session_id`) or its trace
+    /// (`trace_id` with no span, which names the run `trace:<trace_id>`) says
+    /// `true` by the same rule ([`golden_flag`]). A newer annotation saying
+    /// `false` un-marks a run, whatever its spans say: the annotation is the
+    /// later decision. Span-subject annotations and values that are neither
+    /// true nor false decide nothing.
     pub fn goldens(&self, tenant: Option<&str>, limit: usize) -> Result<Goldens> {
         let limit = limit.clamp(1, MAX_GOLDEN_LIMIT);
         let deadline = self.query_deadline(Instant::now());
@@ -773,6 +788,8 @@ impl Store {
                 });
             entry.tagged_at_ns = entry.tagged_at_ns.max(span.start_time_ns);
         }
+        let spans_examined = tagged.len();
+        drop(tagged);
 
         let mut annotations = self.search_annotations(&AnnotationQuery {
             trace_id: None,
@@ -831,7 +848,7 @@ impl Store {
         }
         Ok(Goldens {
             runs,
-            spans_examined: tagged.len(),
+            spans_examined,
             annotations_examined: annotations.len(),
             truncated,
         })
@@ -1110,7 +1127,7 @@ mod tests {
             .annotate(note("by-note", json!(true), 20))
             .expect("annotates");
         store
-            .annotate(note("un-marked", json!("FALSE"), 30))
+            .annotate(note("un-marked", json!("false"), 30))
             .expect("annotates");
         store
             .annotate(note("by-attr", json!(7), 40))
@@ -1138,5 +1155,48 @@ mod tests {
             .expect("lists")
             .runs
             .is_empty());
+    }
+
+    #[test]
+    fn a_golden_marker_reads_the_same_on_a_span_and_in_an_annotation() {
+        let fixture = TempStore::open("goldens-one-rule", crate::Config::default());
+        let store = fixture.store();
+        // `str(True)` in Python: neither path takes it as true.
+        weather_run(store, "span-cased", "t1", json!({GOLDEN: "True"}));
+        weather_run(store, "note-cased", "t2", json!({}));
+        weather_run(store, "note-exact", "t3", json!({}));
+        weather_run(store, "unmark-cased", "t4", json!({GOLDEN: true}));
+        let note = |session: &str, value: Value| crate::annotations::Annotation {
+            trace_id: String::new(),
+            span_id: String::new(),
+            tenant: String::new(),
+            session_id: session.to_owned(),
+            experiment_id: None,
+            example_id: String::new(),
+            name: GOLDEN.to_owned(),
+            value,
+            source: "human:test".to_owned(),
+            comment: String::new(),
+            timestamp_ns: 10,
+        };
+        for (session, value) in [
+            ("note-cased", json!("True")),
+            ("note-exact", json!("true")),
+            ("unmark-cased", json!("FALSE")),
+        ] {
+            store.annotate(note(session, value)).expect("annotates");
+        }
+        let listed: Vec<String> = store
+            .goldens(Some(""), 100)
+            .expect("lists")
+            .runs
+            .into_iter()
+            .map(|run| run.run)
+            .collect();
+        assert_eq!(
+            listed,
+            ["note-exact", "unmark-cased"],
+            "only the boolean or the exact string marks or un-marks, on either path"
+        );
     }
 }

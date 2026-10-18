@@ -553,6 +553,89 @@ fn a_divergence_says_which_message_differs_and_where() {
     );
 }
 
+#[test]
+fn a_kept_difference_is_bounded_whatever_the_request_holds() {
+    let server = seeded();
+    let (_, created) = as_token(
+        &server,
+        "POST",
+        "/v1/replays",
+        Some(&json!({"run": "weather-1"})),
+        ACME,
+    );
+    let replay = created["id"].as_str().unwrap().to_owned();
+    // The recorded messages plus an extra one whose role is a megabyte: a
+    // read-only credential replaying its own run chooses every byte of it.
+    let mut padded = first_request();
+    padded["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role": "r".repeat(1 << 20), "content": "x".repeat(1 << 20)}));
+    let (status, _, refused) = chat(&server, &replay, &padded, ACME);
+    assert_eq!(status, 409, "{}", refused["error"]["type"]);
+    let difference = refused["error"]["difference"].clone();
+    assert_eq!(difference["field"], json!("extra"), "{difference}");
+    let role = difference["role"].as_str().unwrap();
+    assert!(
+        role.chars().count() <= 33 && role.ends_with('…'),
+        "a role of {} characters was kept",
+        role.chars().count()
+    );
+    assert!(difference["got"].as_str().unwrap().chars().count() <= 122);
+    let kept = serde_json::to_vec(&difference).unwrap().len();
+    assert!(kept < 1024, "{kept} bytes kept for the replay's lifetime");
+    let (_, report) = as_token(&server, "GET", &format!("/v1/replays/{replay}"), None, ACME);
+    assert_eq!(report["diverged"]["difference"], difference);
+}
+
+#[test]
+fn a_replay_stops_rereading_the_recording_to_explain_divergences() {
+    let server = seeded();
+    let (_, created) = as_token(
+        &server,
+        "POST",
+        "/v1/replays",
+        Some(&json!({"run": "weather-1"})),
+        ACME,
+    );
+    let replay = created["id"].as_str().unwrap().to_owned();
+    let asked = |attempt: usize| {
+        let mut wrong = first_request();
+        wrong["messages"][1]["content"] = json!(format!("What's the weather at {attempt}?"));
+        wrong
+    };
+    // A harness whose prompt carries a timestamp: every retry is a new
+    // request, and each costs a read of the recording — eight at most.
+    for attempt in 0..8 {
+        let (status, _, refused) = chat(&server, &replay, &asked(attempt), ACME);
+        assert_eq!(status, 409);
+        assert_eq!(
+            refused["error"]["difference"]["field"],
+            json!("content"),
+            "attempt {attempt}: {refused}"
+        );
+    }
+    let (status, head, refused) = chat(&server, &replay, &asked(8), ACME);
+    assert_eq!(status, 409);
+    assert_eq!(header(&head, "x-should-retry"), Some("false"));
+    assert_eq!(refused["error"]["type"], json!("replay_divergence"));
+    assert!(
+        refused["error"].get("difference").is_none(),
+        "past the cap the refusal stands without a read: {refused}"
+    );
+    // The first divergence's explanation was kept, and still answers.
+    let (_, _, again) = chat(&server, &replay, &asked(0), ACME);
+    assert_eq!(
+        again["error"]["difference"]["got"],
+        json!("What's the weather at 0?")
+    );
+    let (_, report) = as_token(&server, "GET", &format!("/v1/replays/{replay}"), None, ACME);
+    assert_eq!(
+        report["diverged"]["difference"],
+        again["error"]["difference"]
+    );
+}
+
 /// A fork of `weather-1` as a harness records it: its own session, every
 /// span tagged with the parent, the cut step and the fork id.
 fn recorded_fork(
@@ -827,6 +910,27 @@ fn goldens_list_tagged_and_annotated_runs_per_tenant() {
     );
     assert_eq!(listed(BETA), owned(&[("beta", "beta-golden", "attribute")]));
     assert_eq!(listed(OPERATOR).len(), 3);
+    // One rule on both paths: the boolean or exactly "true". `str(True)` in
+    // Python marks nothing, as a span attribute or as an annotation.
+    ingest(
+        &server,
+        weather_run(
+            "cased-tag",
+            "tr-g5",
+            6_000,
+            "rain",
+            json!({"traza.golden": "True"}),
+        ),
+        ACME_WRITER,
+    );
+    mark("ordinary", json!("True"), ACME_WRITER);
+    assert_eq!(
+        listed(ACME),
+        owned(&[
+            ("acme", "golden-by-note", "annotation"),
+            ("acme", "golden-by-tag", "attribute")
+        ])
+    );
     // A later "false" un-marks a run, whatever its spans say.
     mark("golden-by-tag", json!(false), ACME_WRITER);
     assert_eq!(
@@ -905,8 +1009,10 @@ fn a_fork_listing_never_outlives_its_query_budget() {
         weather_run("weather-1", "tr-parent", 0, "rain", json!({})),
         ACME_WRITER,
     );
+    // Exactly the limit: more forks than it would mark the listing truncated
+    // by themselves, and only the budget may do that here.
     let mut batch = Vec::new();
-    for fork in 0..60 {
+    for fork in 0..50 {
         batch.extend(recorded_fork(
             &format!("fork-{fork:02}"),
             &format!("tr-fork-{fork:02}"),
@@ -933,9 +1039,10 @@ fn a_fork_listing_never_outlives_its_query_budget() {
             "{body}"
         ),
         // ...or listed, with every fork the budget did not reach undiffed
-        // and the listing marked incomplete. Never a complete answer: sixty
+        // and the listing marked incomplete. Never a complete answer: fifty
         // forks cannot be read and diffed in a millisecond.
         200 => {
+            assert_eq!(body["forks"].as_array().unwrap().len(), 50, "{body}");
             assert_eq!(body["truncated"], json!(true), "{body}");
             assert!(body["forks"]
                 .as_array()

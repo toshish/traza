@@ -37,7 +37,8 @@
 //! own, digested and dropped — strict mode compares against the digest, so
 //! keeping a long conversation's ever-growing prompts would spend the budget
 //! on content nothing reads. A run longer than the span cap is refused rather
-//! than replayed as its beginning.
+//! than replayed as its beginning — except by a fork that goes live within
+//! the steps read, which serves nothing past its live point.
 //!
 //! A replay is a copy taken out of the store, so erasure must reach it: every
 //! call first checks whether an erasure recorded since the replay was created
@@ -170,10 +171,20 @@ const DIFFERENCE_CHARS: usize = 120;
 /// character, so a reader sees where it sits.
 const DIFFERENCE_CONTEXT: usize = 40;
 
+/// Characters of a role a divergence's first difference keeps.
+const DIFFERENCE_ROLE_CHARS: usize = 32;
+
+/// Store reads one replay may spend explaining divergences.
+const MAX_EXPLANATIONS: usize = 8;
+
 /// What a recorded first difference may hold at most, charged up front with
-/// the rest of a replay's bookkeeping: two quotes of [`DIFFERENCE_CHARS`]
-/// characters (up to four bytes each) and the fields around them.
-const DIFFERENCE_BYTES: usize = 2 * 4 * (DIFFERENCE_CHARS + 2) + 1024;
+/// the rest of a replay's bookkeeping, as [`crate::tail::value_bytes`]
+/// measures a JSON value: two quotes of [`DIFFERENCE_CHARS`] characters and a
+/// role of [`DIFFERENCE_ROLE_CHARS`] (up to four bytes each, plus the `…`
+/// marking a cut), and the eight entries around them. Every string in it is
+/// cut to one of those bounds whatever the request held, and a difference
+/// measuring more is never kept ([`Registry::explain_divergence`]).
+const DIFFERENCE_BYTES: usize = 4096;
 
 /// Characters per streamed delta window. Large texts use larger windows so
 /// that an answer stays a bounded number of events (see [`deltas`]).
@@ -260,7 +271,8 @@ pub struct Limits {
     /// largest replay that can ever be created.
     pub max_bytes_per_tenant: usize,
     /// Spans a replayed run may have. A longer run is refused, never replayed
-    /// as its beginning.
+    /// as its beginning — unless a fork's live point falls within the steps
+    /// read, when that beginning is all the fork serves.
     pub max_spans: usize,
     /// The largest response one call renders.
     pub max_response_bytes: usize,
@@ -479,6 +491,10 @@ pub struct Created {
     pub run: String,
     /// Steps on the run's tape: llm, tool and agent.
     pub steps: usize,
+    /// Whether `steps` counts only the run's beginning: a fork whose live
+    /// point falls inside the first [`Limits::max_spans`] spans of a longer
+    /// run replays that beginning, and the rest of the run was never read.
+    pub steps_truncated: bool,
     /// Llm steps the replay will serve.
     pub llm_steps: usize,
     /// The matching mode.
@@ -511,6 +527,9 @@ impl Created {
                 "anthropic": format!("/v1/replays/{}/anthropic", self.id),
             },
         });
+        if self.steps_truncated {
+            body["steps_truncated"] = json!(true);
+        }
         if let Some(fork) = &self.fork {
             body["fork_id"] = json!(fork.id);
             body["fork"] = fork.to_json();
@@ -809,6 +828,9 @@ struct Replay {
     exhausted_calls: u64,
     /// When the replay is a fork, its edits and live point.
     fork: Option<ForkState>,
+    /// Store reads spent explaining divergences, at most
+    /// [`MAX_EXPLANATIONS`].
+    explanations: usize,
 }
 
 impl Replay {
@@ -1045,16 +1067,24 @@ impl Registry {
         if read.spans.is_empty() {
             return Err(ReplayError::RunNotFound);
         }
-        if read.truncated {
+        // A run past the cap is refused rather than replayed as its
+        // beginning — unless the fork goes live inside what was read: then
+        // nothing past the live point is served (every edit is at or before
+        // it), and the read's steps are exactly the run's first steps.
+        let rewinds_inside = fork.live_after.is_some_and(|cut| cut < read.steps.len());
+        if read.truncated && !rewinds_inside {
             return Err(ReplayError::Unreplayable(format!(
                 "the run has more than {max_spans} spans, more than one replay holds; replaying \
                  its first {max_spans} would end the agent's run early with every later model \
-                 call refused as if the recording ended there"
+                 call refused as if the recording ended there (a fork whose live_after falls \
+                 within its first {} steps can still rewind it)",
+                read.steps.len()
             )));
         }
         fork.check_against(&read.steps)
             .map_err(ReplayError::Invalid)?;
         let steps = read.steps.len();
+        let steps_truncated = read.truncated;
         let budget = SnapshotBudget {
             tape_max_bytes,
             overhead: replay_overhead(run_id, tenant, fork),
@@ -1107,11 +1137,13 @@ impl Registry {
                 live_at_ns: None,
                 live_calls: 0,
             }),
+            explanations: 0,
         };
         let created = Created {
             id: id.clone(),
             run: run_id.to_owned(),
             steps,
+            steps_truncated,
             llm_steps: replay.llm.len(),
             mode,
             expires_at_ns: replay.expires_at_ns,
@@ -1475,7 +1507,16 @@ impl Registry {
     ///
     /// When `step` is the replay's first divergence and this request is the
     /// one that caused it, the difference is kept with it, so the status
-    /// document shows it too.
+    /// document shows it too — every string in it cut to a fixed length, so
+    /// what is kept never outgrows the charge taken for it up front
+    /// ([`DIFFERENCE_BYTES`]). That same request refused again is answered
+    /// from what was kept, with no read.
+    ///
+    /// Any other request costs a read of the step's trace, so one replay
+    /// spends at most [`MAX_EXPLANATIONS`] of them: past that a divergence
+    /// is refused without saying where it differs. A harness whose every
+    /// retry differs (a timestamp in the prompt) cannot turn a route that
+    /// otherwise reads nothing into a store read per call.
     #[allow(clippy::too_many_arguments)]
     pub fn explain_divergence(
         &self,
@@ -1504,14 +1545,27 @@ impl Registry {
                     }
                 }
             }
-            replay
+            let origin = replay
                 .llm
                 .iter()
                 .find(|held| held.step == step)?
                 .origin
-                .clone()
+                .clone();
+            // Spent before the read, under the lock, so concurrent calls
+            // cannot all slip under the cap together.
+            if replay.explanations >= MAX_EXPLANATIONS {
+                return None;
+            }
+            replay.explanations += 1;
+            origin
         };
         let difference = first_difference(store, &origin, request, provider).ok()??;
+        if crate::tail::value_bytes(&difference) > DIFFERENCE_BYTES {
+            // Unreachable while every string in it is cut to its bound; if
+            // that ever changes, the difference is dropped, not kept past
+            // its charge.
+            return None;
+        }
         let latest_erasure = store.erasures.latest_id().ok()?;
         let (mut replays, now_ns) = self.lock_at(call);
         let replay = self
@@ -2402,16 +2456,18 @@ fn first_difference(
     };
     let deadline = store.query_deadline(Instant::now());
     let run = format!("{}{trace_id}", semconv::TRACE_RUN_PREFIX);
-    let read = store.run_tape(
-        Some(tenant),
-        &run,
-        tape::MAX_TAPE_SPANS,
-        tape::MAX_TAPE_SPANS,
-        deadline,
-    )?;
-    let Some(mut recorded) = read.steps.into_iter().find(|step| step.span_id == *span_id) else {
+    // The trace is read to find the span, but only that span is made a step:
+    // extracting every span's facts would be work proportional to the run.
+    let read = store.run_spans(Some(tenant), &run, tape::MAX_TAPE_SPANS, deadline)?;
+    let Some(mut recorded) = read
+        .spans
+        .iter()
+        .find(|span| span.span_id == *span_id)
+        .and_then(|span| store.span_step(0, span))
+    else {
         return Ok(None);
     };
+    drop(read);
     let leftover = Resolver::new(store, Some(tenant), deadline)
         .resolve_request(&mut recorded, &mut ResolveBudget::new(usize::MAX))?;
     if leftover.any() || recorded.detail.bare_prompt {
@@ -2547,26 +2603,32 @@ fn message_text(message: &Normalised) -> String {
     }
 }
 
+/// A message's role, cut to [`DIFFERENCE_ROLE_CHARS`] characters (marked
+/// with `…`): the request chooses it, and a difference is kept for the
+/// replay's lifetime at a fixed charge.
 fn role_text(message: &Normalised) -> Option<String> {
-    message
-        .role
-        .as_ref()
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    let role = message.role.as_ref().and_then(Value::as_str)?;
+    let mut kept: String = role.chars().take(DIFFERENCE_ROLE_CHARS).collect();
+    if role.chars().nth(DIFFERENCE_ROLE_CHARS).is_some() {
+        kept.push('…');
+    }
+    kept.shrink_to_fit();
+    Some(kept)
 }
 
 /// [`DIFFERENCE_CHARS`] characters of `text` starting a little before
 /// character `at`, marked with `…` where it was cut.
 fn quote_from(text: &str, at: usize) -> String {
     let start = at.saturating_sub(DIFFERENCE_CONTEXT);
-    let total = text.chars().count();
     let mut quote: String = text.chars().skip(start).take(DIFFERENCE_CHARS).collect();
     if start > 0 {
         quote.insert(0, '…');
     }
-    if start + DIFFERENCE_CHARS < total {
+    if text.chars().nth(start + DIFFERENCE_CHARS).is_some() {
         quote.push('…');
     }
+    // Held at the length it has, not the capacity collecting it grew to.
+    quote.shrink_to_fit();
     quote
 }
 
@@ -5394,6 +5456,139 @@ mod tests {
         let spaced = message("tool", "{\"a\": 1}");
         let compact = message("tool", "{\"a\":1}");
         assert!(describe_difference(&[spaced], &[compact]).is_none());
+    }
+
+    #[test]
+    fn a_difference_stays_within_its_charge_whatever_the_request_holds() {
+        let message = |role: &str, content: &str| Normalised {
+            role: Some(json!(role)),
+            content: Some(json!(content)),
+            ..Normalised::default()
+        };
+        // A megabyte role — the request's to choose — on every side a
+        // difference can quote it from: an extra message, a missing one, a
+        // differing one, and a differing role.
+        let huge = "ʀ".repeat(1 << 20);
+        let long = "é".repeat(4096);
+        let cases = [
+            describe_difference(
+                &[message("user", "hi")],
+                &[message("user", "hi"), message(&huge, &long)],
+            ),
+            describe_difference(&[message(&huge, &long)], &[]),
+            describe_difference(&[message(&huge, &long)], &[message(&huge, "ho")]),
+            describe_difference(&[message("user", "hi")], &[message(&huge, "hi")]),
+        ];
+        for difference in cases {
+            let difference = difference.expect("differs");
+            let role = difference["role"].as_str().expect("a role");
+            assert!(
+                role.chars().count() <= DIFFERENCE_ROLE_CHARS + 1,
+                "a role of {} characters was kept",
+                role.chars().count()
+            );
+            let held = crate::tail::value_bytes(&difference);
+            assert!(
+                held <= DIFFERENCE_BYTES,
+                "a difference holding {held} bytes is charged {DIFFERENCE_BYTES}: {difference}"
+            );
+        }
+    }
+
+    #[test]
+    fn explaining_divergences_reads_the_store_a_bounded_number_of_times() {
+        let fixture = TempStore::open("fork-explain-cap", crate::Config::default());
+        let store = fixture.store();
+        openllmetry_run(store);
+        let registry = Registry::default();
+        let id = registry
+            .create(store, Some(""), "run-1", Mode::Strict, 1 << 20, NOW)
+            .expect("creates")
+            .id;
+        let asked = |city: usize| {
+            let mut wrong = first_request();
+            wrong["messages"][1]["content"] = json!(format!("Weather in city {city}?"));
+            wrong
+        };
+        let explain = |request: &Value| {
+            let got = openai_request_digest(request).expect("parses");
+            assert!(registry
+                .next_llm(store, &id, Some(""), got, NOW, keep_step)
+                .is_err());
+            registry.explain_divergence(store, &id, Some(""), 0, request, Provider::OpenAi, NOW)
+        };
+        // A harness whose every retry differs (a timestamp in its prompt):
+        // each new request costs a read, up to the cap.
+        for city in 0..MAX_EXPLANATIONS {
+            let difference = explain(&asked(city)).expect("explained within the cap");
+            assert_eq!(difference["field"], json!("content"));
+        }
+        assert!(
+            explain(&asked(MAX_EXPLANATIONS)).is_none(),
+            "past the cap a divergence is refused without re-reading the recording"
+        );
+        // The first divergence's own explanation was kept, and is answered
+        // without a read even past the cap.
+        let first = explain(&asked(0)).expect("kept");
+        assert_eq!(first["got"], json!("Weather in city 0?"));
+        let status = registry.status(store, &id, Some(""), NOW).expect("live");
+        assert_eq!(status["diverged"]["difference"], first);
+    }
+
+    #[test]
+    fn a_rewind_of_a_run_past_the_span_cap_replays_its_beginning() {
+        let fixture = TempStore::open("fork-long-rewind", crate::Config::default());
+        let store = fixture.store();
+        // Three spans: llm 0, tool 1, llm 2; the cap reads only the first two.
+        openllmetry_run(store);
+        let registry = Registry::new(Limits {
+            max_spans: 2,
+            ..Limits::default()
+        });
+        // Live after step 1: everything the fork serves is inside what was
+        // read, so the run's length beyond it does not matter.
+        let created = registry
+            .create_fork(
+                store,
+                Some(""),
+                "run-1",
+                Mode::Strict,
+                &fork_spec(Value::Null, json!(1)),
+                1 << 20,
+                NOW,
+            )
+            .expect("a rewind inside the read prefix is replayable");
+        assert_eq!(created.llm_steps, 1);
+        assert!(
+            created.steps_truncated,
+            "the step count is the prefix read, and says so"
+        );
+        assert_eq!(created.to_json()["steps_truncated"], json!(true));
+        let asked = openai_request_digest(&first_request()).expect("parses");
+        registry
+            .next_llm(store, &created.id, Some(""), asked, NOW, keep_step)
+            .expect("step 0 is served, matched strictly");
+        assert!(matches!(
+            registry.next_llm(store, &created.id, Some(""), None, NOW, keep_step),
+            Err(ReplayError::Live { .. })
+        ));
+        // A live point past the prefix, and a plain replay, still need the
+        // whole run: both are refused for its length, not as a bad step.
+        for spec in [fork_spec(Value::Null, json!(2)), ForkSpec::default()] {
+            match registry.create_fork(store, Some(""), "run-1", Mode::Strict, &spec, 1 << 20, NOW)
+            {
+                Err(ReplayError::Unreplayable(message)) => {
+                    assert!(message.contains("more than 2 spans"), "{message}")
+                }
+                other => panic!("expected the span-cap refusal, got {other:?}"),
+            }
+        }
+        // A run that fits says nothing about truncation.
+        let whole = Registry::default()
+            .create(store, Some(""), "run-1", Mode::Strict, 1 << 20, NOW)
+            .expect("creates");
+        assert!(!whole.steps_truncated);
+        assert!(whole.to_json().get("steps_truncated").is_none());
     }
 
     #[test]
