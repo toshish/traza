@@ -5,14 +5,17 @@
 //! numbers and verdict words the server computed; every stored string (the
 //! run id, the agent, the path's tool and model names, the explanation that
 //! quotes them) renders inside the untrusted-telemetry block or, in
-//! structured content, made JSON-safe; the result is clamped to the server's
-//! ceiling with the loss stated. A read: nothing here changes a run.
+//! structured content, made JSON-safe; the whole result — text, structured
+//! content and envelope — fits the server's ceiling with the loss stated, or
+//! is refused when even its identifiers cannot. A read: nothing here
+//! changes a run.
 
 use serde_json::{json, Map, Value};
 
 use super::{
-    clamp_report_narrowing, json_safe, known_keys, optional_string, optional_usize, required_str,
-    sanitize, serialized_len, tool, Context, Nature, Server, Tool, ToolError, ToolResult,
+    clamp_report_narrowing, json_safe, known_keys, optional_string, optional_usize, report,
+    required_str, sanitize, serialized_len, tool, truncate_bytes, Context, Nature, Server, Tool,
+    ToolError, ToolResult,
 };
 use crate::fate::{Foresight, ForesightVerdict, DEFAULT_VERDICT_SUPPORT};
 
@@ -102,7 +105,7 @@ pub(super) fn call(
                     .to_owned(),
             )
         })?;
-    Ok(render(&foresight, server.limits.max_result_bytes))
+    render(&foresight, server.limits.max_result_bytes)
 }
 
 fn verdict_word(verdict: ForesightVerdict) -> &'static str {
@@ -115,7 +118,7 @@ fn verdict_word(verdict: ForesightVerdict) -> &'static str {
     }
 }
 
-fn render(foresight: &Foresight, max_bytes: usize) -> Value {
+fn render(foresight: &Foresight, max_bytes: usize) -> ToolResult {
     // The headline carries only what the server computed: counts, rates
     // and the verdict. Names live in the telemetry block below.
     let odds = match (foresight.p_success, foresight.ci95, foresight.node.as_ref()) {
@@ -202,26 +205,182 @@ fn render(foresight: &Foresight, max_bytes: usize) -> Value {
                 .to_owned(),
         );
     }
-    let text = clamp_report_narrowing(&head, &rows, &notes, max_bytes, FORESEE_NARROW);
-    let mut structured = structured(foresight);
-    let mut result = json!({
-        "content": [{"type": "text", "text": text}],
-        "structuredContent": structured.clone(),
-        "isError": false,
-    });
     // The structured half travels whatever the ceiling, because the tool
-    // advertises a schema for it; what gives way inside it is the long
-    // free text — the path and the options.
-    if serialized_len(&result) > max_bytes {
-        if let Some(object) = structured.as_object_mut() {
-            object.insert("next".to_owned(), json!([]));
-            if let Some(Value::Array(path)) = object.get_mut("path") {
-                path.truncate(8);
+    // advertises a schema for it. It is cut, detail first, until it fits
+    // beside the headline; what is left of the ceiling is the text's.
+    let mut structured = match structured(foresight) {
+        Value::Object(object) => object,
+        _ => Map::new(),
+    };
+    let mut cut = Cut::default();
+    let head = loop {
+        structured.insert("truncated".to_owned(), json!(cut.any()));
+        let head = match cut.note(foresight.path.len()) {
+            Some(note) => format!("{head} {note}"),
+            None => head.clone(),
+        };
+        if serialized_len(&assemble(&report(&head, &[], &[]), &structured)) <= max_bytes {
+            break head;
+        }
+        if !cut.next(&mut structured) {
+            // What is left is the run's identity — its id, tenant and
+            // agent — with the verdict and its numbers: no answer without
+            // them is an answer about this run.
+            return Err(ToolError(format!(
+                "The foresight for this run does not fit under this server's \
+                 --mcp-max-result-bytes ({max_bytes} bytes) even with every detail left out: \
+                 the run id, tenant and agent name alone take too much of it. Raise \
+                 --mcp-max-result-bytes, or read it from GET /v1/fate/runs/{{run}}."
+            )));
+        }
+    };
+    // The headline alone fits beside that, by the loop above.
+    let minimal = report(&head, &[], &[]);
+    let skeleton = serialized_len(&assemble("", &structured));
+    let mut budget = max_bytes.saturating_sub(skeleton);
+    loop {
+        // Rows give way first, then the notes; never the headline, which
+        // carries the verdict, its numbers and what was cut.
+        let text = [notes.as_slice(), &[]]
+            .into_iter()
+            .map(|notes| clamp_report_narrowing(&head, &rows, notes, budget, FORESEE_NARROW))
+            .find(|text| text.starts_with(head.trim_end()))
+            .unwrap_or_else(|| minimal.clone());
+        let result = assemble(&text, &structured);
+        let over = serialized_len(&result).saturating_sub(max_bytes);
+        if over == 0 {
+            return Ok(result);
+        }
+        // JSON escaping made the text longer than its bytes: give back
+        // what it overran by, and lay it out again. Once the budget is
+        // below the headline, the headline alone is what goes.
+        budget = budget.saturating_sub(over);
+    }
+}
+
+fn assemble(text: &str, structured: &Map<String, Value>) -> Value {
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": Value::Object(structured.clone()),
+        "isError": false,
+    })
+}
+
+/// Bytes the explanation is cut to, in turn, before it is left out.
+const EXPLANATION_CUTS: [usize; 2] = [256, 64];
+
+/// What a result too large for the ceiling has left out of its structured
+/// half so far. Detail goes first — what earlier runs did next, the
+/// recommendation, the pooled and common tokens, the divergence and the node
+/// — then the explanation, shortened and then emptied, then the path from
+/// its end. The run's identity, its verdict and its numbers are never cut:
+/// a result that cannot carry them is refused instead.
+#[derive(Default)]
+struct Cut {
+    fields: Vec<&'static str>,
+    /// Path tokens kept, once the path has been cut.
+    path_kept: Option<usize>,
+}
+
+impl Cut {
+    fn any(&self) -> bool {
+        !self.fields.is_empty() || self.path_kept.is_some()
+    }
+
+    /// The sentence the headline carries once anything was cut: server
+    /// words and field names only.
+    fn note(&self, path_len: usize) -> Option<String> {
+        if !self.any() {
+            return None;
+        }
+        let mut left: Vec<String> = self
+            .fields
+            .iter()
+            .map(|field| (*field).to_owned())
+            .collect();
+        if let Some(kept) = self.path_kept {
+            left.push(format!("path past its first {kept} of {path_len} tokens"));
+        }
+        Some(format!(
+            "Truncated to fit this server's --mcp-max-result-bytes: the structured result \
+             leaves out {} (truncated: true).",
+            left.join(", ")
+        ))
+    }
+
+    fn left_out(&mut self, field: &'static str) {
+        // A whole object left out names itself, not its parts again.
+        self.fields.retain(|part| {
+            part.split_once('.')
+                .map_or(true, |(whole, _)| whole != field)
+        });
+        if !self.fields.contains(&field) {
+            self.fields.push(field);
+        }
+    }
+
+    /// Cuts the next piece from `structured`; false when nothing is left
+    /// that may be cut.
+    fn next(&mut self, structured: &mut Map<String, Value>) -> bool {
+        let non_empty = |value: Option<&Value>| {
+            value
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+        };
+        if non_empty(structured.get("next")) {
+            structured.insert("next".to_owned(), json!([]));
+            self.left_out("next");
+            return true;
+        }
+        if structured.remove("recommended_next").is_some() {
+            self.left_out("recommended_next");
+            return true;
+        }
+        if let Some(Value::Object(node)) = structured.get_mut("node") {
+            if non_empty(node.get("pooled")) {
+                node.insert("pooled".to_owned(), json!([]));
+                self.left_out("node.pooled");
+                return true;
             }
         }
-        result["structuredContent"] = structured;
+        if let Some(Value::Object(divergence)) = structured.get_mut("divergence") {
+            if non_empty(divergence.get("common_next")) {
+                divergence.insert("common_next".to_owned(), json!([]));
+                self.left_out("divergence.common_next");
+                return true;
+            }
+        }
+        if structured.remove("divergence").is_some() {
+            self.left_out("divergence");
+            return true;
+        }
+        if structured.get("node").is_some_and(Value::is_object) {
+            structured.remove("node");
+            self.left_out("node");
+            return true;
+        }
+        if let Some(Value::String(explanation)) = structured.get_mut("explanation") {
+            if !explanation.is_empty() {
+                let cut = EXPLANATION_CUTS
+                    .into_iter()
+                    .find(|cut| explanation.len() > cut + '…'.len_utf8());
+                *explanation = match cut {
+                    Some(cut) => format!("{}…", truncate_bytes(explanation, cut)),
+                    None => String::new(),
+                };
+                self.left_out("explanation");
+                return true;
+            }
+        }
+        if let Some(Value::Array(path)) = structured.get_mut("path") {
+            if !path.is_empty() {
+                path.truncate(path.len() / 2);
+                self.path_kept = Some(path.len());
+                return true;
+            }
+        }
+        false
     }
-    result
 }
 
 fn structured(foresight: &Foresight) -> Value {
@@ -296,8 +455,17 @@ fn output_schema() -> Value {
             "divergence": {"type": "object"},
             "next": {"type": "array"},
             "outcome": {"type": "string"},
+            "truncated": {
+                "type": "boolean",
+                "description": "Whether detail was left out to fit the server's result ceiling: \
+                                then the text's headline names what (next, \
+                                recommended_next, node, divergence, the explanation, or the \
+                                path past its first tokens).",
+            },
         },
-        "required": ["run", "agent", "path", "verdict", "explanation", "support", "next"],
+        "required": [
+            "run", "agent", "path", "verdict", "explanation", "support", "next", "truncated",
+        ],
     })
 }
 
@@ -458,5 +626,135 @@ mod tests {
         let explanation = foresight["explanation"].as_str().expect("explanation");
         assert!(explanation.contains("ring\u{fffd}bell"), "{explanation}");
         assert!(!explanation.chars().any(char::is_control), "{explanation}");
+    }
+
+    #[test]
+    fn foresee_run_fits_every_ceiling_or_refuses_within_it() {
+        let fixture = TempStore::open("mcp-foresee-ceiling", crate::Config::default());
+        let store = fixture.store();
+        let now = crate::mcp::unix_nanos_now();
+        // Producer text at its bounds: tool names cut at 160 bytes, a path a
+        // dozen of them deep, and a run id of a thousand bytes.
+        let tools: Vec<String> = (0..12)
+            .map(|index| format!("{index:03}{}", "t".repeat(200)))
+            .collect();
+        let run_of = |run: &str, start: u64, failed: bool| -> Vec<crate::Span> {
+            tools
+                .iter()
+                .enumerate()
+                .map(|(position, tool)| {
+                    let mut span = crate::tape::tests::span(
+                        &format!("{run}-trace"),
+                        &format!("s{position}"),
+                        start + position as u64 * 1_000_000_000,
+                        json!({"session.id": run, "gen_ai.operation.name": "execute_tool",
+                               "gen_ai.tool.name": tool}),
+                    );
+                    span.service = "svc".into();
+                    if failed && position + 1 == tools.len() {
+                        span.status = "error".into();
+                    }
+                    span
+                })
+                .collect()
+        };
+        let mut spans = Vec::new();
+        for index in 0..40_u64 {
+            spans.extend(run_of(
+                &format!("done-{index}"),
+                now - 3 * 3_600_000_000_000 - index * 60_000_000_000,
+                index % 4 == 0,
+            ));
+        }
+        let long_id = format!("r{}", "x".repeat(999));
+        spans.extend(run_of("deep", now - 60_000_000_000, false));
+        spans.extend(run_of(&long_id, now - 60_000_000_000, false));
+        // A run that leaves the known paths halfway, with a long name of its
+        // own: a divergence, the common next steps and what runs did next.
+        let mut astray = run_of("astray", now - 60_000_000_000, false);
+        astray.truncate(7);
+        astray[6].attributes.insert(
+            "gen_ai.tool.name".to_owned(),
+            json!(format!("new{}", "n".repeat(300))),
+        );
+        spans.extend(astray);
+        // And one whose names JSON doubles: every byte a quote.
+        let mut quoted = run_of("quoted", now - 60_000_000_000, false);
+        quoted.truncate(3);
+        for (index, span) in quoted.iter_mut().enumerate() {
+            span.attributes.insert(
+                "gen_ai.tool.name".to_owned(),
+                json!(format!("{index}{}", "\"".repeat(300))),
+            );
+        }
+        spans.extend(quoted);
+        store.ingest_batch(spans).expect("ingests");
+        for ceiling in [super::super::MIN_RESULT_BYTES, 2_048, 32 * 1024] {
+            let server = Server::new(
+                store,
+                Limits {
+                    max_result_bytes: ceiling,
+                    max_payload_bytes: 4096,
+                },
+                false,
+            );
+            for run in ["deep", "astray", "quoted", long_id.as_str()] {
+                let response = server
+                    .handle(
+                        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                            "params": {"name": "foresee_run", "arguments": {"run_id": run}}}),
+                        Context {
+                            access: Access::Read,
+                            tenant: None,
+                            now_ns: now,
+                        },
+                    )
+                    .expect("a response");
+                let result = &response["result"];
+                let serialized = serde_json::to_vec(result).expect("serializes").len();
+                let label = format!("{}-byte run id at {ceiling}", run.len());
+                assert!(serialized <= ceiling, "{label}: {serialized} bytes");
+                let text = result["content"][0]["text"].as_str().expect("text");
+                if result["isError"] == json!(true) {
+                    // Only a result whose identifiers alone overflow is
+                    // refused, and the refusal quotes none of them.
+                    assert!(run.len() > 100 && ceiling < 2_048, "{label}: {text}");
+                    assert!(!text.contains("xxxxxxxx"), "{label}: {text}");
+                    assert!(text.contains("--mcp-max-result-bytes"), "{label}: {text}");
+                    continue;
+                }
+                let structured = &result["structuredContent"];
+                for required in output_schema()["required"].as_array().unwrap() {
+                    assert!(
+                        structured.get(required.as_str().unwrap()).is_some(),
+                        "{label}: {required} missing from {structured}"
+                    );
+                }
+                assert_eq!(structured["run"], json!(run), "{label}");
+                if run == "astray" {
+                    assert_eq!(structured["verdict"], json!("novel"), "{label}");
+                }
+                // The headline is never what gives way.
+                assert!(text.starts_with("Foresight: "), "{label}: {text}");
+                if ceiling == 32 * 1024 {
+                    assert_eq!(structured["truncated"], json!(false), "{label}");
+                    let path = structured["path"].as_array().map(Vec::len);
+                    let whole = match run {
+                        "astray" => 7,
+                        "quoted" => 3,
+                        _ => 12,
+                    };
+                    assert_eq!(path, Some(whole), "{label}");
+                    if run == "astray" {
+                        assert!(structured["divergence"]["common_next"][0].is_string());
+                        assert!(!structured["next"].as_array().unwrap().is_empty());
+                    }
+                } else {
+                    // Cut to fit, and saying so in both halves.
+                    assert_eq!(structured["truncated"], json!(true), "{label}");
+                    assert!(text.contains("Truncated"), "{label}: {text}");
+                }
+            }
+        }
     }
 }
