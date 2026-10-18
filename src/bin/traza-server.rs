@@ -1259,10 +1259,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "import" => traza::import::import_main(&args[1..]),
             _ => traza::import::blame_main(&args[1..]),
         };
+        // Exit 1 is an answer for `blame` (no agent wrote the line), so a
+        // failure to answer at all exits 2.
         match outcome {
             Ok(0) => return Ok(()),
             Ok(code) => std::process::exit(code),
-            Err(message) => return Err(message.into()),
+            Err(message) => {
+                eprintln!("traza-server: {message}");
+                std::process::exit(2);
+            }
         }
     }
     let Some(options) = parse_args(&args)? else {

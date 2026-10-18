@@ -125,7 +125,8 @@ re-sends spans the destination already holds, which is harmless.
 A batch the destination refuses is split until the refused spans are isolated;
 they are counted and named, and the rest still land. A refused credential, an
 unreachable server or an exhausted quota stops the import with the server's own
-words. The exit code is 0, or 3 when some spans or files were refused.
+words. The exit code is 0, 3 when some spans or files were refused, and 2 when
+the import could not run.
 
 `--since 7d` only reads files modified that recently (a selected session is
 imported whole); `--project-filter SUBSTR` only sessions whose file path or
@@ -169,16 +170,17 @@ the way it does before it changes it.
 **What counts as introducing a line.** A tool step introduces a line into a
 file when its edit adds the line more times than it removes it, compared with
 whitespace normalised (runs of whitespace fold to one space, ends trimmed — so
-re-indenting is not authorship, as with `git blame -w`). Edits are read from
-the arguments by shape, not by one vendor's tool names: `new_string`/
-`old_string` (Claude Code `Edit`), `edits[]` (`MultiEdit`), `content` from a
-tool whose name contains `write` (`Write`: every line counts), `new_source`
-(`NotebookEdit`), the `create`/`str_replace`/`insert` commands of Anthropic's
-text-editor tool, and any Codex patch (`*** Begin Patch`) anywhere in the
-arguments — `+` lines added and `-` lines removed per file, relative paths
-joined with the working directory the Codex importer records. It therefore
-works on Claude Code and Codex sessions recorded any way, not only imported
-ones, as long as the arguments were recorded.
+re-indenting is not authorship, as with `git blame -w`). The edit is read from
+the call's arguments by shape: `new_string`/`old_string` (Claude Code `Edit`),
+`edits[]` (`MultiEdit`), `content` from a tool whose name contains `write`
+(`Write`: every line counts), `new_source` (`NotebookEdit`), the
+`create`/`str_replace`/`insert` commands of Anthropic's text-editor tool,
+Codex file-change items (`changes` with a file's content or unified diff), and
+any Codex patch (`*** Begin Patch`) anywhere in the arguments — `+` lines added
+and `-` lines removed per file, relative paths joined with the working
+directory the Codex importer records. It therefore works on Claude Code and
+Codex sessions recorded any way, not only imported ones, as long as the
+arguments were recorded.
 
 **Which file.** The query path matches when it is a suffix of the recorded
 path at a component boundary (`src/lib.rs` matches `/repo/src/lib.rs`, not
@@ -193,17 +195,22 @@ at most 50). Each names its run, tenant, trace and span, the tool, the file as
 recorded, when, the prompt that started that turn (or the task a sub-agent was
 given, with the sub-agent named), the model whose response asked for the edit,
 and the step's position on the run's tape. `traza-server blame` exits 0 when it
-found one and 1 when no recorded edit introduced the line.
+found one, 1 when no recorded edit introduced the line, and 2 when it could not
+ask.
 
-**How it is found.** Candidates come from the content index: a span must
-contain the file name's words and the line's words — only the line's words
-whose left neighbour is printable ASCII punctuation or a space, because those
-are the only words a JSON-escaped copy of the line (arguments recorded as a
-string, where a newline becomes `\n`) tokenises the same way. Every candidate is
-verified by parsing its edit, so the index only makes the search faster. The
-search and the reading of each match's run share one query deadline; at most
-200,000 candidates are verified (`truncated` says when more existed); a line
-with no searchable word at all, in the line or the file name, is refused.
+**How it is found.** Candidates are the calls of the editing tools —
+`Edit`, `MultiEdit`, `Write`, `NotebookEdit`, `apply_patch`, `shell`, `local_shell`, `str_replace_based_edit_tool`, `str_replace_editor`, `text_editor`, `edit_file`, `write_file`, `create_file` — found through the exact attribute index on
+`gen_ai.tool.name` and `tool.name`, so the search decodes edit calls and
+nothing else, and every candidate is verified by parsing its edit. (The content
+index cannot serve here: a store of transcripts is mostly model calls carrying
+whole conversations, whose word filters admit nearly every block for ordinary
+code words.) The search and the reading of each match's run share one query
+deadline; at most 200,000 candidates are verified (`truncated` says when more
+existed). Measured on a real import of one developer's Claude Code history
+(73,965 spans, 7,162 edit calls; release build, Apple-silicon laptop): a line no
+agent wrote is answered in 0.36 s, and of 100 randomly chosen code lines of
+this repository, 81 were attributed to the recorded step that wrote them, at a
+median of 0.93 s per `traza-server blame` call.
 
 ## Limits, honestly
 
@@ -241,5 +248,6 @@ with no searchable word at all, in the line or the file name, is refused.
   trace. Each file is capped at 200,000 spans (`capped` counts what was left
   out), a line at 64 MiB, a decompressed rollout at 2 GiB.
 - **Blame** cannot see lines written by shell commands (`sed -i`, heredocs,
-  generators), edits whose arguments were not recorded, or the part of an
-  argument offloaded to the payload store beyond its inline preview.
+  generators), edits by a tool whose name is not in the list above, edits
+  whose arguments were not recorded, or the part of an argument offloaded to
+  the payload store beyond its inline preview.

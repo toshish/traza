@@ -1313,7 +1313,7 @@ curl 'http://localhost:8080/v1/blame?path=src/item.rs&line=pub%20price%3A%20u64%
 ```
 
 ```json
-{"line":"pub price: u64,","matches":[{"agent":"general-purpose","at_ns":1767607225000000000,"file":"/tmp/demo-shop/src/item.rs","model":"claude-haiku-4-5-20251001","prompt":"Add a price field to Item in src/item.rs","run":"11111111-1111-4111-8111-111111111111","service":"claude-code","span_id":"fe06d3b7c5815378","step_index":10,"tenant":"","tool":"MultiEdit","trace_id":"257eaef69d566d3579947aac638045ca"}],"path":"src/item.rs","searched_spans":7,"truncated":false}
+{"line":"pub price: u64,","matches":[{"agent":"general-purpose","at_ns":1767607225000000000,"file":"/tmp/demo-shop/src/item.rs","model":"claude-haiku-4-5-20251001","prompt":"Add a price field to Item in src/item.rs","run":"11111111-1111-4111-8111-111111111111","service":"claude-code","span_id":"fe06d3b7c5815378","step_index":10,"tenant":"","tool":"MultiEdit","trace_id":"257eaef69d566d3579947aac638045ca"}],"path":"src/item.rs","searched_spans":6,"truncated":false}
 ```
 
 A step **introduces** a line when its edit adds it more times than it removes
@@ -1328,18 +1328,17 @@ ancestor, cut to 500 characters: the turn's prompt, or the task a sub-agent was
 given, in which case `agent` names the sub-agent. `line` and `path` echo what
 was compared.
 
-Candidates come from the content index (the file name's words and the line's
-words that a JSON-escaped copy of it tokenises the same way) and every one is
-verified by parsing its edit. `searched_spans` counts the candidates verified;
-at most 200,000 are, and `truncated: true` says more existed, so an earlier
-introduction may be missing. The search and the reading of each match's run
-spend one [query deadline](../configuration.md#server-flags).
+Candidates are the calls of the editing tools (`Edit`, `MultiEdit`, `Write`, `NotebookEdit`, `apply_patch`, `shell`, `local_shell`, `str_replace_based_edit_tool`, `str_replace_editor`, `text_editor`, `edit_file`, `write_file`, `create_file`), found
+through the exact attribute index on `gen_ai.tool.name` and `tool.name`, and
+every one is verified by parsing its edit. `searched_spans` counts the
+candidates verified; at most 200,000 are, and `truncated: true` says more
+existed, so an earlier introduction may be missing. The search and the reading
+of each match's run spend one [query deadline](../configuration.md#server-flags).
 
-`400` for a missing `path` or `line`, an empty line, a line and file name with
-no searchable word between them (ASCII letters or digits), an invalid `limit`,
-or an unknown parameter; `403` when a bound credential names another tenant.
-Lines written by shell commands are not found — they are not edits a tool
-call's arguments describe.
+`400` for a missing `path` or `line`, an empty line, a path with no file in
+it, an invalid `limit`, or an unknown parameter; `403` when a bound credential
+names another tenant. Lines written by shell commands, or by a tool not in the
+list, are not found.
 
 ---
 

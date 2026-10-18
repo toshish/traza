@@ -48,28 +48,6 @@ fn a_path_matches_by_component_suffix_only() {
 }
 
 #[test]
-fn probe_words_skip_words_an_escaped_copy_would_glue() {
-    // `let` starts the line (after a tab): a JSON-escaped copy reads `\tlet`
-    // as the token `tlet`, so it cannot be probed. `total` follows a space.
-    let words = probe_words("\tlet total = items.sum();", "/repo/src/cart.rs");
-    assert_eq!(words, ["total", "items", "sum", "cart", "rs"]);
-    // The soundness claim, checked: every probed word is a word of the
-    // escaped text the content index would see.
-    let escaped = serde_json::to_string(&json!({
-        "new_string": "fn a() {}\n\tlet total = items.sum();\n",
-        "file_path": "/repo/src/cart.rs",
-    }))
-    .expect("json");
-    let query = crate::content::Query::new(&words.join(" "));
-    assert!(query.matches(std::iter::once(escaped.as_str())));
-    // A word after a non-ASCII character is skipped too (`\u00e9` escapes).
-    assert_eq!(
-        probe_words("é sum", "x"),
-        vec!["sum".to_owned(), "x".to_owned()]
-    );
-}
-
-#[test]
 fn an_edit_introduces_a_line_only_when_it_adds_more_than_it_removes() {
     let edit = tool_span(
         "t",
@@ -364,17 +342,24 @@ fn blame_is_tenant_scoped() {
 fn blame_refuses_what_it_cannot_search_and_honours_the_deadline() {
     let fixture = blame_store("refusals");
     let store = fixture.store();
-    for (path, line) in [("src/cart.rs", "   "), ("", "x = 1"), ("日本", "}")] {
+    for (path, line) in [("src/cart.rs", "   "), ("", "x = 1"), ("/", "x = 1")] {
         match store.blame(Some(""), path, line, 5) {
             Err(Error::Invalid(_)) => {}
             other => panic!("{path:?} {line:?}: expected a refusal, got {other:?}"),
         }
     }
-    // A line with no probe-able word still narrows by the file name.
-    let brace = store
-        .blame(Some(""), "src/cart.rs", "}", 5)
-        .expect("narrowed by the file name");
-    assert!(brace.matches.is_empty());
+    // Any line with text can be asked about — punctuation, non-ASCII — since
+    // candidates come from the tool-name index, not from words.
+    for line in ["}", "日本語のコメント"] {
+        let answer = store
+            .blame(Some(""), "src/cart.rs", line, 5)
+            .expect("answers");
+        assert!(answer.matches.is_empty());
+        assert_eq!(
+            answer.searched_spans, 3,
+            "the default tenant's three edit calls, and only them"
+        );
+    }
 
     let config = crate::Config {
         query_deadline: Some(std::time::Duration::ZERO),

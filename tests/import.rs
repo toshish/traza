@@ -331,6 +331,7 @@ fn a_bad_credential_or_a_bad_command_line_stops_the_import_with_a_reason() {
         "{}",
         String::from_utf8_lossy(&refused.stderr)
     );
+    assert_eq!(refused.status.code(), Some(2));
     for args in [
         vec!["import", "gemini"],
         vec![
@@ -346,7 +347,7 @@ fn a_bad_credential_or_a_bad_command_line_stops_the_import_with_a_reason() {
         vec!["import", "codex", "--tenant", "Not Valid"],
     ] {
         let output = run(&home, &args);
-        assert!(!output.status.success(), "{args:?} must be refused");
+        assert_eq!(output.status.code(), Some(2), "{args:?} must be refused");
         assert!(!output.stderr.is_empty(), "{args:?} says why");
     }
     let _ = std::fs::remove_dir_all(&home);
@@ -375,6 +376,17 @@ fn decoded_spans(server: &Server) -> u64 {
         .find_map(|line| line.strip_prefix("traza_http_decoded_spans_total "))
         .and_then(|value| value.trim().parse().ok())
         .expect("metric")
+}
+
+/// The offset the state file records for `file`, under any destination.
+fn recorded_offset(state: &Path, file: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(state).ok()?;
+    let parsed: Value = serde_json::from_str(&text).ok()?;
+    let key = file.to_string_lossy();
+    parsed["destinations"]
+        .as_object()?
+        .values()
+        .find_map(|destination| destination["files"][key.as_ref()]["offset"].as_u64())
 }
 
 struct Watcher(Child);
@@ -439,18 +451,27 @@ fn watch_follows_appends_and_new_files_and_resumes_from_its_state() {
 
     // So does a session that did not exist when it started.
     let s3 = "33333333-3333-4333-8333-333333333333";
-    append_turn(
-        &root.join("-tmp-demo-shop").join(format!("{s3}.jsonl")),
-        s3,
-        "new",
-        2,
-    );
+    let new_file = root.join("-tmp-demo-shop").join(format!("{s3}.jsonl"));
+    append_turn(&new_file, s3, "new", 2);
     eventually("the new session", Duration::from_secs(20), || {
         steps(s3) == 1
     });
 
     // Stopped, the transcript grows; restarted, it sends what is new — and
-    // only that: the resend floor comes from the state file.
+    // only that: the resend floor comes from the state file. (Stopped only
+    // once the state file says both files were sent in full: a watcher
+    // killed between sending and saving re-sends that pass — harmless,
+    // since re-sending is idempotent, but not what this test counts.)
+    eventually(
+        "the state file to catch up",
+        Duration::from_secs(20),
+        || {
+            [&main, &new_file].iter().all(|file| {
+                let length = std::fs::metadata(file).map_or(0, |meta| meta.len());
+                recorded_offset(&state, file) == Some(length)
+            })
+        },
+    );
     drop(watcher);
     let before = decoded_spans(&server);
     append_turn(&main, S1, "offline", 3);

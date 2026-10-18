@@ -254,8 +254,8 @@ runs.
 | `--json` | off | Print the final counts as JSON instead of a summary line. |
 
 Exit status `0`; `3` when some spans or files were refused (named in the
-output); non-zero with the reason on stderr when the import could not run —
-an unreadable state file, a refused credential, an unreachable server.
+output); `2`, with the reason on stderr, when the import could not run — an
+unreadable state file, a refused credential, an unreachable server.
 
 **`traza-server blame FILE:LINE`** reads line `LINE` (from 1) of `FILE` and asks
 [`GET /v1/blame`](guide/http-api.md#get-v1blame) which agent step introduced
@@ -271,7 +271,7 @@ holding `.git`) when there is one.
 | `--json` | off | Print the route's JSON instead of the human rendering. |
 
 Exit status `0` when an introduction was found, `1` when no recorded edit
-introduced the line, other non-zero on errors.
+introduced the line, `2` (reason on stderr) when it could not ask.
 
 ## Model pricing
 

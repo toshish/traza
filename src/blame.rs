@@ -13,7 +13,7 @@
 //! more times than it removes it, compared on whitespace-normalised text
 //! (runs of whitespace fold to one space, ends trimmed — so re-indenting a
 //! line is not authorship, as with `git blame -w`). Edits are read from the
-//! tool call's arguments, by shape rather than by one vendor's tool names:
+//! tool call's arguments, by shape:
 //!
 //! - `new_string` (with `old_string`) and a file path — Claude Code `Edit`;
 //! - `edits: [{old_string, new_string}]` — `MultiEdit`;
@@ -39,23 +39,24 @@
 //!
 //! # How it is found, and what bounds it
 //!
-//! Candidates come from the content index: the span must contain the file's
-//! base-name words and the line's words. Only words whose left neighbour in
-//! the line is printable ASCII punctuation or a space are used, because those
-//! are the only words a JSON-escaped copy of the line (arguments recorded as
-//! a string, where a newline becomes `\n` and a tab `\t`) tokenises the same
-//! way — a word at the start of a line, after a tab or after a non-ASCII
-//! character would otherwise be glued to the escape and missed. Every
-//! candidate is then verified by parsing its edit, so the index can only make
-//! the search faster, never change its answer. The whole search — the fold,
-//! and reading each match's trace and run — spends one query deadline; at
-//! most [`MAX_BLAME_CANDIDATES`] candidates are verified (`truncated` says
-//! when more existed) and the earliest [`MAX_BLAME_LIMIT`] matches are kept.
+//! Candidates are the tool steps of the editing tools in [`EDIT_TOOLS`],
+//! found through the exact attribute index on `gen_ai.tool.name` and
+//! `tool.name`, so the search decodes edit calls and nothing else. The
+//! content index cannot serve here: a store of agent transcripts is mostly
+//! model calls carrying whole conversations, whose word filters admit nearly
+//! every block for ordinary code words, and a content-driven search ends up
+//! tokenising the store (measured on a real import: past a 30 s budget). Every
+//! candidate is verified by parsing its edit. The whole search — one indexed
+//! fold per tool name and key, then reading each match's run — spends one
+//! query deadline; at most [`MAX_BLAME_CANDIDATES`] candidates are verified
+//! (`truncated` says when more existed) and the earliest [`MAX_BLAME_LIMIT`]
+//! matches are kept.
 //!
 //! **Limits, honestly:** a line written by a shell command (`sed -i`, a
-//! heredoc, a code generator) is not an edit Traza can read and is not found;
-//! an argument offloaded to the payload store is searchable only within its
-//! inline preview; a line that was introduced, deleted and re-introduced
+//! heredoc, a code generator) is not an edit Traza can read and is not found,
+//! nor is an edit by a tool whose name is not in [`EDIT_TOOLS`]; an argument
+//! offloaded to the payload store is read only as its inline preview; a line
+//! that was introduced, deleted and re-introduced
 //! returns every introduction, earliest first — the earliest is the answer
 //! the route is named for, not necessarily the one in the file today.
 
@@ -65,7 +66,32 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::semconv::{self, StepKind};
-use crate::{content, Error, Result, Span, SpanFilter, Store};
+use crate::{Error, Result, Span, SpanFilter, Store};
+
+/// The editing tools blame searches, by exact name: Claude Code's, Codex's
+/// (`apply_patch` for its patch tool and file-change items; `shell` and
+/// `local_shell` for older builds that applied patches through the shell),
+/// Anthropic's text-editor tool under its published names, and common generic
+/// names. A tool step is a candidate when `gen_ai.tool.name` or `tool.name`
+/// is one of these.
+pub const EDIT_TOOLS: &[&str] = &[
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "NotebookEdit",
+    "apply_patch",
+    "shell",
+    "local_shell",
+    "str_replace_based_edit_tool",
+    "str_replace_editor",
+    "text_editor",
+    "edit_file",
+    "write_file",
+    "create_file",
+];
+
+/// The attribute keys a tool name is indexed under.
+const TOOL_NAME_KEYS: [&str; 2] = ["gen_ai.tool.name", "tool.name"];
 
 /// Matches returned when the caller names no limit.
 pub const DEFAULT_BLAME_LIMIT: usize = 5;
@@ -78,9 +104,6 @@ pub const MAX_BLAME_CANDIDATES: usize = 200_000;
 
 /// Characters of the prompt returned with a match.
 pub const PROMPT_CHARS: usize = 500;
-
-/// Content words probed at most.
-const MAX_PROBE_WORDS: usize = 16;
 
 /// Parent links followed from a tool step to its prompt.
 const MAX_ANCESTRY: usize = 64;
@@ -165,6 +188,13 @@ pub struct Blame {
     pub path: String,
 }
 
+/// Runs and traces read while enriching one answer, by `(tenant, id)`.
+#[derive(Default)]
+struct Reads {
+    runs: std::collections::HashMap<(String, String), crate::run::RunSpans>,
+    traces: std::collections::HashMap<(String, String), Vec<Span>>,
+}
+
 /// A candidate kept while folding: the span and the edit that matched.
 struct Found {
     span: Span,
@@ -177,9 +207,9 @@ impl Store {
     /// [`MAX_BLAME_LIMIT`]) whose edit introduced `line` into a file matching
     /// `path`, under `tenant` (`None` is the operator view across tenants).
     ///
-    /// An empty line or path, or one with no searchable word at all (see the
-    /// module docs), is [`Error::Invalid`]. Budgeted by the query deadline,
-    /// anchored here, across the search and every match's enrichment.
+    /// An empty line or path is [`Error::Invalid`]. Budgeted by the query
+    /// deadline, anchored here, across the search and every match's
+    /// enrichment.
     pub fn blame(
         &self,
         tenant: Option<&str>,
@@ -194,65 +224,37 @@ impl Store {
             ));
         }
         let query_path = normalize_path(path);
-        if query_path.is_empty() {
+        if query_path.trim_start_matches('/').is_empty() {
             return Err(Error::Invalid(
                 "path is empty; pass the file's path or a suffix of it".to_owned(),
             ));
         }
-        let words = probe_words(line, &query_path);
-        if words.is_empty() {
-            return Err(Error::Invalid(
-                "neither the line nor the file name has a searchable word (ASCII letters or \
-                 digits) to narrow the search by"
-                    .to_owned(),
-            ));
-        }
         let limit = limit.clamp(1, MAX_BLAME_LIMIT);
         let deadline = self.query_deadline(Instant::now());
-        let filter = SpanFilter {
-            content: Some(words.join(" ")),
-            tenant: tenant.map(str::to_owned),
-            ..SpanFilter::default()
-        };
         let mut kept: Vec<Found> = Vec::new();
         let mut searched = 0usize;
         let mut truncated = false;
-        self.fold_spans_under(&filter, deadline, |span| {
-            if searched >= MAX_BLAME_CANDIDATES {
-                truncated = true;
-                return;
+        for key in TOOL_NAME_KEYS {
+            for tool in EDIT_TOOLS {
+                let filter = SpanFilter {
+                    attributes: vec![(key.to_owned(), Value::String((*tool).to_owned()))],
+                    tenant: tenant.map(str::to_owned),
+                    ..SpanFilter::default()
+                };
+                self.fold_spans_under(&filter, deadline, |span| {
+                    if searched >= MAX_BLAME_CANDIDATES {
+                        truncated = true;
+                        return;
+                    }
+                    searched += 1;
+                    consider(span, &normalized, &query_path, limit, &mut kept);
+                })?;
             }
-            searched += 1;
-            let Some(edit) = edits(span)
-                .into_iter()
-                .find(|edit| edit.introduces(&normalized) && path_matches(&edit.file, &query_path))
-            else {
-                return;
-            };
-            let key = |found: &Found| {
-                (
-                    found.span.start_time_ns,
-                    found.span.tenant.clone(),
-                    found.span.trace_id.clone(),
-                    found.span.span_id.clone(),
-                )
-            };
-            let candidate = Found {
-                span: span.clone(),
-                tool: edit.tool,
-                file: edit.file,
-            };
-            let at = kept
-                .binary_search_by(|probe| key(probe).cmp(&key(&candidate)))
-                .unwrap_or_else(|position| position);
-            if at < limit {
-                kept.insert(at, candidate);
-                kept.truncate(limit);
-            }
-        })?;
+        }
         let mut matches = Vec::with_capacity(kept.len());
+        let mut reads = Reads::default();
         for found in kept {
-            matches.push(self.blame_match(found, deadline)?);
+            matches.push(self.blame_match(found, deadline, &mut reads)?);
         }
         Ok(Blame {
             matches,
@@ -264,12 +266,24 @@ impl Store {
     }
 
     /// Reads a match's run (and its trace, when the run spans several) to
-    /// name its prompt, model, agent and tape position.
-    fn blame_match(&self, found: Found, deadline: Option<crate::Deadline>) -> Result<BlameMatch> {
+    /// name its prompt, model, agent and tape position. Matches in one
+    /// session share one read of it (`reads`).
+    fn blame_match(
+        &self,
+        found: Found,
+        deadline: Option<crate::Deadline>,
+        reads: &mut Reads,
+    ) -> Result<BlameMatch> {
         let span = &found.span;
         let run = semconv::run_id(&span.attributes, &span.trace_id);
         let tenant = Some(span.tenant.as_str());
-        let run_spans = self.run_spans(tenant, &run, MAX_RUN_SPANS, deadline)?;
+        let run_key = (span.tenant.clone(), run.clone());
+        if !reads.runs.contains_key(&run_key) {
+            let read = self.run_spans(tenant, &run, MAX_RUN_SPANS, deadline)?;
+            reads.runs.insert(run_key.clone(), read);
+        }
+        let Reads { runs, traces } = reads;
+        let run_spans = &runs[&run_key];
         let mut step_index = None;
         let mut steps = 0usize;
         for candidate in &run_spans.spans {
@@ -288,10 +302,15 @@ impl Store {
                 .spans
                 .iter()
                 .all(|candidate| candidate.trace_id == span.trace_id);
-        let trace = if one_trace {
-            run_spans.spans
+        let trace: &[Span] = if one_trace {
+            &run_spans.spans
         } else {
-            self.trace_spans_in(tenant, &span.trace_id, deadline)?
+            let trace_key = (span.tenant.clone(), span.trace_id.clone());
+            if !traces.contains_key(&trace_key) {
+                let read = self.trace_spans_in(tenant, &span.trace_id, deadline)?;
+                traces.insert(trace_key.clone(), read);
+            }
+            &traces[&trace_key]
         };
         let by_id: std::collections::HashMap<&str, &Span> = trace
             .iter()
@@ -343,6 +362,39 @@ impl Store {
     }
 }
 
+/// Keeps `span` among the earliest `limit` candidates when one of its edits
+/// introduced `normalized` into a file matching `query_path`. A span seen
+/// twice (indexed under both tool-name keys) is kept once.
+fn consider(span: &Span, normalized: &str, query_path: &str, limit: usize, kept: &mut Vec<Found>) {
+    let Some(edit) = edits(span)
+        .into_iter()
+        .find(|edit| edit.introduces(normalized) && path_matches(&edit.file, query_path))
+    else {
+        return;
+    };
+    let key = |found: &Found| {
+        (
+            found.span.start_time_ns,
+            found.span.tenant.clone(),
+            found.span.trace_id.clone(),
+            found.span.span_id.clone(),
+        )
+    };
+    let candidate = Found {
+        span: span.clone(),
+        tool: edit.tool,
+        file: edit.file,
+    };
+    match kept.binary_search_by(|probe| key(probe).cmp(&key(&candidate))) {
+        Ok(_) => {}
+        Err(at) if at < limit => {
+            kept.insert(at, candidate);
+            kept.truncate(limit);
+        }
+        Err(_) => {}
+    }
+}
+
 /// Whitespace-normalised line text: runs of whitespace fold to one space,
 /// ends trimmed.
 pub fn normalize_line(text: &str) -> String {
@@ -383,43 +435,6 @@ pub fn path_matches(recorded: &str, query: &str) -> bool {
                 && whole_trimmed.as_bytes()[whole_trimmed.len() - tail.len() - 1] == b'/')
     };
     suffix(&recorded, &query) || (!recorded.starts_with('/') && suffix(&query, &recorded))
-}
-
-/// The content words a span holding this edit must contain: the line's
-/// words that a JSON-escaped copy of it tokenises identically (see the
-/// module docs), then the file name's.
-pub fn probe_words(line: &str, path: &str) -> Vec<String> {
-    let mut words: Vec<String> = Vec::new();
-    let bytes = line.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if !bytes[index].is_ascii_alphanumeric() {
-            index += 1;
-            continue;
-        }
-        let start = index;
-        while index < bytes.len() && bytes[index].is_ascii_alphanumeric() {
-            index += 1;
-        }
-        let safe_left = start > 0 && {
-            let left = bytes[start - 1];
-            (0x20..=0x7e).contains(&left) && !left.is_ascii_alphanumeric() && left != b'\\'
-        };
-        if safe_left {
-            let word = line[start..index].to_ascii_lowercase();
-            if !words.contains(&word) {
-                words.push(word);
-            }
-        }
-    }
-    let base = path.rsplit('/').next().unwrap_or(path);
-    for word in content::tokens(base) {
-        if !words.contains(&word) {
-            words.push(word);
-        }
-    }
-    words.truncate(MAX_PROBE_WORDS);
-    words
 }
 
 /// The edits a tool step's arguments describe (empty for anything that is

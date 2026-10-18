@@ -733,12 +733,32 @@ fn filters_select_files_by_project_and_age() {
     let stats = import(&filtered, &mut Memory::new());
     assert_eq!(stats.files_read, 3);
 
+    // Ages are set explicitly: a copy may keep its source's modification
+    // time (it does on macOS), so "just copied" says nothing about age.
     let dir = scratch("since");
     copy_tree(&fixtures().join("codex"), &dir);
+    let files = discover(Source::Codex, &dir);
+    let now = std::time::SystemTime::now();
+    for (index, file) in files.iter().enumerate() {
+        let age = if index == 0 {
+            Duration::from_secs(2 * 86_400)
+        } else {
+            Duration::from_secs(60)
+        };
+        std::fs::File::options()
+            .write(true)
+            .open(&file.path)
+            .and_then(|handle| handle.set_modified(now - age))
+            .expect("sets the modification time");
+    }
     let mut recent = options(Source::Codex, &dir, None);
     recent.since = Some(Duration::from_secs(3600));
     let stats = import(&recent, &mut Memory::new());
-    assert_eq!(stats.files_read, 3, "just-copied files are recent");
+    assert_eq!(
+        (stats.files_read, stats.files_filtered),
+        (2, 1),
+        "the file modified two days ago is outside the last hour"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
