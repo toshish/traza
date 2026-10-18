@@ -6,7 +6,7 @@
 
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, act, cleanup, fireEvent, screen } from '@testing-library/react';
+import { render, act, cleanup, fireEvent, screen, within } from '@testing-library/react';
 import changes from '../test/fixtures/insight/changes.json';
 import placed from '../test/fixtures/insight/changes_run.json';
 // Two agents posted to a fresh server: `tuned-bot`'s sampling parameters
@@ -14,6 +14,9 @@ import placed from '../test/fixtures/insight/changes_run.json';
 // moved success from 8 of 8 ended runs to 0 of 8, every other run declaring
 // an outcome Traza does not recognize.
 import typed from '../test/fixtures/insight/changes_params.json';
+// A store of its own: support-agent in tenants acme and globex, each with a
+// service.version change (globex's a regression), read in the operator view.
+import twoTenants from '../test/fixtures/insight/changes_tenants.json';
 
 vi.mock('../lib/api.js', () => ({
   api: {
@@ -143,5 +146,27 @@ describe('one run on its timeline', () => {
     fireEvent.change(screen.getByLabelText('Run to place'), { target: { value: 'ticket-076' } });
     fireEvent.keyDown(screen.getByLabelText('Run to place'), { key: 'Enter' });
     expect(new URLSearchParams(window.location.hash.split('?')[1]).get('run')).toBe('ticket-076');
+  });
+});
+
+describe('one agent name in two tenants', () => {
+  it('jumps from a timeline marker to its own tenant\'s change, never the other\'s', async () => {
+    api.changes.mockResolvedValueOnce(twoTenants);
+    const scrolled = [];
+    const before = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function scrollIntoView() { scrolled.push(this); };
+    try {
+      await show();
+      const sections = screen.getAllByTestId('agent-changes');
+      expect(sections.map((s) => s.textContent.match(/tenant ([a-z]+)/)[1])).toEqual(['globex', 'acme']);
+      const cards = screen.getAllByTestId('change');
+      expect(new Set(cards.map((card) => card.id)).size).toBe(cards.length);
+      for (const section of sections) {
+        fireEvent.click(within(section).getByTestId('change-marker'));
+        expect(scrolled[scrolled.length - 1]).toBe(within(section).getByTestId('change'));
+      }
+    } finally {
+      Element.prototype.scrollIntoView = before;
+    }
   });
 });

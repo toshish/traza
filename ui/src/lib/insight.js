@@ -300,24 +300,51 @@ export function nodeMeans(node) {
   };
 }
 
-/** A map path as the TQL query that finds the runs which took it: each
-    token an atom, its repeat bucket a count, anchored at the run's first
-    step. Not anchored at the end — a run passes through a node whatever it
-    did afterwards. `null` for a path TQL cannot say exactly: a cut name
-    (ending in `…`) or a kind that is not a step. */
-export function pathToTql(path) {
+/** A map path as the TQL query that finds exactly the runs through its
+    node, anchored at the run's first step.
+
+    Each token is matched by its step signature (`kind:name`), compared
+    exactly as the map groups steps — never by the atom's own name test,
+    which ignores ASCII case and would take `Search` for `search` — and its
+    repeat bucket becomes a count. The map puts a run that repeated a step
+    more than its bucket allows in a sibling branch (three to five calls is
+    `×3-5`, six is `×6+`), so the last token is held to its bucket: the run
+    ends there, or its next step is something else. A token before it needs
+    no such guard: the next token is a different signature, so the very next
+    step must be it.
+
+    `null` for a path TQL cannot say exactly: the fold token or a cut name
+    (ending in `…`), a kind that is not a step, a name that itself carries
+    the bucket mark `×`, or — given the map's `root` — a token two branches
+    of the map share. The map names a step by its text, so a tool literally
+    called `search×2`, called once, reads like `search` called twice; when
+    both are drawn under one node there is no telling which branch a query
+    would mean. */
+export function pathToTql(path, root) {
+  if (!Array.isArray(path) || !path.length) return null;
   const atoms = [];
-  for (const token of path || []) {
-    if (token === '…') break;
+  let node = root || null;
+  let last = null;
+  for (const token of path) {
+    if (root) {
+      const children = (node && node.children) || [];
+      if (children.filter((child) => child.token === token).length > 1) return null;
+      node = children.find((child) => child.token === token) || null;
+    }
     const { kind, name } = splitToken(token);
     if (!['llm', 'tool', 'agent'].includes(kind)) return null;
     const bucket = /×(2|3-5|6\+)$/.exec(name);
     const bare = bucket ? name.slice(0, -bucket[0].length) : name;
-    if (!bare || bare.endsWith('…') || /[\u0000-\u001f]/.test(bare)) return null;
+    if (!bare || bare.endsWith('…') || bare.includes('×') || /[\u0000-\u001f]/.test(bare)) return null;
+    const signature = JSON.stringify(`${kind}:${bare}`);
     const count = !bucket ? '' : bucket[1] === '2' ? '{2}' : bucket[1] === '3-5' ? '{3,5}' : '{6,}';
-    atoms.push(`${kind}(${JSON.stringify(bare)})${count}`);
+    atoms.push(`${kind}[signature=${signature}]${count}`);
+    last = { signature, open: Boolean(bucket) && bucket[1] === '6+' };
   }
-  return atoms.length ? '^' + atoms.join(' -> ') : null;
+  const head = '^' + atoms.join(' -> ');
+  // Six or more has no upper bound: nothing after it can move a run out.
+  if (last.open) return head;
+  return `${head}$ | ${head} -> step[signature!=${last.signature}]`;
 }
 
 /** The verdicts foresight gives a run, with the tag tone each is drawn in. */

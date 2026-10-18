@@ -14,11 +14,20 @@ import noHistory from '../test/fixtures/live_row_no_history.json';
 // --live-window-seconds 3`: a second run took the guard's one slot (the
 // first is `evicted`), then went quiet past the window (`expired`).
 import removedText from '../test/fixtures/live_stream_removed.txt?raw';
+// GET /v1/runs/live/stream from a server holding 257 live runs, the first
+// posted 30 s before the rest: the snapshot left that one out (`truncated`
+// as sent; its rows cut here to the first three of 256), and a nudge queued
+// for it then sent its row in a `run` frame — the row changed, its last
+// activity did not.
+import unseenText from '../test/fixtures/live_stream_unseen.txt?raw';
+// GET /v1/runs/live?limit=3 from the same server just after: the nudged
+// run, most recently changed, first.
+import afterNudge from '../test/fixtures/live_runs_after_nudge.json';
 import { createFramer } from './tail.js';
 import {
   DEFERRED_SENTENCE, IDLE_MS, LIVE_POLL_MS, ROW_CAP, STALL_MS, STREAM_RETRY_MS, WAITING_MS, ageOut, agentsOf, applyRemoved,
-  applyRun, applySnapshot, classifyFailure, deliveryWaitMs, fmtInterval, fmtPct, foresightMarks, foresightSentence, guardState, isQuiet,
-  isWaiting, liveTotals, matches, needsAttention, newLiveState, nudgeProblem, parseLiveFrame, probeCandidates,
+  applyRun, applySnapshot, classifyFailure, deliveryWaitMs, fmtInterval, fmtPct, foresightMarks, foresightSentence, guardState, isPartial,
+  isQuiet, isWaiting, keepListed, liveTotals, matches, needsAttention, newLiveState, nudgeProblem, parseLiveFrame, probeCandidates,
   riskRank, rowKey, runLiveStream, serverNowMs, sortEntries, utf8Bytes,
 } from './live.js';
 
@@ -533,5 +542,99 @@ describe('failures the stream must not retry, and ones it must say', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+
+// ------------------------------------------------------- astra review fixes
+
+describe('the server\'s clock, from a view that does not hold every run', () => {
+  const [snapshot, nudged] = createFramer()(unseenText).map(parseLiveFrame).filter(Boolean);
+  const newest = Math.max(...snapshot.runs.map((row) => row.last_activity_ns)) / 1e6;
+  const asListing = (doc) => ({ runs: doc.runs, truncated: doc.truncated, windowNs: doc.window_ns });
+
+  it('takes no reading from a run frame for a run a cut snapshot left out: its activity can be minutes old', () => {
+    expect(snapshot.truncated).toBe(true);
+    expect(snapshot.runs.some((row) => row.run === nudged.row.run)).toBe(false);
+    // A nudge moved the row, not its activity, which is 30 s older than the rest.
+    expect(nudged.row.pending_nudges).toBe(1);
+    expect(newest - nudged.row.last_activity_ns / 1e6).toBeGreaterThan(29_000);
+    // The browser's clock agrees with the server's.
+    let state = applySnapshot(newLiveState(), snapshot, newest + 1000);
+    state = applyRun(state, nudged.row, newest + 1500);
+    expect(state.rows.has(rowKey(nudged.row))).toBe(true);
+    expect(Math.abs(serverNowMs(state, newest + 1500) - (newest + 1500))).toBeLessThan(1000);
+    // An established reading is kept, not dragged back by the old row either.
+    let ahead = applyRun(newLiveState(), snapshot.runs[0], newest - 60_000);
+    ahead = applySnapshot(ahead, snapshot, newest - 59_000);
+    const before = serverNowMs(ahead, newest - 58_500);
+    ahead = applyRun(ahead, nudged.row, newest - 58_500);
+    expect(Math.abs(serverNowMs(ahead, newest - 58_500) - before)).toBeLessThan(1000);
+  });
+
+  it('takes no ceiling from a listing row it did not hold, when the listing before was cut', () => {
+    // Polling: the cut snapshot, then a cut listing five seconds later that
+    // leads with the nudged run.
+    let state = applySnapshot(newLiveState(), snapshot, newest + 1000);
+    state = applySnapshot(state, asListing(afterNudge), newest + 6000);
+    expect(afterNudge.runs[0].run).toBe(nudged.row.run);
+    expect(Math.abs(serverNowMs(state, newest + 6000) - (newest + 6000))).toBeLessThan(1000);
+  });
+
+  it('still reads the clock from a run that appears after a snapshot that held every run', () => {
+    // An empty, whole snapshot: a run the stream then sends has just started.
+    // The browser's clock runs 60 s behind the server's.
+    const at = nudged.row.last_activity_ns / 1e6;
+    let state = applySnapshot(newLiveState(), { runs: [], truncated: false, windowNs: 900e9 }, at - 61_000);
+    state = applyRun(state, nudged.row, at - 60_000);
+    expect(serverNowMs(state, at - 60_000)).toBeCloseTo(at, -1);
+  });
+});
+
+describe('a view the page itself cut', () => {
+  const [snapshot] = createFramer()(unseenText).map(parseLiveFrame).filter(Boolean);
+  const template = snapshot.runs[0];
+  const nth = (i) => ({ ...template, run: `r-${i}`, last_activity_ns: template.last_activity_ns + i * 1e6 });
+
+  it('says its figures are partial once it has let a run go, until the server lets that run go too', () => {
+    let state = applySnapshot(newLiveState(), { runs: [], truncated: false, windowNs: 900e9 }, 1000);
+    for (let i = 0; i <= ROW_CAP; i += 1) state = applyRun(state, nth(i), 2000 + i);
+    expect(state.rows.size).toBe(ROW_CAP);
+    expect(state.truncated).toBe(false);
+    // 1,001 runs live, 1,000 held: the totals leave one out, and say so.
+    expect(liveTotals([...state.rows.values()], 0).live).toBe(ROW_CAP);
+    expect(isPartial(state)).toBe(true);
+    // The server says the run it dropped has left the view: every live run is held again.
+    state = applyRemoved(state, { run: 'r-0', tenant: '', reason: 'expired' });
+    expect(isPartial(state)).toBe(false);
+  });
+
+  it('is whole again after a snapshot, and partial while the server\'s own snapshot was cut', () => {
+    let state = applySnapshot(newLiveState(), { runs: [], truncated: false, windowNs: 900e9 }, 1000);
+    for (let i = 0; i <= ROW_CAP; i += 1) state = applyRun(state, nth(i), 2000 + i);
+    expect(isPartial(state)).toBe(true);
+    state = applySnapshot(state, { runs: [nth(5)], truncated: false, windowNs: 900e9 }, 9000);
+    expect(isPartial(state)).toBe(false);
+    expect(isPartial(applySnapshot(state, snapshot, 9500))).toBe(true);
+  });
+
+  it('takes no clock reading from a run frame for a run it let go', () => {
+    let state = applySnapshot(newLiveState(), { runs: [], truncated: false, windowNs: 900e9 }, template.last_activity_ns / 1e6);
+    for (let i = 0; i <= ROW_CAP; i += 1) state = applyRun(state, nth(i), template.last_activity_ns / 1e6 + i);
+    const now = template.last_activity_ns / 1e6 + ROW_CAP;
+    const before = serverNowMs(state, now);
+    // r-0 was let go; a nudge sends it again, its activity a second old.
+    state = applyRun(state, { ...nth(0), pending_nudges: 1 }, now);
+    expect(Math.abs(serverNowMs(state, now) - before)).toBeLessThan(100);
+  });
+});
+
+describe('what the held-run probe remembers', () => {
+  it('keeps only the runs still held, and the same map when none has gone', () => {
+    const rows = new Map(listing.runs.map((row) => [rowKey(row), { row, flashAt: 0 }]));
+    const kept = new Map([[rowKey(byRun('tkt-4162')), { at: 1 }], [rowKey(byRun('tkt-4174')), { at: 2 }]]);
+    expect(keepListed(kept, rows)).toBe(kept);
+    const gone = new Map([...kept, [rowKey({ run: 'tkt-0001', tenant: '' }), { at: 3 }], [rowKey({ ...byRun('tkt-4162'), tenant: 'acme' }), { at: 4 }]]);
+    expect([...keepListed(gone, rows).keys()]).toEqual([...kept.keys()]);
   });
 });

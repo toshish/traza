@@ -550,6 +550,39 @@ before deploying over an existing setup.
   value the Fate Map hashes into a task, so every such session joined one
   task. The goal now skips leading reminder blocks, and a prompt that is
   nothing else sets none.
+- **Dashboard: a fork stays in the tenant it was drafted in.** Back and
+  forward to the same run in another tenant kept the fork editor open, and
+  creating it applied the first tenant's edited answer to the second
+  tenant's step of that index. The editor now closes when the tape's scope
+  changes, and a creation still pending never lands in a later draft.
+- **Dashboard: Live's clock and figures.** A run frame for a run the page
+  did not hold — left out of a cut snapshot, or let go past the page's
+  1,000 rows, and sent again because a nudge or a verdict moved it — was
+  read as the server's clock, which could move it back by minutes and
+  suppress waiting runs and held-run probes; it now only bounds the
+  estimate. Letting runs go past 1,000 now marks every figure partial
+  (`1,000+`), as a cut snapshot does, until the server drops those runs or
+  a snapshot covers every run. The held-run probe forgets runs that left
+  the view, cancels reads about them, and keeps at most four reads in
+  flight.
+- **Dashboard: Find these runs finds the node's runs.** Its query matched
+  later repeats and other cases of a name (`×3-5` found runs that searched
+  six times; `Search` found `search`). It now matches exact step
+  signatures and holds the last token to its repeat bucket, and is not
+  offered where two branches of the map read the same (a tool literally
+  named `x×2` beside `x` called twice).
+- **Dashboard: Foresight, Changes and X-Ray.** Naming another run kept the
+  last run's verdict, odds and path in the banner under the new name until
+  its own answer arrived, and a map still drawn from another window lent
+  the banner its skill; both wait for their own answers now. A Changes
+  timeline marker jumped to another tenant's card when two tenants' agents
+  share a name. A context of thousands of chunks no longer clips its last
+  chunks off the X-Ray's bar: the bar scrolls.
+- **The Mission Control demo abandons a run whose step the check keeps
+  refusing.** A stop on the next step alone left the verdict read saying
+  continue, which the agent took for a release, so it never abandoned and
+  could fill the fleet. One deadline now covers the refused step, and a
+  release counts only when the check lets the step go.
 
 ### Upgrade
 

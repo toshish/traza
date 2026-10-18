@@ -117,10 +117,40 @@ function isRow(row) {
 // Before any of that binds, the clocks are assumed to agree. The estimate
 // moves down as readily as up: a server whose clock is behind the browser's
 // must not read every run as long idle, nor age out runs it just listed.
+//
+// A row the client did not hold is a reading only while the client holds
+// every live run — the snapshot was whole, and the client has let none go
+// since: then a row it has never seen is a run that has just become live.
+// Otherwise the row may be an old run the snapshot left out, or one the
+// client let go, sent again because a nudge or a verdict moved it — a
+// change, not activity — and its activity can be minutes old. Such a row
+// still bounds the estimate (its activity is in the past, and inside the
+// window), but it is not taken as the server's now.
+//
+// `evicted` holds the runs the client let go past `ROW_CAP` since the last
+// snapshot. While any is held there, and while the snapshot itself was cut
+// (`truncated`), every figure over the rows leaves runs out (`isPartial`).
+// The stream still tells the client when one of them leaves the view, so an
+// evicted run drops out of `evicted` then, as a held one drops out of
+// `rows`; a snapshot starts the account over.
 
 /** Fresh state: nothing held, the server's default window assumed. */
 export function newLiveState() {
-  return { rows: new Map(), windowNs: 900e9, truncated: false, snapshots: 0, offsetMs: null, seenAtMs: null };
+  return {
+    rows: new Map(), windowNs: 900e9, truncated: false, evicted: new Set(), snapshots: 0, offsetMs: null, seenAtMs: null,
+  };
+}
+
+/** Whether the client holds every live run: the snapshot was whole, and it
+    has let none go since. */
+function holdsAll(state) {
+  return !state.truncated && !(state.evicted && state.evicted.size);
+}
+
+/** Whether the rows, and every figure over them, leave live runs out: the
+    snapshot was cut, or the client let runs go past `ROW_CAP`. */
+export function isPartial(state) {
+  return !holdsAll(state);
 }
 
 /** How recently the client must have looked for a moved row to bound the
@@ -141,6 +171,9 @@ export function applySnapshot(state, snapshot, nowMs) {
   const first = state.snapshots === 0 && state.rows.size === 0;
   const windowNs = snapshot.windowNs || state.windowNs;
   const recent = state.seenAtMs != null && nowMs - state.seenAtMs <= MOVED_WITHIN_MS;
+  // A row the last look did not hold moved since only if that look held
+  // every live run (see above).
+  const whole = holdsAll(state);
   let floor = -Infinity;
   let ceiling = Infinity;
   for (const row of snapshot.runs) {
@@ -151,7 +184,7 @@ export function applySnapshot(state, snapshot, nowMs) {
     if (!at) continue;
     floor = Math.max(floor, at - nowMs);
     ceiling = Math.min(ceiling, at + windowNs / 1e6 - nowMs);
-    if (recent && (!old || at > activityMs(old.row))) {
+    if (recent && (old ? at > activityMs(old.row) : whole)) {
       ceiling = Math.min(ceiling, at - nowMs + (nowMs - state.seenAtMs) + ACTIVITY_LAG_MS);
     }
   }
@@ -163,10 +196,12 @@ export function applySnapshot(state, snapshot, nowMs) {
     if (estimate < floor) estimate = floor;
     if (offset != null || estimate !== 0) offset = estimate;
   }
+  const capped = capRows(rows);
   return {
-    rows: capRows(rows),
+    rows: capped.rows,
     windowNs,
     truncated: snapshot.truncated,
+    evicted: new Set(capped.dropped),
     snapshots: state.snapshots + 1,
     offsetMs: offset,
     seenAtMs: nowMs,
@@ -181,12 +216,28 @@ export function applyRun(state, row, nowMs) {
   const rows = new Map(state.rows);
   rows.set(key, { row, flashAt: nowMs });
   let offset = state.offsetMs;
-  // A moved last activity is a fresh reading of the server's clock.
-  if (!old || activityMs(row) > activityMs(old.row)) {
-    const reading = activityMs(row) - nowMs;
+  const at = activityMs(row);
+  if (old ? at > activityMs(old.row) : holdsAll(state)) {
+    // A moved last activity, or a run that has just become live, is a
+    // fresh reading of the server's clock.
+    const reading = at - nowMs;
     offset = offset == null ? reading : offset * 0.5 + reading * 0.5;
+  } else if (!old && at) {
+    // A run the client did not hold, while it does not hold every run: its
+    // activity bounds the estimate and is no reading of it.
+    let estimate = offset == null ? 0 : offset;
+    estimate = Math.min(estimate, at + state.windowNs / 1e6 - nowMs);
+    estimate = Math.max(estimate, at - nowMs);
+    if (offset != null || estimate !== 0) offset = estimate;
   }
-  return { ...state, rows: capRows(rows), offsetMs: offset, seenAtMs: nowMs };
+  const capped = capRows(rows);
+  let evicted = state.evicted || new Set();
+  if (evicted.has(key) || capped.dropped.length) {
+    evicted = new Set(evicted);
+    evicted.delete(key);
+    for (const gone of capped.dropped) evicted.add(gone);
+  }
+  return { ...state, rows: capped.rows, evicted, offsetMs: offset, seenAtMs: nowMs };
 }
 
 /** Drops one run's row on an `event: removed` frame: the server no longer
@@ -195,6 +246,12 @@ export function applyRun(state, row, nowMs) {
     still active would stay on screen until the client aged it out. */
 export function applyRemoved(state, removal) {
   const key = rowKey(removal);
+  if (state.evicted && state.evicted.has(key)) {
+    // A run the client let go has left the view too: one fewer left out.
+    const evicted = new Set(state.evicted);
+    evicted.delete(key);
+    return { ...state, evicted };
+  }
   if (!state.rows.has(key)) return state;
   const rows = new Map(state.rows);
   rows.delete(key);
@@ -205,10 +262,12 @@ function activityMs(row) {
   return typeof row.last_activity_ns === 'number' ? row.last_activity_ns / 1e6 : 0;
 }
 
+/** At most `ROW_CAP` rows, the most recently active kept, and the keys of
+    the ones let go. */
 function capRows(rows) {
-  if (rows.size <= ROW_CAP) return rows;
-  const kept = [...rows.entries()].sort((a, b) => activityMs(b[1].row) - activityMs(a[1].row)).slice(0, ROW_CAP);
-  return new Map(kept);
+  if (rows.size <= ROW_CAP) return { rows, dropped: [] };
+  const sorted = [...rows.entries()].sort((a, b) => activityMs(b[1].row) - activityMs(a[1].row));
+  return { rows: new Map(sorted.slice(0, ROW_CAP)), dropped: sorted.slice(ROW_CAP).map(([key]) => key) };
 }
 
 /** The server's clock now, by the estimate. */
@@ -296,6 +355,20 @@ export function probeCandidates(rows, asked, serverNow, nowMs, { afterMs, ttlMs,
   }
   candidates.sort((a, b) => a.lastAt - b.lastAt || b.elapsed - a.elapsed || (a.key < b.key ? -1 : 1));
   return candidates.slice(0, batch).map(({ key, row }) => ({ key, row }));
+}
+
+/** `map` (keyed by `rowKey`) narrowed to the runs `rows` still holds — the
+    same map when none has gone. What the held-run probe knows of a run
+    goes when the run leaves the view: kept, it would outlive the run by
+    as long as the page stays open. */
+export function keepListed(map, rows) {
+  let kept = null;
+  for (const key of map.keys()) {
+    if (rows.has(key)) continue;
+    if (!kept) kept = new Map(map);
+    kept.delete(key);
+  }
+  return kept || map;
 }
 
 // ------------------------------------------------------------- reading rows

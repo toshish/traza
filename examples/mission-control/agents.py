@@ -255,6 +255,7 @@ class Run(threading.Thread):
         self.holding = False
         self.released = 0
         self.took_advice = False
+        self.blocked_until = None  # the hold's deadline while a check refuses the step
 
     def pause(self, low, high):
         time.sleep(RNG.uniform(low, high) / self.tempo)
@@ -272,24 +273,43 @@ class Run(threading.Thread):
         return verdict.get("verdict", "continue"), verdict.get("reasons") or [], nudges
 
     def hold(self, reasons):
-        """Stopped: wait for someone to reset the run. A verdict read here is
-        neither activity nor a pre-call check, so it takes no nudges."""
-        self.stops.append(reasons)
-        self.holding = True
-        say(f"  {self.run_id}: stopped before step {self.position}: {'; '.join(reasons)[:110]}")
-        deadline = time.time() + self.hold_seconds
-        try:
-            while time.time() < deadline:
-                time.sleep(1.0)
-                status, doc = self.api.get(f"/v1/fuses/runs/{q(self.run_id)}")
-                if status == 200 and doc.get("verdict") != "stop":
-                    self.released += 1
-                    say(f"  {self.run_id}: released ({doc.get('verdict')}), carrying on")
-                    return True
-            say(f"  {self.run_id}: nobody released it; abandoning")
-            return False
-        finally:
-            self.holding = False
+        """Stopped: wait for someone to reset the run, then ask the check
+        again. False once the hold's deadline has passed: abandon.
+
+        One deadline covers the step however many times the check refuses
+        it: it starts at the first refusal and ends at the release — the
+        check letting the step go (`proceed`) — or at abandonment. The
+        verdict read polled meanwhile is neither activity nor a pre-call
+        check, so it takes no nudges; and it judges the path so far, without
+        the step, so a stop on the step alone — a predictive limit judging
+        the named tool, a block nudge — reads `continue` there while the
+        check still refuses. That read only says when to ask the check
+        again; it is never itself a release."""
+        if self.blocked_until is None:
+            self.stops.append(reasons)
+            self.holding = True
+            self.blocked_until = time.time() + self.hold_seconds
+            say(f"  {self.run_id}: stopped before step {self.position}: {'; '.join(reasons)[:110]}")
+        while True:
+            left = self.blocked_until - time.time()
+            if left <= 0:
+                say(f"  {self.run_id}: nobody released it; abandoning")
+                self.blocked_until = None
+                self.holding = False
+                return False
+            time.sleep(min(1.0, left))
+            status, doc = self.api.get(f"/v1/fuses/runs/{q(self.run_id)}")
+            if status == 200 and doc.get("verdict") != "stop":
+                return True
+
+    def proceed(self):
+        """The check let the step go: if it had refused it, that is the release."""
+        if self.blocked_until is None:
+            return
+        self.blocked_until = None
+        self.holding = False
+        self.released += 1
+        say(f"  {self.run_id}: released, carrying on")
 
     def llm(self, model, final, next_tool, agent=None, parent=None):
         t0 = time.time()
@@ -352,12 +372,14 @@ class Run(threading.Thread):
             if any(n["kind"] == "block" for n in nudges):
                 say(f"  {self.run_id}: step {self.position} ({kind}:{name}) vetoed by a person; skipping it")
                 self.steps.pop(self.position)
+                self.proceed()  # the vetoed step is gone, and whatever held it
                 time.sleep(2.2)  # the veto holds two seconds
                 continue
             if verdict == "stop":
                 if not self.hold(reasons):
                     return self.finish("abandoned")
                 continue
+            self.proceed()
             self.pause(0.2, 0.5)
             if kind == "llm":
                 nxt = self.steps[self.position + 1] if self.position + 1 < len(self.steps) else None
@@ -408,6 +430,7 @@ class TeamRun(Run):
                         self.turns = self.turns[: turn + 1] + ["refunds"]
                         self.took_advice = True
                     if verdict != "stop":
+                        self.proceed()
                         break
                     if not self.hold(reasons):
                         self.post_agent(agent, agent_id, a0)

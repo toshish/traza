@@ -135,8 +135,18 @@ function PlacedRun({ placed, go }) {
   </Card>;
 }
 
+/** The id of an agent's `i`th change card. An agent is a name within its
+    tenant, and the operator view lists every tenant's: two tenants' agents
+    of one name are two timelines, whose markers must each find their own
+    card. Each part is percent-encoded with its hyphens too, so the hyphens
+    between them cannot be confused with one inside a name. */
+function changeAnchor(tenant, agent, i) {
+  const part = (text) => encodeURIComponent(text || '').replace(/-/g, '%2D');
+  return `change-${part(tenant)}-${part(agent)}-${i}`;
+}
+
 function AgentChanges({ agent, operator, go, placed, sinceNs, untilNs }) {
-  const anchor = (i) => `change-${encodeURIComponent(agent.agent)}-${i}`;
+  const anchor = (i) => changeAnchor(agent.tenant, agent.agent, i);
   return <section aria-label={`Changes of ${agent.agent}`} style={{ display: 'grid', gap: 10 }} data-testid="agent-changes">
     <Card>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap', marginBottom: 6 }}>

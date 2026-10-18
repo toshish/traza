@@ -22,6 +22,15 @@ import autopsy from '../test/fixtures/insight/cache_fix7.json';
 import ccAutopsy from '../test/fixtures/insight/cache_cc1.json';
 import tamper from '../test/fixtures/insight/tql_tamper.json';
 import changes from '../test/fixtures/insight/changes.json';
+// A store of its own (CAPTURED.md): loop-agent called `search` once to
+// seven times after one model call, and `Search` three times; mini-agent
+// called a tool literally named `search×2` once, and `search` twice. The
+// maps at min_support 1, and GET /v1/trajectories/search's answer, with
+// the map's agent, to the query every node's "Find these runs" sends —
+// and to the one the wave-3 dashboard sent.
+import loopsMap from '../test/fixtures/insight/fate_map_loops.json';
+import miniMap from '../test/fixtures/insight/fate_map_mini.json';
+import loopAnswers from '../test/fixtures/insight/tql_loops.json';
 
 describe('windows', () => {
   it('sends no since for the default window, which every route defaults to and the server caches', () => {
@@ -153,12 +162,19 @@ describe('the Fate Map', () => {
     expect(runOnMap(supportMap.root, healthy).complete).toBe(true);
   });
 
-  it('turns a path into the TQL that finds the runs which took it', () => {
-    expect(pathToTql(['llm:gpt-4o', 'tool:search_orders×3-5'])).toBe('^llm("gpt-4o") -> tool("search_orders"){3,5}');
-    expect(pathToTql(['llm:gpt-4o', 'tool:issue_refund×2', 'agent:x×6+'])).toBe('^llm("gpt-4o") -> tool("issue_refund"){2} -> agent("x"){6,}');
+  it('turns a path into the TQL that finds the runs which took it: signatures, the last repeat held to its bucket', () => {
+    expect(pathToTql(['llm:gpt-4o', 'tool:search_orders×3-5'])).toBe(
+      '^llm[signature="llm:gpt-4o"] -> tool[signature="tool:search_orders"]{3,5}$'
+      + ' | ^llm[signature="llm:gpt-4o"] -> tool[signature="tool:search_orders"]{3,5} -> step[signature!="tool:search_orders"]');
+    // Six or more has no upper bound: nothing to hold the last token to.
+    expect(pathToTql(['llm:gpt-4o', 'tool:issue_refund×2', 'agent:x×6+']))
+      .toBe('^llm[signature="llm:gpt-4o"] -> tool[signature="tool:issue_refund"]{2} -> agent[signature="agent:x"]{6,}');
+    expect(pathToTql(['tool:say "hi"\\now'])).toContain('tool[signature="tool:say \\"hi\\"\\\\now"]');
     expect(pathToTql(['llm:a-very-long-cut-name…'])).toBeNull();
+    // The fold token stands for every deeper run: no query says exactly which.
+    expect(pathToTql(['llm:gpt-4o', '…'])).toBeNull();
     expect(pathToTql([])).toBeNull();
-    expect(pathToTql(cc.path)).toMatch(/^\^llm\("claude-sonnet-4-5-20250929"\) -> tool\("Read"\)/);
+    expect(pathToTql(cc.path)).toMatch(/^\^llm\[signature="llm:claude-sonnet-4-5-20250929"\] -> tool\[signature="tool:Read"\]/);
   });
 
   it('splits and shortens tokens without losing the repeat bucket', () => {
@@ -201,6 +217,47 @@ describe('the Fate Map', () => {
     expect(skillAt(supportMap.calibration, 40).depth).toBe(5);
     expect(skillAt(lucky, 8).depth).toBe(5);
     expect(skillAt(supportMap.calibration, 0)).toBeNull();
+  });
+});
+
+describe('Find these runs', () => {
+  // Each loop-agent run's own path, from its id: `s<n>` called `search` n
+  // times after one gpt-4o call, `cap3` called `Search` three times.
+  const bucket = (n) => (n === 1 ? '' : n === 2 ? '×2' : n <= 5 ? '×3-5' : '×6+');
+  const pathOf = (run) => (run === 'cap3' ? ['llm:gpt-4o', 'tool:Search×3-5']
+    : ['llm:gpt-4o', `tool:search${bucket(Number(run.slice(1)))}`]);
+  const nodes = [];
+  (function walk(node, path) {
+    for (const child of node.children || []) {
+      nodes.push({ node: child, path: [...path, child.token] });
+      walk(child, [...path, child.token]);
+    }
+  }(loopsMap.root, []));
+
+  it('finds exactly the runs through each node, as the server answered the query', () => {
+    expect(nodes).toHaveLength(6);
+    for (const { node, path } of nodes) {
+      const q = pathToTql(path, loopsMap.root);
+      expect(loopAnswers, `the answer to ${q} was captured`).toHaveProperty([q]);
+      const runs = loopAnswers[q].matches.map((m) => m.run);
+      // Every run the server matched took this node's path — six searches
+      // are not three to five, and Search is not search...
+      for (const run of runs) expect(pathOf(run).slice(0, path.length), `${run} found under ${path.join(' > ')}`).toEqual(path);
+      // ...and every run through the node was matched.
+      expect(runs, path.join(' > ')).toHaveLength(node.visits);
+      for (const example of node.example_runs) expect(runs).toContain(example.run);
+    }
+  });
+
+  it('offers no search where two branches of the map read the same, or a name carries the bucket mark', () => {
+    // `search×2` called once and `search` called twice: one text, two branches.
+    const [mini] = miniMap.root.children;
+    expect(mini.children.map((c) => c.token)).toEqual(['tool:search×2', 'tool:search×2']);
+    expect(pathToTql(['llm:gpt-4o-mini', 'tool:search×2'], miniMap.root)).toBeNull();
+    expect(pathToTql(['llm:gpt-4o-mini', 'tool:search×2', 'llm:gpt-4o-mini'], miniMap.root)).toBeNull();
+    expect(pathToTql(['llm:gpt-4o-mini'], miniMap.root)).not.toBeNull();
+    // A name that itself holds the mark: where it ends cannot be read.
+    expect(pathToTql(['tool:x×2×2'])).toBeNull();
   });
 });
 

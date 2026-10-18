@@ -12,6 +12,11 @@ import { Kv, Swatch, Tooltip } from './Bits.jsx';
 
 const STALE_HATCH = (fill) => `repeating-linear-gradient(135deg, ${fill} 0 3px, var(--bg-raised) 3px 5px)`;
 
+/** The narrowest a segment is drawn, and the gap between two: a chunk of a
+    few tokens in a context of thousands still gets a mark to point at. */
+const MIN_SEGMENT_PX = 2;
+const GAP_PX = 1;
+
 /** Where a chunk came from, in words. */
 export function introducedLabel(chunk) {
   const by = chunk && chunk.introduced_by;
@@ -32,9 +37,28 @@ export function ContextBar({ chunks, focusKey, onFocus, onPick, height = 30 }) {
     setHover({ index: chunk.index, x: event.clientX - box.left, y: event.clientY - box.top, width: box.width });
   };
 
+  // Every chunk keeps its minimum mark, so the bar is never narrower than
+  // that: 2,000 chunks need about 6,000 px. Wider than the card, it scrolls
+  // sideways rather than cutting the last chunks off — and the labels under
+  // it travel with it, so "last read" is the context's end, not the card's.
+  const canvas = Math.max(0, chunks.length * (MIN_SEGMENT_PX + GAP_PX) - GAP_PX);
+  const scroller = React.useRef(null);
+  const [overflowing, setOverflowing] = React.useState(false);
+  React.useEffect(() => {
+    const measure = () => {
+      const box = scroller.current;
+      setOverflowing(Boolean(box && box.scrollWidth > box.clientWidth + 1));
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [canvas]);
+
   return <div ref={wrap} style={{ position: 'relative' }} onMouseLeave={() => { setHover(null); }}>
+    <div ref={scroller} className="tz-scroll-x" style={{ overflowX: 'auto' }}>
+    <div data-testid="context-canvas" style={{ minWidth: canvas, width: '100%' }}>
     <div role="list" aria-label={`Context window: ${chunks.length} chunks, about ${fmtNum(total)} estimated tokens`}
-      style={{ display: 'flex', gap: 1, height, alignItems: 'stretch', borderRadius: 2, overflow: 'hidden' }}>
+      style={{ display: 'flex', gap: GAP_PX, height, alignItems: 'stretch', borderRadius: 2, overflow: 'hidden' }}>
       {chunks.map((chunk) => {
         const share = total ? (chunk.est_tokens || 0) / total : 1 / chunks.length;
         const focused = lit && provenanceKey(chunk) === lit;
@@ -48,7 +72,7 @@ export function ContextBar({ chunks, focusKey, onFocus, onPick, height = 30 }) {
           onClick={() => onPick && onPick(chunk)}
           onKeyDown={(e) => { if (e.key === 'Enter') onPick && onPick(chunk); }}
           style={{
-            flex: `${Math.max(share, 0.0005)} 1 0`, minWidth: 2, position: 'relative', cursor: 'pointer',
+            flex: `${Math.max(share, 0.0005)} 1 0`, minWidth: MIN_SEGMENT_PX, position: 'relative', cursor: 'pointer',
             background: chunk.stale ? STALE_HATCH(fill) : fill,
             // Paper-filled kinds (definitions, other) carry an inset ink
             // edge so they read as present, not as a gap.
@@ -60,9 +84,14 @@ export function ContextBar({ chunks, focusKey, onFocus, onPick, height = 30 }) {
     </div>
     <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-faint)' }}>
       <span>first read</span>
-      <span>~{fmtNum(total)} est. tokens</span>
+      {overflowing ? null : <span>~{fmtNum(total)} est. tokens</span>}
       <span>last read</span>
     </div>
+    </div>
+    </div>
+    {overflowing ? <div style={{ marginTop: 2, fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-faint)' }}>
+      ~{fmtNum(total)} est. tokens in {fmtNum(chunks.length)} chunks · scroll the bar for the rest
+    </div> : null}
     {hovered ? <Tooltip x={hover.x} y={hover.y} containerWidth={hover.width} width={300}>
       <div style={{ display: 'grid', gap: 3 }}>
         <div style={{ fontFamily: 'var(--font-mono)' }}>#{hovered.index} · {hovered.role || 'no role'} · {hovered.kind}{hovered.name ? ' · ' + hovered.name : ''}</div>

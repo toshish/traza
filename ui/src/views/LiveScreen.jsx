@@ -4,9 +4,9 @@ import { hashFor, navigate, useMedia } from '../lib/route.js';
 import { fmtCompact, fmtNum, fmtTimeNs } from '../lib/format.js';
 import { tenantParams } from '../lib/runs.js';
 import {
-  FILTERS, SORTS, ageOut, agentsOf, applyRemoved, applyRun, applySnapshot, foresightSentence, guardState, idleMs, isQuiet,
-  liveTotals, matches, newLiveState, probeCandidates, rowKey, runLiveStream, serverNowMs, sortEntries,
-  stepElapsedMs, waitingKeys,
+  FILTERS, ROW_CAP, SORTS, ageOut, agentsOf, applyRemoved, applyRun, applySnapshot, foresightSentence, guardState, idleMs,
+  isPartial, isQuiet, keepListed, liveTotals, matches, newLiveState, probeCandidates, rowKey, runLiveStream, serverNowMs,
+  sortEntries, stepElapsedMs, waitingKeys,
 } from '../lib/live.js';
 import { Card, Chip, EmptyState, ErrorState, LiveDot, Mono, Skeleton } from '../components/primitives/Chrome.jsx';
 import { Tag } from '../components/primitives/Tag.jsx';
@@ -32,7 +32,8 @@ import { ResetModal, TripModal, canWrite } from './GuardScreen.jsx';
 const PROBE_MS = 3000;
 /** How long a named step must stay pending before the probe asks why. */
 const PROBE_AFTER_MS = 4000;
-/** Probes in one round, at most: each is one verdict read from memory. */
+/** Verdict reads in flight at once, at most: each is one read from memory.
+    A round asks only as many as have finished. */
 const PROBE_BATCH = 4;
 /** How long a probe's answer stands before the run is asked about again. */
 const PROBE_TTL_MS = 10_000;
@@ -134,38 +135,62 @@ function useLiveRuns(tenant) {
     without the step the check was asked about, so a hold that exists only
     for that step — a predictive limit judging the named tool, a budget its
     estimate would cross, a block nudge — is not found here; such a run is
-    shown as waiting instead. At most four a round, each run at most once
-    per ten seconds or per move it makes, the runs never asked first and
-    then the longest waiting. `forget(key)` drops what is known about a run,
-    so it is asked again at the next round (after an approval, say). */
+    shown as waiting instead. At most four reads in flight at once, and a
+    run never in two: a round asks only as many runs as there is room for,
+    so slow answers hold the probe back rather than piling up behind it.
+    Each run at most once per ten seconds or per move it makes, the runs
+    never asked first and then the longest waiting. `forget(key)` drops what
+    is known about a run, so it is asked again at the next round (after an
+    approval, say).
+
+    What it knows follows the rows: a run that leaves the view takes with it
+    when it was asked, the stop found for it, and a read still in flight
+    about it (cancelled). */
 function useHeldProbe(state, serverNow) {
   const [held, setHeld] = React.useState(() => new Map());
   const latest = React.useRef({ state, serverNow });
   latest.current = { state, serverNow };
   const asked = React.useRef(new Map());
+  // Reads in flight, by run, each with its own controller.
+  const flying = React.useRef(new Map());
+  const cancel = React.useCallback((key) => {
+    const read = flying.current.get(key);
+    if (!read) return;
+    read.abort();
+    flying.current.delete(key);
+  }, []);
   const forget = React.useCallback((key) => {
     asked.current.delete(key);
+    cancel(key);
     setHeld((map) => {
       if (!map.has(key)) return map;
       const next = new Map(map);
       next.delete(key);
       return next;
     });
-  }, []);
+  }, [cancel]);
 
   React.useEffect(() => {
     let live = true;
     const round = () => {
       if (document.hidden) return;
       const { state: current, serverNow: now } = latest.current;
+      asked.current = keepListed(asked.current, current.rows);
+      for (const key of [...flying.current.keys()]) if (!current.rows.has(key)) cancel(key);
+      setHeld((map) => keepListed(map, current.rows));
+      const room = PROBE_BATCH - flying.current.size;
+      if (room <= 0) return;
       const candidates = probeCandidates(current.rows, asked.current, now, Date.now(),
-        { afterMs: PROBE_AFTER_MS, ttlMs: PROBE_TTL_MS, batch: PROBE_BATCH });
+        { afterMs: PROBE_AFTER_MS, ttlMs: PROBE_TTL_MS, batch: current.rows.size })
+        .filter(({ key }) => !flying.current.has(key)).slice(0, room);
       for (const { key, row } of candidates) {
         const ask = { activity: row.last_activity_ns, at: Date.now() };
         asked.current.set(key, ask);
-        api.fuseRun(row.run, tenantParams(row.tenant || '')).then((doc) => {
-          // An answer to a question since forgotten (an approval in between)
-          // or asked again is out of date.
+        const read = new AbortController();
+        flying.current.set(key, read);
+        api.fuseRun(row.run, tenantParams(row.tenant || ''), read.signal).then((doc) => {
+          // An answer to a question since forgotten (an approval in between,
+          // or the run left the view) or asked again is out of date.
           if (!live || asked.current.get(key) !== ask) return;
           setHeld((map) => {
             const next = new Map(map);
@@ -173,12 +198,20 @@ function useHeldProbe(state, serverNow) {
             else next.delete(key);
             return next;
           });
-        }, () => { /* no answer is no evidence of a hold */ });
+        }, () => { /* no answer is no evidence of a hold */ }).finally(() => {
+          if (flying.current.get(key) === read) flying.current.delete(key);
+        });
       }
     };
     const timer = setInterval(round, PROBE_MS);
-    return () => { live = false; clearInterval(timer); };
-  }, []);
+    const reads = flying.current;
+    return () => {
+      live = false;
+      clearInterval(timer);
+      for (const read of reads.values()) read.abort();
+      reads.clear();
+    };
+  }, [cancel]);
   return { held, forget };
 }
 
@@ -569,6 +602,10 @@ export function LiveScreen({ go, params, identity, pushToast }) {
     });
   }, [live.state.rows, held, waiting]);
   const totals = liveTotals(entries, serverNow);
+  // The snapshot was cut, or the page let runs go: every figure is of the
+  // runs held, and says so.
+  const partial = isPartial(live.state);
+  const evicted = live.state.evicted ? live.state.evicted.size : 0;
   const agents = agentsOf(entries);
   const shown = sortEntries(entries.filter((entry) => matches(entry, { filter, agent, search }, serverNow)), sort, serverNow);
 
@@ -635,8 +672,9 @@ export function LiveScreen({ go, params, identity, pushToast }) {
   return <ClockContext.Provider value={serverNow}>
     <div style={{ display: 'grid', gap: 12, maxWidth: 1700 }}>
       <Card pad="0" className="tz-reflow" style={{ display: 'grid', gridTemplateColumns: 'repeat(6, minmax(0, 1fr))', overflow: 'hidden' }}>
-        <Tile label="live runs" value={fmtNum(totals.live)} note={`${fmtNum(totals.active)} active`} active={filter === 'all'}
-          onClick={() => setParam('filter', '')} title="Runs with activity in the live window; active ones had some in the last 30 seconds" />
+        <Tile label="live runs" value={fmtNum(totals.live) + (partial ? '+' : '')} note={`${fmtNum(totals.active)} active`} active={filter === 'all'}
+          onClick={() => setParam('filter', '')} title={'Runs with activity in the live window; active ones had some in the last 30 seconds'
+            + (partial ? '. More are live than this page holds: every figure here counts the runs it holds.' : '')} />
         <Tile label="spend, live runs" value={<>$<Ticking value={totals.cost} format={fmtUsd} /></>}
           title="The guard's cost for every run listed, summed" />
         <Tile label="tokens" value={fmtCompact(totals.tokens)} tone="var(--ink)" />
@@ -675,7 +713,13 @@ export function LiveScreen({ go, params, identity, pushToast }) {
         seconds instead; the stream is tried again in half a minute.
       </div> : null}
       {live.state.truncated ? <div style={{ fontSize: 12, color: 'var(--ink-muted)' }}>
-        More runs are live than the snapshot holds (256, the most recently changed).{operator ? ' Filter by tenant to narrow it.' : ''}
+        More runs are live than the snapshot holds (256, the most recently changed), so every figure above counts
+        only the runs listed.{operator ? ' Filter by tenant to narrow it.' : ''}
+      </div> : null}
+      {evicted ? <div data-testid="live-partial" style={{ fontSize: 12, color: 'var(--warn)' }}>
+        This page keeps {fmtNum(ROW_CAP)} runs, the most recently active, and has let {fmtNum(evicted)} more
+        go since the last snapshot: every figure above leaves {evicted === 1 ? 'it' : 'them'} out until
+        {evicted === 1 ? ' it leaves' : ' they leave'} the live view or a fresh snapshot covers every run.
       </div> : null}
 
       {rejected ? <ErrorState what={live.status.error?.what || 'The server refused the live view.'}

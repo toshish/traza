@@ -17,6 +17,10 @@ import nudges from '../test/fixtures/nudges.json';
 import forks from '../test/fixtures/forks.json';
 import forkCreated from '../test/fixtures/fork_created.json';
 import forkStatus from '../test/fixtures/fork_status.json';
+// One run id in two tenants, from a store of its own: tkt-7 searched orders
+// in the default tenant, and looked up a customer and escalated in acme.
+import tkt7Default from '../test/fixtures/tape_tkt7_default.json';
+import tkt7Acme from '../test/fixtures/tape_tkt7_acme.json';
 
 vi.mock('../lib/api.js', () => ({
   api: {
@@ -186,6 +190,67 @@ describe('fork from here', () => {
     const dialog = await openFork(1);
     await act(async () => { fireEvent.click(within(dialog).getByText('Create fork')); });
     expect(within(dialog).getByRole('alert').textContent).toMatch(/step 1 is a tool call/);
+  });
+});
+
+describe('fork from here, when the route moves to the same run in another tenant', () => {
+  // Back and forward keep the screen mounted: the route's tenant changes
+  // under a fork being drafted against the other tenant's step.
+  const tapes = { '': tkt7Default, acme: tkt7Acme };
+  const screenAt = (tenant) => <RunScreen runId="tkt-7" go={vi.fn()} params={new URLSearchParams({ tenant })}
+    identity={RW} pushToast={vi.fn()} />;
+  const flush = async () => { await act(async () => { for (let i = 0; i < 6; i += 1) await Promise.resolve(); }); };
+  async function openAt(index) {
+    const step = screen.getAllByTestId('tape-step')[index];
+    const head = step.querySelector('[role="row"]');
+    if (head.getAttribute('aria-expanded') !== 'true') fireEvent.click(head);
+    fireEvent.click(within(step).getByText('Fork from here'));
+    return screen.getByRole('dialog', { name: `Fork tkt-7 at step ${index}` });
+  }
+
+  beforeEach(() => { api.tape.mockImplementation(async (run, params) => tapes[params.tenant]); });
+  afterEach(() => { api.tape.mockImplementation(async () => tape); });
+
+  it('closes the draft, and a fork drafted after is the new tenant\'s, from its own step', async () => {
+    const view = render(screenAt(''));
+    await flush();
+    const dialog = await openAt(1);
+    fireEvent.change(within(dialog).getByLabelText('Edited tool result'), { target: { value: '{"orders": []}' } });
+
+    view.rerender(screenAt('acme'));
+    await flush();
+    expect(api.tape).toHaveBeenLastCalledWith('tkt-7', expect.objectContaining({ tenant: 'acme' }), expect.anything());
+    expect(screen.getAllByTestId('tape-step')).toHaveLength(tkt7Acme.steps.length);
+    // The default tenant's edit to search_orders is not offered for acme's step 1.
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(api.createReplay).not.toHaveBeenCalled();
+
+    const fresh = await openAt(1);
+    expect(fresh.textContent).toContain('lookup_customer');
+    expect(JSON.parse(within(fresh).getByLabelText('Edited tool result').value)).toEqual(tkt7Acme.steps[1].response);
+    await act(async () => { fireEvent.click(within(fresh).getByText('Create fork')); });
+    expect(api.createReplay).toHaveBeenCalledWith({
+      run: 'tkt-7', mode: 'strict', tenant: 'acme', edits: [{ step: 1, tool_result: tkt7Acme.steps[1].response }], live_after: 1,
+    });
+  });
+
+  it('never shows a creation still pending from the old tenant in a draft for the new one', async () => {
+    let finish;
+    api.createReplay.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const view = render(screenAt(''));
+    await flush();
+    const dialog = await openAt(1);
+    await act(async () => { fireEvent.click(within(dialog).getByText('Create fork')); });
+    expect(within(dialog).getByText('Creating…')).toBeTruthy();
+
+    view.rerender(screenAt('acme'));
+    await flush();
+    const fresh = await openAt(1);
+    await act(async () => { finish(forkCreated); });
+    await flush();
+    expect(within(fresh).queryByTestId('fork-created')).toBeNull();
+    expect(within(fresh).getByLabelText('Edited tool result')).toBeTruthy();
+    expect(within(fresh).getByText('Create fork')).toBeTruthy();
   });
 });
 
