@@ -439,4 +439,64 @@ describe('a credential change', () => {
     expect(server.sentWith('trz_first').filter((p) => p === '/v1/whoami').length).toBe(asked);
     expect(getToken()).toBe('trz_first');
   });
+
+  // An admin credential minted by an operator, whose secret must never be
+  // shown to whoever holds the tab after a switch to another credential.
+  const ADMIN_MINT = {
+    id: 'cr_admin2', token: 'trz_admin_secret', prefix: 'trz_admi', scope: 'admin', tenant: null,
+    label: 'second admin', source: 'api', created_at_ns: 1, expires_at_ns: null,
+  };
+
+  function serveMint() {
+    const server = serveTokens({
+      'Bearer op-token': { whoami: OPERATOR },
+      'Bearer tenant-token': { whoami: whoamiBound },
+    });
+    server.route = (c) => (c.path === '/v1/admin/credentials' && c.method === 'POST'
+      ? json(200, ADMIN_MINT) : undefined);
+    return server;
+  }
+
+  it('drops a mint that answers after a switch to another credential, secret unseen', async () => {
+    // The reproduction: an operator starts minting an unbound admin
+    // credential, then follows a tenant-token handoff before the answer.
+    const server = serveMint();
+    setToken('op-token');
+    window.location.hash = '#/credentials';
+    render(<App />);
+    await settle(0);
+    await settle(10);
+
+    server.hold = (c) => c.path === '/v1/admin/credentials' && c.method === 'POST';
+    await act(async () => { fireEvent.click(screen.getByText('Mint')); });
+    await settle(10);
+    await navigateTo('#/overview?token=tenant-token');
+    await settle(10);
+    expect(getToken()).toBe('tenant-token');
+
+    server.release((c) => c.method === 'POST');
+    await settle(10);
+    expect(screen.queryByTestId('minted-token')).toBeNull();
+    expect(document.body.textContent).not.toContain('trz_admin_secret');
+    expect(screen.queryByRole('dialog', { name: 'Credential minted' })).toBeNull();
+  });
+
+  it('clears a minted secret on display when the tab switches to another credential', async () => {
+    const server = serveMint();
+    setToken('op-token');
+    window.location.hash = '#/credentials';
+    render(<App />);
+    await settle(0);
+    await settle(10);
+
+    await act(async () => { fireEvent.click(screen.getByText('Mint')); });
+    await settle(10);
+    expect(screen.getByTestId('minted-token').textContent).toContain('trz_admin_secret');
+    expect(server.calls.some((c) => c.method === 'POST' && c.auth === 'Bearer op-token')).toBe(true);
+
+    await navigateTo('#/overview?token=tenant-token');
+    await settle(10);
+    expect(screen.queryByTestId('minted-token')).toBeNull();
+    expect(document.body.textContent).not.toContain('trz_admin_secret');
+  });
 });

@@ -1,5 +1,6 @@
 import React from 'react';
 import { api } from '../lib/api.js';
+import { credentialGeneration } from '../lib/session.js';
 import { useRead } from '../lib/route.js';
 import { fmtAgo, fmtTimeNs } from '../lib/format.js';
 import { Card, Chip, EmptyState, ErrorState, Mono, PanelHead, Skeleton } from '../components/primitives/Chrome.jsx';
@@ -29,9 +30,11 @@ export function credentialState(credential, nowNs = Date.now() * 1e6) {
 
 const STATE_TAG = { live: 'ok', revoked: 'error', expired: 'warn' };
 
-/** The screen. A minted credential goes to `onMinted(doc, {adopt})`, which
-    shows it once: the app holds that display, because adopting the first
-    token on an open store remounts this screen under the new credential. */
+/** The screen. A minted credential goes to `onMinted(doc, {adopt, asked})`,
+    which shows it once: the app holds that display, because adopting the
+    first token on an open store remounts this screen under the new
+    credential. `asked` is the credential generation the mint was sent
+    under, so an answer that outlives the credential that asked is dropped. */
 export function CredentialsScreen({ identity, pushToast, onMinted }) {
   const list = useRead((signal) => api.credentials(signal), []);
   const [revoking, setRevoking] = React.useState(null);
@@ -49,12 +52,12 @@ export function CredentialsScreen({ identity, pushToast, onMinted }) {
       </div>
     </Card> : null}
 
-    <MintCard open={open} credentials={credentials} onMinted={(doc) => {
+    <MintCard open={open} credentials={credentials} onMinted={(doc, asked) => {
       // On an open store that request closed it, and the app adopts the new
       // token: this screen is remounted under it and reads its list once
       // whoami has confirmed an operator. Reloading here would ask an
       // operator surface with a token nobody has described yet.
-      onMinted?.(doc, { adopt: open });
+      onMinted?.(doc, { adopt: open, asked });
       if (!open) list.reload();
     }} />
 
@@ -97,6 +100,8 @@ function MintCard({ open, credentials, onMinted }) {
   const mint = async () => {
     setBusy(true);
     setError(null);
+    // The credential this mint is sent with: its answer belongs to it.
+    const asked = credentialGeneration();
     try {
       const body = { scope };
       if (tenant.trim()) body.tenant = tenant.trim();
@@ -106,7 +111,7 @@ function MintCard({ open, credentials, onMinted }) {
       const doc = await api.mintCredential(body);
       setTenant('');
       setLabel('');
-      onMinted(doc);
+      onMinted(doc, asked);
     } catch (e) { setError(e); } finally { setBusy(false); }
   };
 

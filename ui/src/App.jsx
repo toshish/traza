@@ -208,7 +208,9 @@ export function App() {
   // A credential just minted, shown once. Held here rather than by the
   // Credentials screen: adopting the first token on an open store is a
   // credential change, which remounts every screen, and the one-time display
-  // must survive it.
+  // must survive it. It is kept with the credential generation it belongs
+  // to, and shown only under that generation: a secret minted by one
+  // credential is that credential's holder's to see, not the next one's.
   const [minted, setMinted] = React.useState(null);
   const [palette, setPalette] = React.useState(false);
   const [drawer, setDrawer] = React.useState(false);
@@ -272,10 +274,23 @@ export function App() {
   // is adopted at once, or the next poll would answer 401 and open the prompt
   // over the one-time display — and adopting it is a token change like any
   // other: the screens wait for whoami before asking an operator surface.
-  const onMinted = (doc, { adopt = false } = {}) => {
-    setMinted(adopt ? { ...doc, adopted: true } : doc);
-    if (adopt) changeToken(doc.token);
+  //
+  // `asked` is the generation the mint was sent under. An answer that lands
+  // after the tab has switched credentials — a handoff link followed while
+  // the POST was in flight — is dropped: the screen that asked is gone, and
+  // the secret would otherwise appear over another credential's session,
+  // with an offer to adopt it. Adopting the first token is the one switch
+  // the display follows, so it moves to the new generation explicitly.
+  const onMinted = (doc, { adopt = false, asked = credentialGeneration() } = {}) => {
+    if (asked !== credentialGeneration()) return;
+    if (adopt) {
+      changeToken(doc.token);
+      setMinted({ doc: { ...doc, adopted: true }, generation: credentialGeneration() });
+    } else {
+      setMinted({ doc, generation: asked });
+    }
   };
+  const mintedShown = minted && minted.generation === generation ? minted.doc : null;
 
   const [head, second, third] = route.parts;
   const screen = head || 'overview';
@@ -375,7 +390,7 @@ export function App() {
     <CommandPalette open={palette} onClose={() => setPalette(false)} nav={navFor(operator)}
       onNavigate={(parts) => go(parts)} />
 
-    <TokenOnce doc={minted} onClose={() => setMinted(null)}
+    <TokenOnce doc={mintedShown} onClose={() => setMinted(null)}
       onUse={(token) => { setMinted(null); changeToken(token); }} />
 
     <Modal open={tokenModal} title="Set token" onClose={() => setTokenModal(false)} footer={<>
