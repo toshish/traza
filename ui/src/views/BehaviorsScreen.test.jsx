@@ -13,6 +13,9 @@ import explain from '../test/fixtures/insight/tql_explain.json';
 import refusal from '../test/fixtures/insight/tql_bad_field.json';
 import detectors from '../test/fixtures/insight/detectors.json';
 import findings from '../test/fixtures/insight/findings.json';
+import page1 from '../test/fixtures/insight/tql_page1.json';
+import page2 from '../test/fixtures/insight/tql_page2.json';
+import cursorWindow from '../test/fixtures/insight/tql_cursor_window.json';
 
 vi.mock('../lib/api.js', () => ({
   api: {
@@ -55,7 +58,7 @@ describe('a search', () => {
     expect(go).toHaveBeenCalledWith(['run', 'fix-parser-7'], { step: '5', tenant: '' });
     fireEvent.click(within(match).getByTitle('step 31: tool Edit'));
     expect(go).toHaveBeenCalledWith(['run', 'fix-parser-7'], { step: '31', tenant: '' });
-    expect(screen.getByTestId('tql-results').textContent).toContain('350 of 350 runs scanned');
+    expect(screen.getByTestId('tql-results').textContent).toContain('351 of 351 runs scanned');
   });
 
   it('reaches back a year for the imported Claude Code session, which edited after a failing test', async () => {
@@ -63,6 +66,35 @@ describe('a search', () => {
     expect(api.trajectories.mock.calls[0][0].since).toMatch(/^\d{19}$/);
     const runs = screen.getAllByTestId('tql-match').map((m) => m.textContent);
     expect(runs.some((t) => t.includes('11111111-1111-4111-8111-111111111111'))).toBe(true);
+  });
+
+  it('continues a page with the cursor the server gave, never with a window of its own', async () => {
+    api.trajectories.mockImplementation(async (params) => (params.cursor ? page2 : page1));
+    await show('window=1y&q=' + encodeURIComponent('test[error] ..> edit'));
+    expect(screen.getAllByTestId('tql-match').map((m) => m.textContent).join()).toContain('fix-parser-7');
+    fireEvent.click(screen.getByText('Continue with the runs not yet checked'));
+    const routed = new URLSearchParams(window.location.hash.split('?')[1]);
+    expect(routed.get('cursor')).toBe(page1.next_cursor);
+    expect(routed.get('until')).toBeNull();
+    cleanup();
+    api.trajectories.mockClear();
+    // The continued page: the cursor carries the window, so `since` is left
+    // out, though the route still names a window.
+    await show('window=1y&q=' + encodeURIComponent('test[error] ..> edit') + '&cursor=' + encodeURIComponent(page1.next_cursor));
+    expect(api.trajectories).toHaveBeenCalledWith(expect.objectContaining({ cursor: page1.next_cursor, since: undefined }), expect.anything());
+    expect(screen.getByTestId('tql-results').textContent).toContain('continued from the page before');
+    expect(screen.getAllByTestId('tql-match').map((m) => m.textContent).join()).toContain('thrash-3');
+    expect(screen.getByText('Continue with the runs not yet checked')).toBeTruthy();
+    api.trajectories.mockImplementation(async (params) => (params.since ? ccSearch : tamper));
+  });
+
+  it('says to start again when a continued page is refused', async () => {
+    api.trajectories.mockImplementation(async () => {
+      throw Object.assign(new Error(cursorWindow.error), { status: 400, what: cursorWindow.error, body: cursorWindow });
+    });
+    await show('q=' + encodeURIComponent('test[error] ..> edit') + '&cursor=c1.1.2');
+    expect(document.body.textContent).toContain('start the search again from its first page');
+    api.trajectories.mockImplementation(async (params) => (params.since ? ccSearch : tamper));
   });
 
   it('parses the query as it is typed, and refuses at the column the server names', async () => {
@@ -112,14 +144,22 @@ describe('a search', () => {
 });
 
 describe('the detector library', () => {
+  it('says why findings are incomplete, a capped detector included', async () => {
+    const { findingsCaveat } = await import('./BehaviorsScreen.jsx');
+    expect(findingsCaveat({ ...findings, truncated: true, stopped: 'deadline' }))
+      .toBe('The scan stopped at the query deadline; counts cover the runs checked.');
+    const capped = { ...findings, truncated: true, detectors: findings.detectors.map((d, i) => (i ? d : { ...d, runs_inexact: 2 })) };
+    expect(findingsCaveat(capped)).toBe('1 detector hit a matcher cap on some run, so its count is a lower bound (marked +); counts cover the runs checked.');
+  });
+
   it('ranks detectors with findings first, each against how every checked run ended', async () => {
     const { go } = await show();
     const rows = screen.getAllByTestId('detector').map((d) => d.textContent);
     expect(rows[0]).toContain('Edited the tests to make them pass');
-    expect(rows[0]).toContain('1 of 350 runs');
+    expect(rows[0]).toContain('1 of 351 runs');
     expect(rows).toHaveLength(findings.detectors.filter((d) => d.runs_matched).length);
     const panel = screen.getByTestId('findings').textContent;
-    expect(panel).toContain('61.9%');
+    expect(panel).toContain('62.0%');
     expect(panel).toContain('No findings in this window:');
     expect(panel).toContain('Agents handing work back and forth');
     fireEvent.click(screen.getAllByText('giveup-5')[0]);
@@ -128,10 +168,10 @@ describe('the detector library', () => {
 
   it("draws a detector's success rate with its interval, and calls it worse only when the interval says so", async () => {
     await show();
-    // One run matched, and failed: 0% of 1 cannot be told from the 61.9% baseline.
+    // One run matched, and failed: 0% of 1 cannot be told from the 62.0% baseline.
     const row = screen.getAllByTestId('detector').find((d) => d.textContent.includes('hallucinated_tool'));
     expect(row.textContent).toContain('0% of 1 known');
-    expect(within(row).getByRole('img', { name: /success 0\.0%, 95% interval 0\.0–79\.3%, base rate 61\.9%/ })).toBeTruthy();
+    expect(within(row).getByRole('img', { name: /success 0\.0%, 95% interval 0\.0–79\.3%, base rate 62\.0%/ })).toBeTruthy();
     expect(within(row).getByTestId('detector-rate').style.color).not.toBe('var(--error)');
   });
 

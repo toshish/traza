@@ -151,7 +151,7 @@ function AgentChanges({ agent, operator, go, placed, sinceNs, untilNs }) {
         {Object.entries(agent.current || {}).map(([k, v]) => <span key={k} title={v} style={{
           fontSize: 12, border: '1px solid var(--hairline)', borderRadius: 'var(--radius-control)', padding: '1px 6px',
         }}><span style={{ color: 'var(--ink-muted)' }}>{DIMENSION_LABEL[k] || k}</span> <Mono>{changeValue(v, 36)}</Mono></span>)}
-        {agent.volatile.length ? <Tag status="warn" mono title="Too varied to search: more than half the runs carry a value no other run shares, or over 100 change points">volatile: {agent.volatile.map((d) => DIMENSION_LABEL[d] || d).join(', ')}</Tag> : null}
+        {agent.volatile.length ? <Tag status="warn" mono title="Too varied to search: more than half the runs carry a value no other run shares, or more than four values of it, or it has over 100 change points">volatile: {agent.volatile.map((d) => DIMENSION_LABEL[d] || d).join(', ')}</Tag> : null}
       </div>
       {agent.truncated ? <Caveat>More than 40 changes; the lowest-ranked are not listed.</Caveat> : null}
     </Card>
@@ -354,7 +354,7 @@ function ChangeDetail({ change }) {
   }
   if (d.changed) {
     return <div style={{ display: 'grid', gap: 3, fontSize: 12 }}>
-      {d.changed.map((c) => <div key={c.key}><Mono color="var(--ink-muted)">{c.key}</Mono> <Mono>{String(c.before ?? '∅')}</Mono> → <Mono>{String(c.after ?? '∅')}</Mono></div>)}
+      {d.changed.map((c) => <div key={c.key}><Mono color="var(--ink-muted)">{c.key}</Mono> <Mono>{paramValue(c.before)}</Mono> → <Mono>{paramValue(c.after)}</Mono></div>)}
     </div>;
   }
   if (d.paths) {
@@ -387,9 +387,24 @@ function SharePair({ before, after, max = 1 }) {
   </span>;
 }
 
+/** A sampling parameter's value as the server types it: JSON, so the
+    number `1024` and the string `"1024"` — two configurations — read apart,
+    and an absent key is `∅`. */
+export function paramValue(value) {
+  if (value === null || value === undefined) return '∅';
+  return JSON.stringify(value);
+}
+
+/** Observations a side a metric's own test needs before the server lets it
+    take part in a verdict (runs that ended, for success rate; priced runs,
+    for cost). Below it the row is still shown, never marked. */
+export const MIN_SIDE_OBSERVATIONS = 10;
+
 /** The deltas as a table: before, after, the change, its p-value and how
     many runs each side counted. A row is marked by direction only when its
-    raw p is under 5%; the verdict itself is the server's, Holm-corrected. */
+    raw p is under 5% and its own test had ten observations a side, as the
+    server requires before a metric counts; the verdict itself is the
+    server's, Holm-corrected. */
 function Deltas({ deltas }) {
   if (!deltas) return null;
   return <div className="tz-scroll-x"><div role="table" aria-label="Deltas" style={{ display: 'grid', gridTemplateColumns: 'minmax(96px, 1.2fr) minmax(64px, 1fr) minmax(88px, 1fr) 56px 56px', fontSize: 12, alignItems: 'center', minWidth: 360 }}>
@@ -400,7 +415,8 @@ function Deltas({ deltas }) {
       const delta = deltas[metric.key];
       if (!delta) return null;
       const direction = deltaDirection(metric, delta);
-      const significant = typeof delta.p_value === 'number' && delta.p_value < 0.05;
+      const counted = (delta.n_before ?? 0) >= MIN_SIDE_OBSERVATIONS && (delta.n_after ?? 0) >= MIN_SIDE_OBSERVATIONS;
+      const significant = counted && typeof delta.p_value === 'number' && delta.p_value < 0.05;
       const color = significant && direction === 'worse' ? 'var(--error)' : significant && direction === 'better' ? 'var(--ok)' : 'var(--ink)';
       return <React.Fragment key={metric.key}>
         <div role="cell" style={{ padding: '4px 6px', color: 'var(--ink-muted)' }}>{metric.label}</div>
@@ -410,7 +426,9 @@ function Deltas({ deltas }) {
           {typeof delta.ratio === 'number' ? <Mono size={11} color="var(--ink-faint)"> {delta.ratio.toFixed(2)}×</Mono> : null}
         </div>
         <div role="cell" style={{ padding: '4px 6px', textAlign: 'right' }}><Mono color={significant ? 'var(--ink)' : 'var(--ink-faint)'}>{fmtP(delta.p_value)}</Mono></div>
-        <div role="cell" style={{ padding: '4px 6px', textAlign: 'right' }}><Mono size={11} color="var(--ink-faint)">{fmtNum(delta.n_before)}/{fmtNum(delta.n_after)}</Mono></div>
+        <div role="cell" style={{ padding: '4px 6px', textAlign: 'right' }} title={counted ? undefined : `Fewer than ${MIN_SIDE_OBSERVATIONS} observations on a side: shown, but not part of the verdict`}>
+          <Mono size={11} color={counted ? 'var(--ink-faint)' : 'var(--warn)'}>{fmtNum(delta.n_before)}/{fmtNum(delta.n_after)}</Mono>
+        </div>
       </React.Fragment>;
     })}
   </div></div>;

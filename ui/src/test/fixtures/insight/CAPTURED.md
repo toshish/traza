@@ -42,3 +42,22 @@ that window, so their last step is open and pooled.
 | `tql_bad_field.json` | `GET /v1/trajectories/search?q=tool(bash)[stauts=error]` (400) |
 | `detectors.json`, `findings.json` | `GET /v1/detectors`, `GET /v1/detectors/findings` |
 | `blame_item.json`, `blame_test.json`, `blame_none.json` | `GET /v1/blame?path=src/item.rs&line=pub price: u64,`, `?path=tests/test_parser.py&line=    assert parse('  Mixed ') == 'mixed'`, and a line no edit wrote |
+| `tql_page1.json`, `tql_page2.json` | `GET /v1/trajectories/search?q=test[error] ..> edit&since=<a year back>&limit=1`, then the same with `cursor=` the first page's `next_cursor` and no `since` |
+| `tql_cursor_window.json` | that cursor sent with a `since` an hour later than the one it carries (400) |
+
+## Captured from stores of their own
+
+Each of these came from a fresh `traza-server --data-dir <empty>` given only
+the spans described, so the case it shows is the only thing in it.
+
+| File | Store | Request |
+|---|---|---|
+| `blame_unconfirmed.json` | Three `Edit` calls writing `let total = items.len();` into `/srv/shop/src/cart.rs`, one run each: one with status `error` and Claude Code's not-found result, one with no status and no result, one with status `ok` and a result | `GET /v1/blame?path=src/cart.rs&line=let total = items.len();` |
+| `changes_params.json` | 120 runs of `tuned-bot`, whose `gen_ai.request.stop` once spelled out a temperature and whose `max_tokens` was text, then became `stop="END"`, `temperature=0.7` and `max_tokens=1024` (error rate 0% → 40%); and 120 runs of `triage-bot`, whose one-word prompt edit moved success from 8 of 8 ended runs to 0 of 8, every other run declaring `session.outcome=escalated` | `GET /v1/changes` |
+| `cache_long.json` | Three calls of `long-ctx-1`: 2,000 one-line turns, the same with an instruction put ahead of them, and that with one more turn | `GET /v1/cache/long-ctx-1` |
+| `xray_unread.json` | `--payload-threshold-bytes 200`; two calls of `unread-1` in one conversation, the first's two instructions inline, the second's request (the same two and a long question) offloaded | `GET /v1/xray/0ff10ad0000000000000000000000000/00000000000000d1?resolve=false` |
+
+The Live screen's `../live_stream_removed.txt` is `GET /v1/runs/live/stream`
+from a server run with `--fuse-max-runs 1 --live-window-seconds 3`: one run,
+then a second that took the guard's one slot (the first `evicted`), then
+three quiet seconds (the second `expired`).

@@ -5,8 +5,10 @@
 // `fetch`, like the tail — `EventSource` cannot carry the bearer header, and
 // a token in the URL lands in proxy logs and browser history. Its protocol is
 // simpler than the tail's: an `event: snapshot` carrying the whole listing,
-// then `event: run` with one run's row each time that run changes, and a
-// `: tick` comment after fifteen quiet seconds. There is no resume cursor, so
+// then `event: run` with one run's row each time that run changes, `event:
+// removed` when a run the client holds leaves the view (the guard let go of
+// it, or its activity left the live window), and a `: tick` comment after
+// fifteen quiet seconds. There is no resume cursor, so
 // there is nothing to resume: every connection, first or reconnected, starts
 // from a snapshot that replaces everything held. A break is therefore healed
 // by construction, and what the client owes the reader is honesty about the
@@ -47,7 +49,8 @@ export function rowKey(row) {
   return (row.tenant || '') + '\u0000' + row.run;
 }
 
-/** Interprets one stream frame: a snapshot, a run, a tick, or null.
+/** Interprets one stream frame: a snapshot, a run, a removal, a tick, or
+    null.
 
     A comment (`: tick`) is the heartbeat, returned so the runner can count
     it as progress. An unknown event is ignored, so the server can add frame
@@ -73,6 +76,14 @@ export function parseLiveFrame(frame) {
     };
   }
   if (event === 'run' && isRow(payload)) return { type: 'run', row: payload };
+  if (event === 'removed' && isRow(payload)) {
+    return {
+      type: 'removed',
+      run: payload.run,
+      tenant: typeof payload.tenant === 'string' ? payload.tenant : '',
+      reason: typeof payload.reason === 'string' ? payload.reason : '',
+    };
+  }
   return null;
 }
 
@@ -178,6 +189,18 @@ export function applyRun(state, row, nowMs) {
   return { ...state, rows: capRows(rows), offsetMs: offset, seenAtMs: nowMs };
 }
 
+/** Drops one run's row on an `event: removed` frame: the server no longer
+    lists it — the guard let go of it (`evicted`), or its last activity left
+    the live window (`expired`). Without this a run the guard evicted while
+    still active would stay on screen until the client aged it out. */
+export function applyRemoved(state, removal) {
+  const key = rowKey(removal);
+  if (!state.rows.has(key)) return state;
+  const rows = new Map(state.rows);
+  rows.delete(key);
+  return { ...state, rows };
+}
+
 function activityMs(row) {
   return typeof row.last_activity_ns === 'number' ? row.last_activity_ns / 1e6 : 0;
 }
@@ -193,9 +216,10 @@ export function serverNowMs(state, nowMs) {
   return nowMs + (state.offsetMs || 0);
 }
 
-/** Drops rows whose last activity has left the live window. The stream sends
-    nothing when a run goes quiet, so the client ages rows out itself. A few
-    seconds of grace keep a row from flickering out on clock noise. */
+/** Drops rows whose last activity has left the live window. The stream says
+    so itself (`event: removed`, reason `expired`), but a poll does not, and a
+    stream that broke may have missed it, so the client ages rows out too. A
+    few seconds of grace keep a row from flickering out on clock noise. */
 export function ageOut(state, nowMs) {
   const limitMs = state.windowNs / 1e6 + 5000;
   const now = serverNowMs(state, nowMs);
@@ -436,7 +460,13 @@ export function fmtInterval(ci) {
 
 /** The sentence a foresight stands for, built from the row's own figures
     (the live row carries no explanation; the run route does). */
-export function foresightSentence(foresight) {
+/** Why a row lists without foresight when the server says
+    `foresight_deferred`: the reads behind a listing share one query budget,
+    and this run's was not made — not that there is nothing to say. */
+export const DEFERRED_SENTENCE = 'Foresight not read for this update: the listing spent its query budget on other runs first, or this run\'s last read failed. A later update reads it.';
+
+export function foresightSentence(foresight, deferred = false) {
+  if (!foresight && deferred) return DEFERRED_SENTENCE;
   if (!foresight) return 'No foresight yet: the server holds no whole path for this run.';
   const { verdict, support, p_success: p, base_rate: base } = foresight;
   if (verdict === 'insufficient_history') {
@@ -512,7 +542,8 @@ const TERMINAL = new Set(['denied', 'disabled', 'missing', 'rejected']);
     drives this with generators rather than sockets.
 
     `onSnapshot(snapshot, {source})` replaces everything; `onRun(row)`
-    upserts one row; `onStatus({state, …})` reports `live`, `reconnecting`
+    upserts one row; `onRemoved({run, tenant, reason})` drops one;
+    `onStatus({state, …})` reports `live`, `reconnecting`
     (with `inMs`, and the `error` that ended the last connection when one
     did), `polling` (with the refusal, and `failed` when the last read
     failed), or — for good — `disabled`, `missing`, `denied` or `rejected`
@@ -529,7 +560,7 @@ const TERMINAL = new Set(['denied', 'disabled', 'missing', 'rejected']);
     though no read has said so. */
 export async function runLiveStream(options) {
   const {
-    open, poll, params = {}, onSnapshot, onRun, onStatus = () => {}, signal,
+    open, poll, params = {}, onSnapshot, onRun, onRemoved = () => {}, onStatus = () => {}, signal,
     sleep = defaultSleep, now = Date.now, stallMs = STALL_MS,
     setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = (id) => clearTimeout(id),
   } = options;
@@ -600,6 +631,8 @@ export async function runLiveStream(options) {
               onStatus({ state: 'live' });
             } else if (frame.type === 'run') {
               onRun(frame.row);
+            } else if (frame.type === 'removed') {
+              onRemoved(frame);
             }
           }
         }

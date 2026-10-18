@@ -1,6 +1,6 @@
 import React from 'react';
 import { Tag } from '../primitives/Tag.jsx';
-import { FORESIGHT, fmtInterval, fmtPct, foresightMarks, foresightSentence } from '../../lib/live.js';
+import { DEFERRED_SENTENCE, FORESIGHT, fmtInterval, fmtPct, foresightMarks, foresightSentence } from '../../lib/live.js';
 
 // A run's foresight, drawn: how earlier runs of its agent that took the same
 // path ended. The rate is a measurement, so it is the accent; its 95%
@@ -10,7 +10,10 @@ import { FORESIGHT, fmtInterval, fmtPct, foresightMarks, foresightSentence } fro
 
 /** The verdict as a chip: on track, at risk, likely failure, novel path, or
     no history. */
-export function ForesightChip({ foresight, style }) {
+export function ForesightChip({ foresight, deferred = false, style }) {
+  if ((!foresight || !foresight.verdict) && deferred) {
+    return <span title={DEFERRED_SENTENCE} style={{ fontSize: 11, color: 'var(--ink-faint)', whiteSpace: 'nowrap', ...style }}>foresight deferred</span>;
+  }
   if (!foresight || !foresight.verdict) {
     return <span title="The server holds no whole path for this run yet" style={{ fontSize: 11, color: 'var(--ink-faint)', ...style }}>no foresight</span>;
   }
@@ -40,9 +43,9 @@ function Rate({ foresight, marks, faded }) {
 
     `compact` is the phone card: the track and one line of figures, the run
     count always among them — a touch screen shows no tooltip. */
-export function ForesightBar({ foresight, compact = false, width = '100%' }) {
+export function ForesightBar({ foresight, deferred = false, compact = false, width = '100%' }) {
   const marks = foresightMarks(foresight);
-  const title = foresightSentence(foresight);
+  const title = foresightSentence(foresight, deferred);
   if (!marks || marks.p == null) {
     return <div title={title} style={{ width, display: 'grid', gap: 3 }}>
       <Track width={width} />
@@ -69,12 +72,12 @@ export function ForesightBar({ foresight, compact = false, width = '100%' }) {
     title. The figures wrap under the chip when the column is narrow rather
     than being cut. A run without enough history says how much it has, and
     draws nothing: an interval over three runs is a picture of noise. */
-export function ForesightCell({ foresight }) {
+export function ForesightCell({ foresight, deferred = false }) {
   const marks = foresightMarks(foresight);
-  const title = foresightSentence(foresight);
+  const title = foresightSentence(foresight, deferred);
   if (!foresight || !marks || foresight.verdict === 'insufficient_history' || marks.p == null) {
     return <div title={title} style={{ display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0, whiteSpace: 'nowrap' }}>
-      <ForesightChip foresight={foresight} />
+      <ForesightChip foresight={foresight} deferred={deferred} />
       {foresight && foresight.verdict === 'insufficient_history'
         ? <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-faint)', fontVariantNumeric: 'tabular-nums' }}>n {marks ? marks.support : 0}/30</span> : null}
     </div>;

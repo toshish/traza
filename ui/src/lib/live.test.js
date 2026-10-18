@@ -10,10 +10,14 @@ import listing from '../test/fixtures/live_runs.json';
 // A support-app run from the same server minutes earlier, before its agent
 // had a completed run: no base rate, no interval, no support.
 import noHistory from '../test/fixtures/live_row_no_history.json';
+// GET /v1/runs/live/stream from a server run with `--fuse-max-runs 1
+// --live-window-seconds 3`: a second run took the guard's one slot (the
+// first is `evicted`), then went quiet past the window (`expired`).
+import removedText from '../test/fixtures/live_stream_removed.txt?raw';
 import { createFramer } from './tail.js';
 import {
-  IDLE_MS, LIVE_POLL_MS, ROW_CAP, STALL_MS, STREAM_RETRY_MS, WAITING_MS, ageOut, agentsOf, applyRun, applySnapshot,
-  classifyFailure, deliveryWaitMs, fmtInterval, fmtPct, foresightMarks, foresightSentence, guardState, isQuiet,
+  DEFERRED_SENTENCE, IDLE_MS, LIVE_POLL_MS, ROW_CAP, STALL_MS, STREAM_RETRY_MS, WAITING_MS, ageOut, agentsOf, applyRemoved,
+  applyRun, applySnapshot, classifyFailure, deliveryWaitMs, fmtInterval, fmtPct, foresightMarks, foresightSentence, guardState, isQuiet,
   isWaiting, liveTotals, matches, needsAttention, newLiveState, nudgeProblem, parseLiveFrame, probeCandidates,
   riskRank, rowKey, runLiveStream, serverNowMs, sortEntries, utf8Bytes,
 } from './live.js';
@@ -39,6 +43,14 @@ describe('the stream as the server sent it', () => {
     expect(parseLiveFrame('event: future\ndata: {"run":"x"}')).toBeNull();
     expect(parseLiveFrame('event: run\ndata: {not json')).toBeNull();
     expect(parseLiveFrame('event: run\ndata: {"no_run":1}')).toBeNull();
+  });
+
+  it('reads a removal: the run, its tenant and why it left the view', () => {
+    const parsed = createFramer()(removedText).map(parseLiveFrame).filter(Boolean);
+    expect(parsed.map((f) => f.type)).toEqual(['snapshot', 'removed', 'run', 'removed']);
+    expect(parsed[1]).toEqual({ type: 'removed', run: 'tkt-5001', tenant: '', reason: 'evicted' });
+    expect(parsed[3]).toEqual({ type: 'removed', run: 'tkt-5002', tenant: '', reason: 'expired' });
+    expect(parseLiveFrame('event: removed\ndata: {"reason":"evicted"}')).toBeNull();
   });
 
   it('survives a frame split anywhere, multi-byte names included', () => {
@@ -70,6 +82,24 @@ describe('the rows', () => {
     expect(next.rows.get(rowKey(first.row)).row).toEqual(first.row);
     expect(next.rows.get(rowKey(first.row)).flashAt).toBe(5000);
     expect(applyRun(next, first.row, 6000)).toBe(next);
+  });
+
+  it('a removal drops exactly the run it names, in its tenant', () => {
+    let state = newLiveState();
+    for (const frame of createFramer()(removedText).map(parseLiveFrame).filter(Boolean)) {
+      if (frame.type === 'snapshot') state = applySnapshot(state, frame, 1000);
+      else if (frame.type === 'run') state = applyRun(state, frame.row, 2000);
+      else if (frame.type === 'removed') state = applyRemoved(state, frame);
+      if (frame.type === 'removed') expect(state.rows.has(rowKey(frame))).toBe(false);
+    }
+    // Every event applied: the client holds what the listing holds, nothing.
+    expect(state.rows.size).toBe(0);
+    const row = byRun('tkt-4173');
+    const two = applyRun(applyRun(newLiveState(), row, 1), { ...row, tenant: 'acme' }, 2);
+    const one = applyRemoved(two, { run: row.run, tenant: 'acme', reason: 'evicted' });
+    expect([...one.rows.keys()]).toEqual([rowKey(row)]);
+    // A removal of a run not held changes nothing.
+    expect(applyRemoved(one, { run: 'nobody', tenant: '', reason: 'expired' })).toBe(one);
   });
 
   it('keys a run by tenant and id: one id in two tenants is two runs', () => {
@@ -181,6 +211,10 @@ describe('foresight', () => {
     expect(foresightSentence(noHistory.foresight)).toMatch(/No earlier run of this agent took this path yet/);
     expect(foresightSentence(byRun('conv-c36f2e').foresight)).toMatch(/^This run took a step no earlier run of its agent took at that point/);
     expect(foresightSentence(undefined)).toMatch(/no whole path/);
+    // A row the listing's one query budget did not reach says so, rather
+    // than that there is nothing to say.
+    expect(foresightSentence(undefined, true)).toBe(DEFERRED_SENTENCE);
+    expect(foresightSentence(byRun('conv-82febb').foresight, true)).toMatch(/^Only 6 earlier runs/);
   });
 });
 
@@ -219,6 +253,22 @@ describe('following the stream', () => {
     expect(seen[0]).toEqual(['snapshot', listing.runs.length, 'stream']);
     expect(seen.filter((s) => s[0] === 'run')).toHaveLength(4);
     expect(statuses).toEqual(['live', 'reconnecting']);
+  });
+
+  it('hands each removal to onRemoved, in order with the run frames', async () => {
+    const controller = new AbortController();
+    const seen = [];
+    await runLiveStream({
+      open: async () => chunks(removedText),
+      poll: vi.fn(),
+      signal: controller.signal,
+      onSnapshot: () => seen.push('snapshot'),
+      onRun: (row) => seen.push('run ' + row.run),
+      onRemoved: (removal) => seen.push(`removed ${removal.run} ${removal.reason}`),
+      onStatus: (status) => { if (status.state === 'reconnecting') controller.abort(); },
+      sleep: async () => {},
+    });
+    expect(seen).toEqual(['snapshot', 'removed tkt-5001 evicted', 'run tkt-5002', 'removed tkt-5002 expired']);
   });
 
   it('reconnects with backoff that resets on progress, starting again from a snapshot', async () => {

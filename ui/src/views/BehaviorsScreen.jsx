@@ -25,7 +25,10 @@ export function BehaviorsScreen({ go, params }) {
   const windowId = windowFrom(params);
   const since = windowSince(windowId);
   const q = params.get('q') || '';
-  const until = params.get('until') || undefined;
+  // A continued page: the server's `next_cursor`, opaque. It carries the
+  // window it continues, so `since` is left out with it — the window's
+  // hour-floored start would move under a page read past the hour.
+  const cursor = params.get('cursor') || undefined;
   const agent = params.get('agent') || '';
   const outcome = OUTCOMES.includes(params.get('outcome')) ? params.get('outcome') : 'any';
   const tenant = routeTenant(params);
@@ -44,32 +47,33 @@ export function BehaviorsScreen({ go, params }) {
     const text = (query ?? draft).trim();
     if (!text) return;
     setDraft(text);
-    set({ q: text, until: null }, false);
+    set({ q: text, cursor: null }, false);
   };
 
   const explain = useExplain(draft);
   const results = useRead((signal) => api.trajectories({
-    q, since, until, agent: agent || undefined, outcome: outcome === 'any' ? undefined : outcome, limit: 50, ...tenantParams(tenant),
-  }, signal), [q, since, until, agent, outcome, tenant], { skip: !q });
+    q, since: cursor ? undefined : since, cursor, agent: agent || undefined, outcome: outcome === 'any' ? undefined : outcome, limit: 50,
+    ...tenantParams(tenant),
+  }, signal), [q, cursor ? '' : since, cursor, agent, outcome, tenant], { skip: !q });
   const findings = useRead((signal) => api.findings({ since, agent: agent || undefined, ...tenantParams(tenant) }, signal),
     [since, agent, tenant]);
   const library = useRead((signal) => api.detectors(signal), []);
 
   return <div style={{ display: 'grid', gap: 14, maxWidth: 1600 }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: '8px 14px', flexWrap: 'wrap' }}>
-      <RangeBar ranges={WINDOWS} active={windowId} onPick={(id) => set({ window: id === '30d' ? null : id, until: null })} />
+      <RangeBar ranges={WINDOWS} active={windowId} onPick={(id) => set({ window: id === '30d' ? null : id, cursor: null })} />
       <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
         <span style={{ fontSize: 12, color: 'var(--ink-muted)' }}>ended</span>
-        {OUTCOMES.map((o) => <Chip key={o} active={outcome === o} onClick={() => set({ outcome: o === 'any' ? null : o })}>{o}</Chip>)}
+        {OUTCOMES.map((o) => <Chip key={o} active={outcome === o} onClick={() => set({ outcome: o === 'any' ? null : o, cursor: null })}>{o}</Chip>)}
       </span>
       <Input size="sm" mono value={agentDraft} onChange={setAgentDraft} placeholder="agent (any)" ariaLabel="Agent"
-        style={{ width: 170 }} onKeyDown={(e) => { if (e.key === 'Enter') set({ agent: agentDraft.trim() || null }); }} />
+        style={{ width: 170 }} onKeyDown={(e) => { if (e.key === 'Enter') set({ agent: agentDraft.trim() || null, cursor: null }); }} />
     </div>
 
     <div className="tz-split" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(300px, 400px)', gap: 14, alignItems: 'start' }}>
       <div style={{ display: 'grid', gap: 14, minWidth: 0 }}>
         <QueryBox draft={draft} setDraft={setDraft} explain={explain} onSearch={() => search()} />
-        {q ? <Results results={results} q={q} go={go} onContinue={(ns) => set({ until: ns })} until={until} /> : <EmptyState message={<span>
+        {q ? <Results results={results} q={q} go={go} onContinue={(next) => set({ cursor: next }, false)} continued={Boolean(cursor)} /> : <EmptyState message={<span>
           Write a pattern above, or pick one: an atom matches one step (<code>tool</code>, <code>llm</code>,
           <code> edit</code>, <code>test</code>), brackets test it (<code>[error]</code>), and <code>-&gt;</code> and
           <code> ..&gt;</code> chain steps — next, and eventually.
@@ -141,30 +145,35 @@ function QueryBox({ draft, setDraft, explain, onSearch }) {
   </Card>;
 }
 
-function Results({ results, q, go, onContinue, until }) {
+function Results({ results, q, go, onContinue, continued }) {
   if (results.error) {
     const body = results.error.body;
     return <ErrorState what={body && body.error ? body.error : results.error.what}
-      next={results.error.status === 400 && !(body && body.column) ? 'Enumerating a window that does not fit the query deadline is refused; narrow it.' : results.error.next} />;
+      next={results.error.status === 400 && !(body && body.column) ? (continued
+        ? 'A continued page carries the window it continues; start the search again from its first page.'
+        : 'Enumerating a window that does not fit the query deadline is refused; narrow it.') : results.error.next} />;
   }
   if (!results.data) return <Skeleton height={160} />;
   const d = results.data;
   return <Card pad="0" data-testid="tql-results">
     <div style={{ padding: '12px 14px 8px' }}>
       <PanelHead title="Matches" style={{ marginBottom: 4 }}
-        note={`${fmtNum(d.matches.length)} run${d.matches.length === 1 ? '' : 's'} · ${ofTotal(d.runs_scanned, d.runs_in_window)} runs scanned, newest first${until ? ' · before ' + fmtTimeNs(Number(until)) : ''}`} />
+        note={`${fmtNum(d.matches.length)} run${d.matches.length === 1 ? '' : 's'} · ${ofTotal(d.runs_scanned, d.runs_in_window)} runs scanned, newest first${continued ? ' · continued from the page before' : ''}`} />
       <LoadingBar active={results.loading} />
       {d.window_capped ? <Caveat>The window holds more than 5,000 runs; only the most recent were considered.</Caveat> : null}
       {d.stopped === 'deadline' ? <Caveat>The scan stopped at the query deadline; older runs were not checked.</Caveat> : null}
       {d.stopped === 'limit' ? <div style={{ fontSize: 12, color: 'var(--ink-muted)' }}>Stopped at 50 matching runs.</div> : null}
       {d.spans_skipped ? <Caveat>{fmtNum(d.spans_skipped)} spans were left out: their run id does not read back to them.</Caveat> : null}
+      {d.runs_inexact ? <Caveat>{fmtNum(d.runs_inexact)} scanned run{d.runs_inexact === 1 ? '' : 's'} not listed hit a matcher cap, so a match there may have been missed.</Caveat> : null}
     </div>
     {!d.matches.length ? <div style={{ padding: '4px 14px 14px', fontSize: 12, color: 'var(--ink-muted)' }}>
-      No run in this window has a step sequence matching <Mono>{d.query}</Mono>.
+      {d.truncated
+        ? <>No run scanned has a step sequence matching <Mono>{d.query}</Mono> — but the answer is incomplete, so one may yet.</>
+        : <>No run in this window has a step sequence matching <Mono>{d.query}</Mono>.</>}
     </div> : null}
     {d.matches.map((m) => <MatchRow key={m.tenant + '\u0000' + m.run} match={m} go={go} />)}
-    {d.next_until_ns != null ? <div style={{ padding: '10px 14px', borderTop: '1px solid var(--hairline)' }}>
-      <Chip onClick={() => onContinue(String(d.next_until_ns))}>Continue with older runs</Chip>
+    {d.next_cursor ? <div style={{ padding: '10px 14px', borderTop: '1px solid var(--hairline)' }}>
+      <Chip onClick={() => onContinue(d.next_cursor)}>Continue with the runs not yet checked</Chip>
     </div> : null}
   </Card>;
 }
@@ -251,7 +260,7 @@ function Findings({ findings, library, go, onSearch, windowId }) {
         action={f ? <span style={{ fontSize: 12, color: 'var(--ink-muted)' }}>every checked run: <CiBar rate={f.baseline_success_rate} width={70} label={false} /> <Mono color="var(--accent)">{fmtPct(f.baseline_success_rate)}</Mono> succeeded</span> : null} />
       <LoadingBar active={findings.loading} />
       {findings.error ? <ErrorState what={findings.error.what} next={findings.error.next} onRetry={findings.reload} /> : null}
-      {f && f.truncated ? <Caveat>{f.stopped === 'deadline' ? 'The scan stopped at the query deadline' : 'The window held more runs than the 2,000 checked'}; counts cover the runs checked.</Caveat> : null}
+      {f && f.truncated ? <Caveat>{findingsCaveat(f)}</Caveat> : null}
     </div>
     {!rows.length && (findings.loading || library.loading) ? <div style={{ padding: 14 }}><Skeleton height={120} /></div> : null}
     {fired.map((d) => <DetectorRow key={d.name} d={d} baseline={f && f.baseline_success_rate} checked={f && f.runs_checked} go={go} onSearch={onSearch} />)}
@@ -268,6 +277,22 @@ function Findings({ findings, library, go, onSearch, windowId }) {
   </Card>;
 }
 
+/** Why a findings answer is incomplete, in the order a reader can act on:
+    a scan cut short, a window larger than the runs checked, and a detector
+    whose matcher hit a cap on some run (its count is then a lower bound). */
+export function findingsCaveat(f) {
+  const reasons = [];
+  if (f.stopped === 'deadline') reasons.push('the scan stopped at the query deadline');
+  if (f.window_capped || f.next_cursor || (f.runs_in_window != null && f.runs_checked < f.runs_in_window)) {
+    reasons.push(`the window held more runs than the ${fmtNum(f.runs_checked)} checked`);
+  }
+  const inexact = (f.detectors || []).filter((d) => d.runs_inexact).length;
+  if (inexact) reasons.push(`${inexact} detector${inexact === 1 ? '' : 's'} hit a matcher cap on some run, so ${inexact === 1 ? 'its count is' : 'their counts are'} a lower bound (marked +)`);
+  if (!reasons.length) reasons.push('some runs were not checked');
+  const text = reasons.join('; ');
+  return text.charAt(0).toUpperCase() + text.slice(1) + '; counts cover the runs checked.';
+}
+
 function DetectorRow({ d, baseline, checked, go, onSearch }) {
   const severity = SEVERITY[d.severity] || SEVERITY.low;
   // The rate rests on the matched runs whose outcome is known; it is called
@@ -279,7 +304,9 @@ function DetectorRow({ d, baseline, checked, go, onSearch }) {
       <span style={{ fontSize: 13, fontWeight: 500 }}>{d.title}</span>
       <Mono size={11} color="var(--ink-faint)">{d.name}</Mono>
       <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', fontSize: 12, color: 'var(--ink-muted)' }}>
-        <span><Mono color="var(--accent)">{fmtNum(d.runs_matched)}</Mono> of <Mono>{fmtNum(checked)}</Mono> runs · <Mono>{fmtNum(d.occurrences)}</Mono> {d.occurrences === 1 ? 'time' : 'times'}</span>
+        <span title={d.runs_inexact ? `${d.runs_inexact} more checked run${d.runs_inexact === 1 ? '' : 's'} hit a matcher cap, so it may have matched there too` : undefined}>
+          <Mono color="var(--accent)">{fmtNum(d.runs_matched)}{d.runs_inexact ? '+' : ''}</Mono> of <Mono>{fmtNum(checked)}</Mono> runs · <Mono>{fmtNum(d.occurrences)}</Mono> {d.occurrences === 1 ? 'time' : 'times'}
+        </span>
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
           title={`Successes over the ${rate.n} matched run${rate.n === 1 ? '' : 's'} whose outcome is known (95% interval ${fmtCi(rate.ci)}), against every checked run (the ink hairline)`}>
           <CiBar rate={rate.rate} ci={rate.ci || undefined} base={baseline} width={90} label={false} />

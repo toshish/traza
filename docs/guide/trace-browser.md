@@ -316,9 +316,11 @@ what the guard says and how runs like it have ended; and the controls to steer
 them. It follows
 [`GET /v1/runs/live/stream`](http-api.md#get-v1runslivestream) over one held
 connection, read with `fetch` so the bearer token travels as a header and
-never in the URL: the snapshot fills the screen, and each `run` event updates
-its row in place, marked for a moment so the eye finds what moved. Each run
-is keyed by tenant and id.
+never in the URL: the snapshot fills the screen, each `run` event updates
+its row in place, marked for a moment so the eye finds what moved, and each
+`removed` event takes its row away — the guard let go of the run
+(`--fuse-max-runs`, its span budget, six idle hours) or its activity left the
+live window. Each run is keyed by tenant and id.
 
 **When the stream is not there.** A dropped connection is retried with
 backoff (half a second, doubling to ten), reset by any frame including the
@@ -344,8 +346,10 @@ than `408` and `429`, such as a tenant typed into the filter that is not a
 tenant name) is not retried: the page shows the server's message, keeps the
 filter to correct, and offers **Retry**.
 
-The stream sends nothing when a run goes quiet, so a row leaves once its last
-activity is older than the live window. The server's timestamps are its own
+The stream says when a run goes quiet past the live window (`removed`, reason
+`expired`), but a polled listing does not, and a broken stream may have
+missed it, so the page also ages a row out once its last activity is older
+than the window. The server's timestamps are its own
 clock, and nothing it sends says what time it is there, so the page bounds
 its estimate with what the rows prove: no activity is in the server's future,
 every run listed is inside the live window, and a run whose activity moved
@@ -366,8 +370,11 @@ success rate with its 95% interval and the number of earlier runs behind it
 rate. For a run on a novel path the rate is the path's before the run left
 it, labelled `before` and drawn faded: it is not the run's odds. A run with
 fewer than 30 earlier runs on its path shows how many it has
-(`no history n 6/30`). On a phone the card shows the same figures, the count
-included. Opening a row shows the reasons in full, the foresight in a
+(`no history n 6/30`). A row the server listed without foresight only
+because that listing's one query budget ran out before reading it — or the
+run's last read failed and is resting for a minute — says `foresight
+deferred` rather than `no foresight`. On a phone the card shows the same
+figures, the count included. Opening a row shows the reasons in full, the foresight in a
 sentence, the run's policy, service and start, and its nudges.
 
 **Held and waiting runs.** A [predictive fuse](foresight.md#predictive-fuses)
@@ -705,9 +712,14 @@ one step. The chunk list gives each chunk's kind, tokens, the step that
 introduced it (linked to that step on the tape), its age and its preview;
 filters show only stale chunks, repeats, tool results or instructions.
 Beside it: **Dropped since the previous call**, every lost instruction shown
-and flagged, the rest folded behind a count, unverified losses marked;
-**Edited since the previous call** with each diff; this call's cache verdict;
-repeated content; the context by source; and what the model answered. Every
+and flagged, the rest folded behind a count; a chunk missing from a context
+that was not read whole (cut at 2,000 chunks, or an offloaded value left
+unresolved) is marked `not proven lost` and never counted as an instruction
+the agent lost;
+**Edited since the previous call** with each diff; this call's cache verdict
+(tagged `context cut` when this context or the previous one passed the
+2,000-chunk bound, where a verdict the unread part could change is
+`unknown`); repeated content; the context by source; and what the model answered. Every
 partial-read flag the server sets is said in words.
 
 Stored text — previews, prompts, diffs, explanations — is rendered as text
@@ -731,11 +743,15 @@ the unlisted ones still bound their neighbours' sides, so its stretches carry
 no rate. A change card gives the
 verdict, what decided it (quality or efficiency), the dimension and its
 co-changes, when, the effect size, from and to, the dimension's own evidence
-(the prompt edit as a diff, tools added and removed, parameters changed, or
-the paths whose share moved), the server's explanation, and the deltas —
-error and success rate, cost, steps and duration per run, before and after
-with their p-values and the runs counted. A row is marked by direction only
-when its own p is under 5%; the verdict is the server's, Holm-corrected. The
+(the prompt edit as a diff, tools added and removed, parameters changed —
+each value as the JSON the server typed it, so `1024` and `"1024"` read
+apart — or the paths whose share moved), the server's explanation, and the
+deltas — error and success rate, cost, steps and duration per run, before
+and after with their p-values and the observations each side counted. A row
+is marked by direction only when its own p is under 5% and its own test had
+10 observations on each side, as the server requires before a metric takes
+part in a verdict (a row short of that has its counts in the warning colour);
+the verdict is the server's, Holm-corrected. The
 tool mix, the path shift and the example runs follow, with **Diff the last
 run before against the first after**.
 
@@ -758,15 +774,20 @@ caret under the column the server named and its message, and is not
 searched. `⌘↵` or **Search** runs it (the query is in the route). Each
 matching run shows its outcome, agent, the steps covered and how many times
 it matched, the steps the atoms matched — each opening that step on the
-tape — and its captures; inexact and cut runs are flagged, and a stopped or
-capped scan says so, with **Continue with older runs** when the server gave
-a point to resume from. Window chips, an outcome filter and an agent filter
+tape — and its captures; inexact and cut runs are flagged, scanned runs a
+matcher cap may have hidden a match in are counted, and a stopped or capped
+scan says so, with **Continue with the runs not yet checked** when the
+server gave a `next_cursor`. The cursor goes in the route (`?cursor=`) and is
+sent back as it came, without a window of its own, since it carries the
+window it continues. Window chips, an outcome filter and an agent filter
 apply. The syntax panel condenses the guide's tables and lists worked
 examples to run with a click.
 
 **Detectors** runs the library over the window: the detectors that fired
 first, by severity, each with its runs matched of the runs checked, its
-occurrences, its success rate with its 95% interval over the matched runs
+occurrences (marked `+` when its matcher hit a cap on some other checked
+run, so the count is a lower bound), its success rate with its 95% interval
+over the matched runs
 whose outcome is known (and how many those are), drawn against every checked
 run's and marked worse only when the whole interval lies below it, when it
 last fired, its example runs and captures, and **Search this pattern**; the
@@ -781,8 +802,11 @@ spaces (each sent as a repeated `project`). The answer
 shows the line as compared and, earliest first, each tool step that
 introduced it: when, the tool, the sub-agent, the prompt that turn was given,
 the model that asked for the edit, the run and its step (**Open the step on
-its tape**), the file as recorded and the project. A line no recorded edit
-introduced says what blame cannot see.
+its tape**), the file as recorded and the project. An edit that failed wrote
+nothing and is never listed; one with no result recorded (a call cut short,
+or still running) comes after every applied one, tagged `attempted`, since it
+may not have happened. A line no recorded edit introduced says what blame
+cannot see.
 
 ## Live tail
 

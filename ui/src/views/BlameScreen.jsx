@@ -13,7 +13,9 @@ import { Caveat, Kv } from '../components/insight/Bits.jsx';
 // file and the exact text of one line, and it answers with the tool calls
 // whose edit introduced that line — the session, the step on its tape, the
 // prompt that turn was given and the model that asked for the edit —
-// earliest first.
+// earliest first. An edit that failed wrote nothing and is never named; one
+// whose result was never recorded may not have happened, so it is named
+// after every applied one, as an attempt.
 
 export function BlameScreen({ go, params }) {
   const path = params.get('path') || '';
@@ -68,7 +70,7 @@ export function BlameScreen({ go, params }) {
         <div style={{ fontSize: 12, color: 'var(--ink-muted)', lineHeight: '18px' }}>
           Without a repository root every project is searched and the path is a suffix match, so a common line in a
           common path can be answered from an unrelated repository. A step introduces a line when its edit adds it
-          more times than it removes it; re-indenting is not authorship.
+          more times than it removes it; re-indenting is not authorship, and an edit that failed wrote nothing.
         </div>
       </div>
     </Card>
@@ -103,6 +105,8 @@ function BlameAnswer({ data, go }) {
       {data.truncated ? <Caveat>The search reached its 200,000-candidate bound; an earlier introduction may be missing.</Caveat> : null}
     </Card>;
   }
+  const attempts = data.matches.filter(isAttempt).length;
+  const applied = data.matches.length - attempts;
   return <div style={{ display: 'grid', gap: 12 }} data-testid="blame-matches">
     <Card pad="0" style={{ overflow: 'hidden' }}>
       <div style={{ display: 'flex', alignItems: 'stretch', fontFamily: 'var(--font-mono)', fontSize: 14, lineHeight: '22px' }}>
@@ -110,28 +114,43 @@ function BlameAnswer({ data, go }) {
         <div style={{ padding: '10px 14px', color: 'var(--ink)', overflowX: 'auto', whiteSpace: 'pre' }}>{data.line}</div>
       </div>
       <div style={{ padding: '7px 14px', borderTop: '1px solid var(--hairline)', fontSize: 12, color: 'var(--ink-muted)' }}>
-        <Mono color="var(--accent)">{data.matches.length}</Mono> introduction{data.matches.length === 1 ? '' : 's'}, earliest first, from <Mono>{fmtNum(data.searched_spans)}</Mono> edit calls checked{data.projects ? <> under <Mono>{data.projects.join(', ')}</Mono></> : ' in every project'}
+        <Mono color="var(--accent)">{applied}</Mono> introduction{applied === 1 ? '' : 's'}{applied > 1 ? ', earliest first' : ''}{attempts ? <>{applied ? ', then ' : ''}<Mono color="var(--warn)">{attempts}</Mono> attempt{attempts === 1 ? '' : 's'} with no result recorded</> : ''}, from <Mono>{fmtNum(data.searched_spans)}</Mono> edit calls checked{data.projects ? <> under <Mono>{data.projects.join(', ')}</Mono></> : ' in every project'}
       </div>
     </Card>
     {data.truncated ? <Caveat>The search reached its 200,000-candidate bound; an earlier introduction may be missing.</Caveat> : null}
     <ol style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: 12, position: 'relative' }}>
-      {data.matches.map((m, i) => <li key={m.trace_id + m.span_id} style={{ display: 'grid', gridTemplateColumns: '18px minmax(0, 1fr)', gap: 10 }}>
-        <span aria-hidden="true" style={{ position: 'relative' }}>
-          <span style={{ position: 'absolute', left: 8, top: 0, bottom: i === data.matches.length - 1 ? 'calc(100% - 18px)' : -12, width: 1, background: 'var(--hairline)' }} />
-          <span style={{ position: 'absolute', left: 3, top: 13, width: 11, height: 11, borderRadius: '50%', background: i === 0 ? 'var(--accent)' : 'var(--bg-raised)', border: `2px solid ${i === 0 ? 'var(--accent)' : 'var(--ink-faint)'}` }} />
-        </span>
-        <BlameMatch m={m} first={i === 0} go={go} />
-      </li>)}
+      {data.matches.map((m, i) => {
+        // Applied introductions come first, earliest first; the first of
+        // them is the answer. An attempt is never the answer.
+        const first = i === 0 && !isAttempt(m);
+        return <li key={m.trace_id + m.span_id} style={{ display: 'grid', gridTemplateColumns: '18px minmax(0, 1fr)', gap: 10 }}>
+          <span aria-hidden="true" style={{ position: 'relative' }}>
+            <span style={{ position: 'absolute', left: 8, top: 0, bottom: i === data.matches.length - 1 ? 'calc(100% - 18px)' : -12, width: 1, background: 'var(--hairline)' }} />
+            <span style={{ position: 'absolute', left: 3, top: 13, width: 11, height: 11, borderRadius: '50%', background: first ? 'var(--accent)' : 'var(--bg-raised)', border: `2px ${isAttempt(m) ? 'dashed' : 'solid'} ${first ? 'var(--accent)' : 'var(--ink-faint)'}` }} />
+          </span>
+          <BlameMatch m={m} first={first} go={go} />
+        </li>;
+      })}
     </ol>
   </div>;
+}
+
+/** A match whose edit has no recorded result, and no `ok` status: the call
+    was still running, or its result was never written. It may not have
+    happened, so it is an attempt, not an introduction. */
+export function isAttempt(m) {
+  return m.outcome === 'unconfirmed';
 }
 
 function BlameMatch({ m, first, go }) {
   const runParams = { tenant: m.tenant || '' };
   if (typeof m.step_index === 'number') runParams.step = String(m.step_index);
-  return <Card data-testid="blame-match">
+  const attempt = isAttempt(m);
+  return <Card data-testid="blame-match" data-outcome={m.outcome || 'applied'}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-      <Tag status={first ? 'accent' : 'neutral'} mono>{first ? 'introduced' : 'introduced again'}</Tag>
+      {attempt
+        ? <Tag status="warn" mono title="No result was recorded for this edit, and no ok status: the call may have been cut short, so it may not have happened">attempted</Tag>
+        : <Tag status={first ? 'accent' : 'neutral'} mono>{first ? 'introduced' : 'introduced again'}</Tag>}
       <Mono size={12}>{fmtTimeNs(m.at_ns)}</Mono>
       <span style={{ fontSize: 12, color: 'var(--ink-muted)' }}>by</span>
       <Tag mono>{m.tool}</Tag>
@@ -145,6 +164,9 @@ function BlameMatch({ m, first, go }) {
       margin: '0 0 10px', padding: '8px 12px', borderLeft: '2px solid var(--accent)', background: 'var(--bg-sunken)',
       borderRadius: '0 var(--radius-control) var(--radius-control) 0', fontSize: 13, lineHeight: '20px', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere',
     }}>{m.prompt}</blockquote> : <div style={{ fontSize: 12, color: 'var(--ink-faint)', marginBottom: 10 }}>No prompt recorded on an enclosing turn.</div>}
+    {attempt ? <div style={{ fontSize: 12, color: 'var(--ink-muted)', marginBottom: 10, lineHeight: '18px' }}>
+      No result was recorded for this edit: the call may still have been running, or been cut short. It is listed after every applied edit because it may not have happened.
+    </div> : null}
     <div className="tz-reflow-1" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '3px 24px', fontSize: 12 }}>
       <Kv k="run">{m.run}</Kv>
       <Kv k="step on the tape">{m.step_index == null ? 'past the tape read' : m.step_index}</Kv>

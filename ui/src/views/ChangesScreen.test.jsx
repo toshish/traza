@@ -9,6 +9,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, act, cleanup, fireEvent, screen } from '@testing-library/react';
 import changes from '../test/fixtures/insight/changes.json';
 import placed from '../test/fixtures/insight/changes_run.json';
+// Two agents posted to a fresh server: `tuned-bot`'s sampling parameters
+// changed type (`max_tokens` "1024" → 1024), and `triage-bot`'s prompt edit
+// moved success from 8 of 8 ended runs to 0 of 8, every other run declaring
+// an outcome Traza does not recognize.
+import typed from '../test/fixtures/insight/changes_params.json';
 
 vi.mock('../lib/api.js', () => ({
   api: {
@@ -37,7 +42,7 @@ describe('the timeline', () => {
     expect(api.changes).toHaveBeenCalledWith({ since: undefined, environment: undefined, run: undefined }, expect.anything());
     const agents = screen.getAllByTestId('agent-changes');
     expect(agents).toHaveLength(4);
-    expect(agents[0].textContent).toContain('support-bot: regression at 2026-10-17T03:43:54Z');
+    expect(agents[0].textContent).toContain('support-bot: regression at 2026-10-17T06:34:56Z');
     expect(document.body.textContent).toContain('2 regressions in this window');
   });
 
@@ -93,6 +98,31 @@ describe('a change', () => {
     expect(card).toContain('improvement');
     expect(card).toContain('efficiency');
     expect(card).toContain('paths shifted by 1.00');
+  });
+});
+
+describe('what a change is judged on', () => {
+  it('shows parameters as typed JSON, so a number and its text read apart', async () => {
+    api.changes.mockResolvedValueOnce(typed);
+    await show('agent=tuned-bot');
+    const card = screen.getAllByTestId('change')[0].textContent;
+    expect(card).toContain('max_tokens "1024" → 1024');
+    expect(card).toContain('stop "END, temperature=0.7" → "END"');
+    expect(card).toContain('temperature ∅ → 0.7');
+  });
+
+  it('never marks a metric whose own test had fewer than ten observations a side', async () => {
+    api.changes.mockResolvedValueOnce(typed);
+    await show('agent=triage-bot');
+    const card = screen.getAllByTestId('change')[0];
+    expect(card.textContent).toContain('neutral');
+    const cells = [...card.querySelectorAll('[role="cell"]')];
+    const at = cells.findIndex((c) => c.textContent === 'success rate');
+    expect(cells[at + 4].textContent).toBe('8/8');
+    // p = 0.00016 by Fisher's test, on 8 runs a side: shown, not marked.
+    const after = cells[at + 2].querySelector('span');
+    expect(after.style.color).toBe('var(--ink)');
+    expect(cells[at + 4].title).toMatch(/not part of the verdict/);
   });
 });
 

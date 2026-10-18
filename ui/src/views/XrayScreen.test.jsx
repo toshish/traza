@@ -4,8 +4,10 @@
 // GET /v1/xray/{trace}/{span} as a 0.28.0 server answered them: the insight
 // corpus's coding run (a clock in the system prompt, stale results, a pasted
 // repeat, a pause past the TTL, a compaction), the imported Claude Code
-// fixture (each call rebuilt from recorded deltas), and a run whose recorded
-// text is markup.
+// fixture (each call rebuilt from recorded deltas), a run whose recorded
+// text is markup, a run whose contexts pass the 2,000-chunk bound
+// (`cache_long.json`), and a call whose offloaded request was read with
+// resolve=false (`xray_unread.json`).
 
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -16,18 +18,23 @@ import xray34 from '../test/fixtures/insight/xray_fix7_34.json';
 import ccAutopsy from '../test/fixtures/insight/cache_cc1.json';
 import ccXray from '../test/fixtures/insight/xray_cc1_14.json';
 import injected from '../test/fixtures/insight/xray_inject.json';
+import longAutopsy from '../test/fixtures/insight/cache_long.json';
+import unread from '../test/fixtures/insight/xray_unread.json';
 
 const BY_SPAN = {
   [xray30.span.span_id]: xray30,
   [xray34.span.span_id]: xray34,
   [ccXray.span.span_id]: ccXray,
   [injected.span.span_id]: injected,
+  [unread.span.span_id]: unread,
 };
 
 vi.mock('../lib/api.js', () => ({
   api: {
-    cache: vi.fn(async (run) => (run === 'fix-parser-7' ? autopsy : run === 'inject-1' ? {
+    cache: vi.fn(async (run) => (run === 'fix-parser-7' ? autopsy : run === 'long-ctx-1' ? longAutopsy : run === 'inject-1' ? {
       ...ccAutopsy, run: 'inject-1', steps: [{ ...ccAutopsy.steps[0], step_index: 2, span: injected.span }],
+    } : run === 'unread-1' ? {
+      ...ccAutopsy, run: 'unread-1', steps: [{ ...ccAutopsy.steps[0], step_index: 1, span: unread.span }],
     } : ccAutopsy)),
     // The last call of the coding run is not in the fixtures: answer with
     // step 34's body for any span not listed.
@@ -179,6 +186,24 @@ describe('the X-Ray of one call', () => {
     expect(rows).toHaveLength(ccXray.chunks.length);
     expect(rows[4].textContent).toContain('pub struct Cart { items: Vec<Item> }');
     expect(rows[4].textContent).toMatch(/step 1\s*tool Read/);
+  });
+});
+
+describe('what the X-Ray could not read', () => {
+  it('says a verdict over a cut context is unknown, with nothing counted lost', async () => {
+    await show('long-ctx-1', 'step=0');
+    const calls = screen.getAllByTestId('cache-call');
+    expect(calls.map((c) => c.getAttribute('data-cause'))).toEqual(['new_context', 'volatile_content', 'unknown']);
+    expect(document.body.textContent).toContain('had more than 2,000 chunks. Only the chunks both calls had analysed are compared');
+  });
+
+  it('never calls an instruction lost when the call it is missing from was not read whole', async () => {
+    await show('unread-1', 'step=1');
+    const dropped = screen.getByTestId('dropped');
+    expect(dropped.textContent).not.toMatch(/no longer in its context/);
+    expect(screen.getByTestId('dropped-unproven').textContent).toBe('2 instructions not proven lost: possibly edited, or in the part of this context that was not read.');
+    expect(within(dropped).getAllByText('not proven lost')).toHaveLength(2);
+    expect(document.body.textContent).toContain('The context was offloaded and resolve=false.');
   });
 });
 

@@ -4,7 +4,7 @@ import { hashFor, navigate, useMedia } from '../lib/route.js';
 import { fmtCompact, fmtNum, fmtTimeNs } from '../lib/format.js';
 import { tenantParams } from '../lib/runs.js';
 import {
-  FILTERS, SORTS, ageOut, agentsOf, applyRun, applySnapshot, foresightSentence, guardState, idleMs, isQuiet,
+  FILTERS, SORTS, ageOut, agentsOf, applyRemoved, applyRun, applySnapshot, foresightSentence, guardState, idleMs, isQuiet,
   liveTotals, matches, newLiveState, probeCandidates, rowKey, runLiveStream, serverNowMs, sortEntries,
   stepElapsedMs, waitingKeys,
 } from '../lib/live.js';
@@ -20,7 +20,8 @@ import { ResetModal, TripModal, canWrite } from './GuardScreen.jsx';
 // wheel: a nudge, the kill switch, an approval to go on.
 //
 // One held connection carries it (GET /v1/runs/live/stream): a snapshot,
-// then a row each time a run changes. When the stream is refused — a scope
+// then a row each time a run changes, and a removal when one leaves the view
+// (the guard let go of it, or it went quiet past the live window). When the stream is refused — a scope
 // holds at most eight — the screen reads the listing every five seconds
 // instead, and says so. Everything shown is the guard's memory, the same
 // state the pre-call check answers from: nothing here is estimated, and
@@ -97,6 +98,10 @@ function useLiveRuns(tenant) {
         const now = Date.now();
         setState((current) => applyRun(current, row, now));
         setUpdatedAt(now);
+      },
+      onRemoved: (removal) => {
+        setState((current) => applyRemoved(current, removal));
+        setUpdatedAt(Date.now());
       },
       onStatus: (next) => {
         if (next.state === 'reconnecting') broken = true;
@@ -343,7 +348,7 @@ const LiveRow = React.memo(function LiveRow({ entry, idle, open, operator, write
       <Num muted>{fmtCompact(row.tokens)}</Num>
       <Num accent><Ticking value={row.cost_usd} format={fmtUsd} /></Num>
       <Cell><GuardChip entry={entry} /></Cell>
-      <Cell><ForesightCell foresight={row.foresight} /></Cell>
+      <Cell><ForesightCell foresight={row.foresight} deferred={Boolean(row.foresight_deferred)} /></Cell>
       <Cell align="right">
         {row.pending_nudges ? <Tag status="warn" mono>{row.pending_nudges} waiting</Tag> : <span style={{ color: 'var(--ink-faint)' }}>—</span>}
       </Cell>
@@ -404,8 +409,8 @@ function RowDetail({ entry, writer, onAction }) {
         </div> : null}
       </Section>
       <Section title="foresight">
-        <ForesightBar foresight={row.foresight} />
-        <div style={{ fontSize: 12, color: 'var(--ink-muted)', lineHeight: '18px' }}>{foresightSentence(row.foresight)}</div>
+        <ForesightBar foresight={row.foresight} deferred={Boolean(row.foresight_deferred)} />
+        <div style={{ fontSize: 12, color: 'var(--ink-muted)', lineHeight: '18px' }}>{foresightSentence(row.foresight, Boolean(row.foresight_deferred))}</div>
       </Section>
       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
         <Chip onClick={() => onAction('open', entry)}>Open the tape</Chip>
@@ -450,7 +455,7 @@ const LiveCard = React.memo(function LiveCard({ entry, idle, operator, writer, o
       <a href={runHref(row)} onClick={(e) => { e.preventDefault(); onAction('open', entry); }}
         style={{ fontFamily: 'var(--font-mono)', fontSize: 13, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.run}</a>
       <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 6, alignItems: 'center', flex: 'none' }}>
-        <ForesightChip foresight={row.foresight} />
+        <ForesightChip foresight={row.foresight} deferred={Boolean(row.foresight_deferred)} />
         <GuardChip entry={entry} />
       </span>
     </div>

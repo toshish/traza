@@ -2,7 +2,9 @@
 //
 // The Blame screen, rendered from GET /v1/blame as a 0.28.0 server answered
 // it over the imported Claude Code fixture (a sub-agent's MultiEdit) and the
-// insight corpus (an Edit with no recorded prompt).
+// insight corpus (an Edit with no recorded prompt), and over three Edits of
+// one line (`blame_unconfirmed.json`): one failed, one with no result
+// recorded, one applied.
 
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -10,10 +12,12 @@ import { render, act, cleanup, fireEvent, screen } from '@testing-library/react'
 import item from '../test/fixtures/insight/blame_item.json';
 import test from '../test/fixtures/insight/blame_test.json';
 import none from '../test/fixtures/insight/blame_none.json';
+import unconfirmed from '../test/fixtures/insight/blame_unconfirmed.json';
 
 vi.mock('../lib/api.js', () => ({
   api: {
-    blame: vi.fn(async (params) => (params.path === 'src/item.rs' ? item : params.path === 'tests/test_parser.py' ? test : none)),
+    blame: vi.fn(async (params) => (params.path === 'src/item.rs' ? item : params.path === 'tests/test_parser.py' ? test
+      : params.line === unconfirmed.line ? unconfirmed : none)),
   },
 }));
 
@@ -45,6 +49,20 @@ describe('blame', () => {
     fireEvent.click(screen.getByText('Open the step on its tape'));
     expect(go).toHaveBeenCalledWith(['run', '11111111-1111-4111-8111-111111111111'], { tenant: '', step: '10' });
     expect(screen.getByTestId('blame-matches').textContent).toContain('from 14 edit calls checked in every project');
+  });
+
+  it('names the applied edit, and lists an edit with no result recorded after it as an attempt', async () => {
+    await show('path=src/cart.rs&line=' + encodeURIComponent(unconfirmed.line));
+    const cards = screen.getAllByTestId('blame-match');
+    expect(cards.map((c) => c.dataset.outcome)).toEqual(['applied', 'unconfirmed']);
+    expect(cards[0].textContent).toContain('introduced');
+    expect(cards[0].textContent).toContain('session-applied');
+    expect(cards[1].textContent).toContain('attempted');
+    expect(cards[1].textContent).not.toContain('introduced');
+    expect(cards[1].textContent).toContain('may not have happened');
+    // The failed edit wrote nothing: it is not here at all.
+    expect(screen.getByTestId('blame-matches').textContent).not.toContain('session-failed');
+    expect(screen.getByTestId('blame-matches').textContent).toContain('1 introduction, then 1 attempt with no result recorded, from 3 edit calls checked');
   });
 
   it('says when no prompt or model was recorded, rather than inventing one', async () => {

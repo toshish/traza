@@ -87,7 +87,8 @@ function RunXray({ runId, go, params }) {
       <Tile label="cache lifetime assumed" value={autopsy.data.ttl_seconds % 3600 === 0 ? `${autopsy.data.ttl_seconds / 3600} h` : `${Math.round(autopsy.data.ttl_seconds / 60)} min`} tone="var(--ink)" />
     </TileRow>
     {autopsy.data.truncated ? <Caveat>The run is longer than one autopsy reads (20,000 spans or 2,000 model calls); later calls are not here.</Caveat> : null}
-    {autopsy.data.resolved_partial ? <Caveat>Some offloaded requests stayed unresolved, so their calls read as unknown.</Caveat> : null}
+    {autopsy.data.chunks_truncated ? <Caveat>Some call's context, or the one it continues, had more than 2,000 chunks. Only the chunks both calls had analysed are compared: a verdict the part past the cut could change reads as unknown, with nothing counted lost.</Caveat> : null}
+    {autopsy.data.resolved_partial ? <Caveat>Some offloaded values — a request, tool definitions, or an answer a later call continues from — stayed unresolved, so the calls they leave partial read as unknown.</Caveat> : null}
     {autopsy.data.texts_partial ? <Caveat>Over 32 MiB of distinct chunk text: some diffs were not kept.</Caveat> : null}
 
     {!steps.length ? <EmptyState message="This run has no model calls, so there is no context to read: the X-Ray reads llm steps." /> : <>
@@ -299,7 +300,7 @@ function XrayView({ xray, step, runId, go, runParams, onPick }) {
   const toTape = (index) => go(['run', runId], { ...(runParams || {}), step: String(index) });
   const caveats = [];
   if (x.context_unavailable) caveats.push(`The context ${x.context_unavailable}.`);
-  if (x.chunks_truncated) caveats.push('The context had more than 2,000 chunks; the rest is not analysed.');
+  if (x.chunks_truncated) caveats.push('The context had more than 2,000 chunks; the rest is not analysed, so a chunk the previous call had that is missing from the first 2,000 is not proven lost.');
   if (x.provenance_partial) caveats.push('A provenance or staleness bound was reached: introduced-by and stale are incomplete.');
   if (x.texts_partial) caveats.push('Over 32 MiB of distinct chunk text: some previews and diffs were not kept.');
   if (x.resolved_partial) caveats.push('An offloaded value stayed unresolved.');
@@ -434,6 +435,7 @@ function Dropped({ dropped, truncated, toTape, previous }) {
   const [all, setAll] = React.useState(false);
   const list = [...(dropped || [])].sort((a, b) => (a.kind === 'instruction' ? 0 : 1) - (b.kind === 'instruction' ? 0 : 1));
   const instructions = list.filter((d) => d.kind === 'instruction' && !d.unverified).length;
+  const unproven = list.filter((d) => d.kind === 'instruction' && d.unverified).length;
   // Every instruction is shown; the rest of a compaction's losses fold
   // behind a count, since a rewrite can drop the whole history.
   const others = list.filter((d) => d.kind !== 'instruction');
@@ -445,6 +447,9 @@ function Dropped({ dropped, truncated, toTape, previous }) {
       : <div style={{ display: 'grid', gap: 8 }}>
         {instructions ? <div style={{ fontSize: 13, color: 'var(--error)', fontWeight: 500 }}>
           {instructions} instruction{instructions === 1 ? '' : 's'} the agent was given {instructions === 1 ? 'is' : 'are'} no longer in its context.
+        </div> : null}
+        {unproven ? <div data-testid="dropped-unproven" style={{ fontSize: 12, color: 'var(--ink-muted)', lineHeight: '18px' }}>
+          {unproven} instruction{unproven === 1 ? '' : 's'} not proven lost: possibly edited, or in the part of this context that was not read.
         </div> : null}
         {shown.map((d, i) => <DroppedChunk key={d.digest + i} d={d} toTape={toTape} />)}
         {!all && list.length > shown.length ? <div><Chip onClick={() => setAll(true)}>{list.length - shown.length} more dropped chunk{list.length - shown.length === 1 ? '' : 's'}</Chip></div> : null}
@@ -461,7 +466,7 @@ function DroppedChunk({ d, toTape }) {
   }}>
     <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
       {d.kind === 'instruction' ? <Tag status="error" mono>instruction lost</Tag> : <Tag mono>{d.chunk_kind}</Tag>}
-      {d.unverified ? <Tag status="warn" mono>unverified: may be edited</Tag> : null}
+      {d.unverified ? <Tag status="warn" mono title="Not proven lost: a chunk of this call may be it edited, or this call's context was not read whole (cut at 2,000 chunks, or an offloaded value left unresolved)">not proven lost</Tag> : null}
       <Mono size={11} color="var(--ink-muted)">{d.role || ''} · ~{fmtNum(d.est_tokens)} tokens</Mono>
       {d.introduced_by && typeof d.introduced_by.step_index === 'number' ? <a href="#" style={{ marginLeft: 'auto', fontSize: 12 }}
         onClick={(e) => { e.preventDefault(); toTape(d.introduced_by.step_index); }}>from step {d.introduced_by.step_index}</a> : null}
@@ -504,6 +509,7 @@ function CallVerdict({ cache }) {
       <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
         <Tag status={cause.tone} mono>{cause.label}</Tag>
         {d ? <Mono size={11} color="var(--ink-muted)">chunk {d.index} {d.change}{d.volatile ? ' · ' + d.volatile : ''}</Mono> : null}
+        {cache.chunks_truncated ? <Tag status="warn" mono title="This call's context, or the previous call's, had more than 2,000 chunks: only the chunks both had analysed are compared">context cut</Tag> : null}
       </div>
       <div style={{ fontSize: 12, lineHeight: '18px', overflowWrap: 'anywhere' }}>{cache.explanation}</div>
       {d && d.diff ? <DiffPair diff={d.diff} /> : null}

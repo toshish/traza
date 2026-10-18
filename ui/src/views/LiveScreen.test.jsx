@@ -136,6 +136,20 @@ describe('the live view', () => {
     expect(screen.getByTestId('live-status').dataset.state).toBe('live');
   });
 
+  it('drops a run the server says left the view, and says when foresight was deferred', async () => {
+    const server = serve();
+    await show();
+    expect(row('tkt-4173')).toBeTruthy();
+    // The guard let go of one run; another's foresight read was not made.
+    const deferredRow = { ...listing.runs.find((r) => r.run === 'tkt-4162'), foresight: undefined, foresight_deferred: true };
+    server.streams[0].push('event: removed\ndata: {"reason":"evicted","run":"tkt-4173","tenant":""}\n\n'
+      + 'event: run\ndata: ' + JSON.stringify(deferredRow) + '\n\n');
+    await settle(10);
+    expect(row('tkt-4173')).toBeUndefined();
+    expect(rows()).toHaveLength(listing.runs.length - 1);
+    expect(within(row('tkt-4162')).getByText('foresight deferred')).toBeTruthy();
+  });
+
   it('puts what needs a person first: stopped runs, then likely failures', async () => {
     serve();
     await show();
