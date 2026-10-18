@@ -56,6 +56,32 @@ describe('the tape', () => {
     expect(api.tape).toHaveBeenCalledWith('weather-9', expect.objectContaining({ max_steps: 2000 }), expect.anything());
   });
 
+  it("shows a model call's input with what it read from and wrote to the cache, broken down on hover", async () => {
+    // Anthropic's input count is the uncached remainder: a call that read
+    // 40k tokens from the cache reported 2. OpenAI's prompt count already
+    // includes its cached subset. Synthetic counts on the fixture's steps.
+    const [llm, tool] = tape.steps;
+    api.tape.mockResolvedValueOnce({
+      ...tape,
+      steps: [
+        { ...llm, index: 0, model: 'claude-sonnet-4-5', tokens: { input: 2, output: 555, cache_read: 40011, cache_write: 200, context: 40213 } },
+        { ...tool, index: 1 },
+        { ...llm, index: 2, tokens: { input: 1200, output: 40, cache_read: 1024, cache_write: null, context: 1200 } },
+        { ...llm, index: 3 },
+      ],
+    });
+    await show();
+    const cells = screen.getAllByTestId('tape-step').map((node) => node.querySelectorAll('[role="cell"]')[5]);
+    expect(cells[0].textContent).toBe('40,213 / 555');
+    expect(cells[0].getAttribute('title')).toBe('input 40,213 = 2 uncached + 40,011 cache read + 200 cache write · output 555');
+    expect(cells[1].textContent).toBe('—');
+    expect(cells[2].textContent).toBe('1,200 / 40');
+    expect(cells[2].getAttribute('title')).toBe('input 1,200, including 1,024 cache read · output 40');
+    // No cache counters: as before, with nothing to break down.
+    expect(cells[3].textContent).toBe('82 / 17');
+    expect(cells[3].getAttribute('title')).toBeNull();
+  });
+
   it('opens a step to show its request and response, rendered by kind', async () => {
     await show();
     const [first, second] = screen.getAllByTestId('tape-step');

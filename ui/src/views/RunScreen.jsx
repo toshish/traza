@@ -18,6 +18,7 @@ import { NudgesCard } from '../components/runs/Nudges.jsx';
 import { ForkModal, ForksCard } from '../components/runs/Fork.jsx';
 import { RunForesight } from '../components/insight/RunForesight.jsx';
 import { forkable } from '../lib/fork.js';
+import { stepTokens } from '../lib/tokens.js';
 import { VERDICT_TAG, canWrite } from './GuardScreen.jsx';
 
 // A run read as a tape: its model calls, tool calls and agent invocations in
@@ -240,6 +241,7 @@ function Tape({ steps, totals, go, focusStep, onFork, onXray }) {
           const left = ((step.start_ns - totals.startNs) / span) * 100;
           const width = Math.max(0.5, ((step.duration_ns || 0) / span) * 100);
           const focused = focusStep != null && Number(focusStep) === step.index;
+          const tokens = stepTokens(step);
           return <div key={step.index} ref={focused ? focusRef : undefined} data-testid="tape-step">
             <div role="row" onClick={() => toggle(step.index)} tabIndex={0} aria-expanded={expanded}
               onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(step.index); } }}
@@ -269,8 +271,9 @@ function Tape({ steps, totals, go, focusStep, onFork, onXray }) {
                 </div>
               </div>
               <Num>{fmtDurationNs(step.duration_ns || 0)}</Num>
-              <Num muted>{step.tokens?.input == null && step.tokens?.output == null ? '—'
-                : `${step.tokens.input == null ? '—' : fmtNum(step.tokens.input)} / ${step.tokens.output == null ? '—' : fmtNum(step.tokens.output)}`}</Num>
+              {/* Input with what the call read from and wrote to the cache,
+                  under its provider's counting rule; the title breaks it down. */}
+              <Num muted title={tokens.title}>{tokens.text}</Num>
               <Num accent={typeof step.cost_usd === 'number'}>{typeof step.cost_usd === 'number' ? fmtMoney(step.cost_usd) : '—'}</Num>
               <div role="cell" style={{ padding: 'var(--row-py) 10px', textAlign: 'right' }}>
                 <span style={{ fontSize: 11, color: step.status === 'error' ? 'var(--error)' : 'var(--ink-faint)' }}>{step.status}</span>
@@ -284,8 +287,8 @@ function Tape({ steps, totals, go, focusStep, onFork, onXray }) {
   </Card>;
 }
 
-function Num({ children, muted, accent }) {
-  return <div role="cell" style={{
+function Num({ children, muted, accent, title }) {
+  return <div role="cell" title={title} style={{
     padding: 'var(--row-py) 10px', fontFamily: 'var(--font-mono)', fontSize: 12,
     fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap',
     color: accent ? 'var(--accent)' : muted ? 'var(--ink-muted)' : 'var(--ink)',
