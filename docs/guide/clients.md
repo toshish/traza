@@ -198,11 +198,15 @@ golden runs; in short:
   loopback switch — private to the process, answering only the per-fork
   secret it puts in the API-key variables — which forwards to the replay
   until it answers `replay_live` and to the real provider (with the real key,
-  read from the environment when the fork was made) after it; with the
-  OpenTelemetry SDK configured it also tags the spans started inside the
-  block. TypeScript's returns a `Fork` whose `openaiOptions()` /
-  `anthropicOptions()` carry a switching `fetch` for the provider SDKs, and
-  whose `spanProcessor()` tags spans until `close()`. `tool_result(name)` /
+  read from the environment as it stood before any fork changed it) after it;
+  one fork at a time may own the environment, and overlapping forks take
+  `set_env=False` with `openai_kwargs()`. With the OpenTelemetry SDK
+  configured it also tags the spans started in the block's context
+  (`tag_threads=True` for every thread). TypeScript's returns a `Fork` whose
+  `openaiOptions()` / `anthropicOptions()` carry a switching `fetch` for the
+  provider SDKs, and whose `spanProcessor()` tags the spans started in the
+  fork's OpenTelemetry context (`fork.run(context, fn)`) until `close()`.
+  `tool_result(name)` /
   `toolResult(name)` returns the edited or recorded tool step, or
   `None` / `null` once the real tool should run.
 - **Tape tests** replay a run strictly and fail — `TapeMismatch`, an
@@ -220,9 +224,14 @@ golden runs; in short:
   ```
 
   The command reads the server from `--url` or `TRAZA_URL`, the tenant from
-  `--tenant` or `TRAZA_TENANT`, and the credential from `TRAZA_TOKEN` only.
-  It exits 0 when every test passed, 1 when one failed (or there was nothing
-  to test, unless `--allow-empty`), 2 when the server could not be asked.
+  `--tenant` or `TRAZA_TENANT`, and the credential from `TRAZA_TOKEN` only;
+  the agent under test gets `TRAZA_REPLAY_KEY` as its provider key, or
+  `TRAZA_TOKEN` unless that is an unbound operator credential
+  ([the agent's key](fork.md#the-agents-key)). It exits 0 when every test
+  passed, 1 when one failed (or there was nothing to test, unless
+  `--allow-empty`, or the golden listing was incomplete, unless
+  `--allow-partial`), 2 for a usage error, a refused key, or a server that
+  could not be asked.
 
 ## The exporter environment
 

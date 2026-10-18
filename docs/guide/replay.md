@@ -180,7 +180,8 @@ could not be read, or that recorded no result at all, is listed in
 [tools](#tools-still-execute-live--unless-you-replay-them-too)). A run with
 more than 20,000 spans is refused (`409`) rather than replayed as its
 beginning, which would end the agent's run early as if the recording stopped
-there.
+there — unless a [fork](fork.md#forking-a-run) goes live within the steps
+those spans hold, so nothing past them is served.
 
 **3. Point the SDK at it and run the agent.**
 
@@ -335,7 +336,9 @@ field (`role`, `content`, `tool_call_id`, `tool_calls`, or `missing` /
 `extra`), the character, and a quote of each side — `{"message": 1, "role":
 "user", "field": "content", "at_char": 22, "recorded": "What's the weather
 in Paris?", "got": "What's the weather in Lyon?", …}`. The replay keeps it
-with its first divergence. It is what makes a strict replay a usable
+with its first divergence. Explaining costs a re-read of the recording, so a
+replay does it at most 8 times; past that a divergence is refused without
+one. It is what makes a strict replay a usable
 [tape test](fork.md#tape-tests).
 
 A divergence means your agent asked a different question than it asked when
@@ -560,7 +563,7 @@ telemetry choose which recording its next run is fed. See the
   `--tape-max-bytes` — refuses it the same way (`409`), and the message says
   which of those it was. A tool step that recorded no result is refused by
   `tools/next` rather than served as `null`. A run longer than 20,000 spans
-  is refused rather than cut.
+  is refused rather than cut, except as a rewind that goes live inside it.
 - **Only chat completions and messages are replayed.** The OpenAI Responses
   API, embeddings and legacy completions under the replay's base URL answer
   `400`.

@@ -138,6 +138,14 @@ still be rewound to any point before them. `llm_steps` counts what is held.
 replays steps 0 and 1 exactly, then everything after is live. Re-running a
 long agent from step 40 costs nothing for its first 40 steps.
 
+**A run longer than a replay holds can still be rewound.** A plain replay
+refuses a run past 20,000 spans rather than replaying its beginning as if the
+recording ended there. A fork whose live point falls within the steps those
+first 20,000 spans hold serves nothing past that point, so it is accepted:
+its creation response says `"steps_truncated": true`, and `steps` counts the
+steps read, not the run's. A live point past them is refused for the run's
+length.
+
 Refusals are `400` and say what to change:
 
 ```json
@@ -207,7 +215,10 @@ A fork the budget did not reach is listed undiffed (`"skipped": "deadline"`)
 and the listing says `"truncated": true` — a partial listing is more use than
 a refusal; the tagged-span read and the parent's read themselves are refused
 `400` past the budget, as everywhere. `limit` (default 20, at most 50) bounds
-the forks listed; at most 10,000 tagged spans are examined.
+the forks listed; at most 10,000 tagged spans are examined. Those are the
+**earliest-starting** 10,000 (a sorted read would have to hold every match),
+so past that cap the oldest forks are listed and the newest may be missing —
+`truncated` says so.
 
 ## From Python: `traza.fork`
 
@@ -229,9 +240,9 @@ Inside the block, `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` point at a
 that forwards each model call to the replay until the replay answers
 `replay_live`, and from then on to the real provider — the base URL and key
 the environment named when the fork was made (`OPENAI_BASE_URL`, else
-OpenAI's API, and `OPENAI_API_KEY`; the same for Anthropic), or the
-`live_openai_base_url` / `live_openai_api_key` options. The agent sees one
-provider throughout. The switch listens on `127.0.0.1` only and answers only
+OpenAI's API, and `OPENAI_API_KEY`; the same for Anthropic), as it stood
+before any fork changed it, or the `live_openai_base_url` /
+`live_openai_api_key` options. The agent sees one provider throughout. The switch listens on `127.0.0.1` only and answers only
 requests carrying the per-fork secret it put in `OPENAI_API_KEY` /
 `ANTHROPIC_API_KEY`, so nothing else on the machine can borrow the real key
 it forwards with — and inside the block those variables hold the secret, not
@@ -243,11 +254,34 @@ or pass `fork.openai_kwargs()`.
 the edited step — or `None` once the harness should run the real tool;
 `fork.call_tool(name, fn, *args)` does that choice for you.
 
+**The environment is one fork's at a time.** Starting a second fork that
+would set it while one's block is active raises `RuntimeError` before
+anything is created. Forks that overlap — nested, or one per thread for
+parallel what-ifs — take `set_env=False` and give each agent its own
+`fork.openai_kwargs()` (or `fork.env()` for a subprocess); each still finds
+the real provider, never another fork's switch:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+def what_if(forecast):
+    with traza.fork("weather-7", 1, tool_result={"forecast": forecast}, set_env=False) as fork:
+        return run_agent("What's the weather in Paris?", client=OpenAI(**fork.openai_kwargs()))
+
+answers = list(ThreadPoolExecutor(4).map(what_if, ["sun", "snow", "fog", "hail"]))
+```
+
 **Spans are tagged** when the OpenTelemetry SDK is configured before the
 fork is entered: a span processor is added to the global tracer provider
-once, and stamps the active fork's attributes and its session id
-(`fork.run_id`, the fork id unless you name one) on every span that starts
-inside the block. Without the SDK, `fork.span_attributes()` is the dict to
+once, and stamps the fork's attributes and its session id (`fork.run_id`,
+the fork id unless you name one) on every span that starts in the block's
+context. A span another thread starts meanwhile — a web server's other
+request — keeps its own run: Python threads do not inherit context
+variables, so a worker thread of the agent's is tagged only when it runs in
+a copy of the block's context (`contextvars.copy_context().run`), or when
+the fork is made with `tag_threads=True` — which tags every thread's spans,
+for a process that runs nothing but the forked agent, and is allowed for one
+fork at a time. Without the SDK, `fork.span_attributes()` is the dict to
 stamp yourself, and `fork.env()` carries `TRAZA_FORK_ID`,
 `TRAZA_FORK_PARENT`, `TRAZA_FORK_STEP` and `TRAZA_FORK_RUN` for a subprocess
 agent along with the switch's URLs and key. From a shell:
@@ -269,9 +303,26 @@ The switch is the `fetch` the fork hands the SDK — both the OpenAI and the
 Anthropic SDKs take one — so no port is opened: it sends each call to the
 replay until it answers `replay_live`, then that call and every later one to
 the real provider (`liveOpenAI` / `liveAnthropic` options, else the
-environment's base URL and key). `fork.spanProcessor()` returns a
-duck-typed OpenTelemetry span processor that stamps the fork's attributes and
-session id on every span started until `fork.close()`.
+environment's base URL and key). Each fork is its own `fetch`, so any number
+can run side by side in one process.
+
+`fork.spanProcessor()` returns a duck-typed OpenTelemetry span processor
+that stamps the fork's attributes and session id on the spans started **in
+the fork's OpenTelemetry context**, until `fork.close()`. Run the agent
+there, and a server handling other requests meanwhile keeps their spans in
+their own runs:
+
+```ts
+import { context } from "@opentelemetry/api";
+
+provider.addSpanProcessor(fork.spanProcessor());
+await fork.run(context, () => runAgent(openai));   // context.with(fork.context(context.active()), …)
+```
+
+The fork is carried under `Symbol.for("traza.fork")` (exported as
+`FORK_CONTEXT_KEY`), which is what `createContextKey("traza.fork")` returns.
+`fork.spanProcessor({ allSpans: true })` tags every span while the fork is
+open, whatever its context — only for a process that runs nothing else.
 
 ## Tape tests
 
@@ -296,10 +347,18 @@ budget, and compared message by message under the same normalisation strict
 matching uses. `field` is the first of `role`, `content`, `tool_call_id`,
 `tool_calls` that differs — or `missing` / `extra` when one side has fewer
 messages — and each side is quoted (120 characters) from just before
-`at_char`. The first divergence keeps its difference in the replay's status.
-When the recorded request cannot be re-read (erased, offloaded and gone, not
-a message list, or past the budget) there is no `difference`, and the digests
-are all there is.
+`at_char`; `role` is cut to 32 characters, since the request chooses it. The
+first divergence keeps its difference in the replay's status, and that same
+request refused again is answered from it without a read. When the recorded
+request cannot be re-read (erased, offloaded and gone, not a message list,
+or past the budget) there is no `difference`, and the digests are all there
+is.
+
+**Each replay re-reads its recording at most 8 times** to explain
+divergences. A harness whose every retry differs — a timestamp or a fresh id
+in its prompt — would otherwise turn a route that reads nothing into a store
+read per call. Past the eighth, a divergence is refused as usual, without a
+`difference`; the first divergence's, already kept, is still reported.
 
 The status also counts `exhausted_calls`: model calls refused because every
 recorded step had been served — an agent that asked for more than the
@@ -344,8 +403,11 @@ regardless. The `traza_tape` fixture is the `TapeTest` (recorded tool results
 via `tool_result()`, the environment for a subprocess agent). The server is
 `--traza-url` or `TRAZA_URL`, the tenant `--traza-tenant` or
 `TRAZA_TENANT`, the credential `TRAZA_TOKEN` — never a command-line option,
-where it would land in process listings and CI logs. The plugin needs pytest;
-the package itself still depends on nothing.
+where it would land in process listings and CI logs. The agent's provider
+key is [`TRAZA_REPLAY_KEY`](#the-agents-key) when set. A marked test that
+skips itself, or is `xfail` and fails as expected, is reported as it was:
+the tape is judged only for a test that ran to an end. The plugin needs
+pytest; the package itself still depends on nothing.
 
 ### TypeScript: vitest, jest, node:test
 
@@ -368,13 +430,16 @@ is its `cause`.
 A **golden run** is a run marked as a regression baseline, one of two ways:
 
 - **recorded so** — any of its spans carries `traza.golden = true` (the
-  boolean or the string);
+  boolean, or exactly the string `"true"`);
 - **marked after the fact** — an annotation named `traza.golden` on its
   session (`session_id`), or on its trace with no span (which names the run
   `trace:<trace_id>`). The newest such annotation decides, so a later
   `false` un-marks a run whatever its spans say. `traza golden add RUN` /
   `remove RUN` and `client.mark_golden(run)` / `markGolden(run)` write it
   (an `rw` credential).
+
+Both read a value by one rule: the boolean, or exactly the string `"true"`
+or `"false"`. `"True"` — Python's `str(True)` — marks nothing either way.
 
 `GET /v1/goldens` lists them, ordered by tenant then run so a report reads
 the same every time:
@@ -406,8 +471,26 @@ the agent's output (64 KiB of each stream) as `system-out` / `system-err`.
 
 The exit status is 0 when every run passed and 1 otherwise. **An empty suite
 is a failure** unless `--allow-empty` is given: a CI step that tests nothing
-should not pass. `--run RUN` (repeatable) tests named runs instead of the
-golden ones.
+should not pass. **So is a partial one**: `traza test` lists up to 1,000
+golden runs (`--limit`, the server's maximum by default), and when the
+listing says it is incomplete — more runs than the limit, or more golden
+markers than one listing examines — the runs listed are tested and the suite
+fails anyway, saying why, unless `--allow-partial` is given. Past 1,000
+golden runs, split the suite with `--tenant` or `--run`. `--run RUN`
+(repeatable) tests named runs instead of the golden ones. Exit status 2 is a
+usage error or a server that could not be asked.
+
+### The agent's key
+
+The agent under test sends a key as `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`,
+and any library that reads that variable but ignores `OPENAI_BASE_URL` sends
+it to the real provider. So `traza test` and pytest-traza hand the agent
+**`TRAZA_REPLAY_KEY`** when it is set — a dedicated `ro` credential bound to
+the runs' tenant, which any replay of that tenant accepts — and otherwise
+`TRAZA_TOKEN`, **refusing** (exit 2, or a pytest usage error) when that is an
+unbound operator credential, which can read every tenant. To hand it over
+anyway, say so: `TRAZA_REPLAY_KEY=$TRAZA_TOKEN`. One replay key serves one
+tenant; a suite spanning tenants runs once per tenant (`--tenant`).
 
 ## From an agent: `list_forks`
 
@@ -431,16 +514,25 @@ that creates a replay ([MCP guide](mcp.md#the-tools)).
   same [registry bounds](replay.md#limits-stated-plainly), and an erasure of
   what it holds withdraws it. Its edits are your data, held as long as it is.
 - **The divergence explanation is best effort**: it re-reads the recorded
-  span, and says nothing when it cannot.
+  span, at most 8 times per replay, and says nothing when it cannot.
 - **Golden markers are session or trace annotations, or span attributes.** An
   annotation on a single span marks nothing.
 - **Bounds:** 64 edits per fork; a fork listing examines 10,000 tagged spans
-  and lists at most 50 forks, each diffed within the differ's own caps (5,000
+  (the earliest-starting: past the cap the newest forks can be missing) and
+  lists at most 50 forks, each diffed within the differ's own caps (5,000
   steps, 50,000 spans a side); a golden listing examines 20,000 tagged spans
-  and 10,000 annotations and lists at most 1,000 runs (200 by default).
-- **The Python switch and span tagging act on the process.** The environment
-  variables are restored when the block ends; a provider client built before
-  it, or an instrumentation that sets its own `session.id` after a span
-  starts, is not redirected or re-tagged.
+  and 10,000 annotations and lists at most 1,000 runs (200 by default); a
+  divergence's kept difference quotes 120 characters a side and 32 of a role.
+- **A run past 20,000 spans replays only as a rewind** whose live point falls
+  within the steps read; a plain replay, or a later live point, is refused.
+- **The Python switch acts on the process environment**, so one fork at a
+  time may set it; overlapping forks take `set_env=False`. The variables are
+  restored when the block ends; a provider client built before it is not
+  redirected.
+- **Span tagging follows context.** A span started outside the fork's
+  context — another thread in Python (unless `tag_threads=True`), another
+  async context in Node (unless `allSpans: true`) — is not tagged, and an
+  instrumentation that sets its own `session.id` after a span starts is not
+  re-tagged.
 - **pytest-traza loads wherever the package is installed.** For an unmarked
   test it does nothing.
