@@ -83,7 +83,7 @@ curl -s localhost:8080/v1/tapes/weather-7
       "request_digest": "8b9a07d4aac0a133c789406dfccd9477618c1049ca0255f58b262fc72fca3d8b",
       "response_digest": "bc0a9a93dfc45c687262d0e46fceb83a1c7c92d362ccb045210310872c51d35f",
       "fingerprint": "llm:gpt-4o-2024-08-06#8b9a07d4aac0a133",
-      "tokens": {"input": 82, "output": 17, "cache_read": null, "cache_write": null}
+      "tokens": {"input": 82, "output": 17, "cache_read": null, "cache_write": null, "context": 82}
     },
     {
       "index": 1,
@@ -93,7 +93,7 @@ curl -s localhost:8080/v1/tapes/weather-7
       "request": {"city": "Paris"},
       "response": {"celsius": 12, "forecast": "rain"},
       "fingerprint": "tool:get_weather#6e1e312d537bc71b",
-      "tokens": {"input": null, "output": null, "cache_read": null, "cache_write": null},
+      "tokens": {"input": null, "output": null, "cache_read": null, "cache_write": null, "context": null},
       "…": "trace, span, timing, status and digests as above"
     },
     {"index": 2, "kind": "llm", "…": "the model call that answers"}

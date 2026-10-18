@@ -1082,7 +1082,7 @@ curl 'http://localhost:8080/v1/tapes/weather-7?max_steps=1'
 ```
 
 ```json
-{"run":"weather-7","spans_examined":4,"steps":[{"duration_ns":390000000,"fingerprint":"llm:gpt-4o-2024-08-06#8b9a07d4aac0a133","index":0,"kind":"llm","model":"gpt-4o-2024-08-06","name":"openai.chat","parent_span_id":"wf","request":[{"content":"You are a weather assistant.","role":"system"},{"content":"What's the weather in Paris?","role":"user"}],"request_digest":"8b9a07d4aac0a133c789406dfccd9477618c1049ca0255f58b262fc72fca3d8b","response":[{"finish_reason":"tool_calls","role":"assistant","tool_calls":[{"arguments":{"city":"Paris"},"id":"call_w1","name":"get_weather"}]}],"response_digest":"bc0a9a93dfc45c687262d0e46fceb83a1c7c92d362ccb045210310872c51d35f","service":"weather-agent","span_id":"llm-1","start_ns":1791964800010000000,"status":"ok","tokens":{"cache_read":null,"cache_write":null,"input":82,"output":17},"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],"tenant":null,"truncated":true}
+{"run":"weather-7","spans_examined":4,"steps":[{"duration_ns":390000000,"fingerprint":"llm:gpt-4o-2024-08-06#8b9a07d4aac0a133","index":0,"kind":"llm","model":"gpt-4o-2024-08-06","name":"openai.chat","parent_span_id":"wf","request":[{"content":"You are a weather assistant.","role":"system"},{"content":"What's the weather in Paris?","role":"user"}],"request_digest":"8b9a07d4aac0a133c789406dfccd9477618c1049ca0255f58b262fc72fca3d8b","response":[{"finish_reason":"tool_calls","role":"assistant","tool_calls":[{"arguments":{"city":"Paris"},"id":"call_w1","name":"get_weather"}]}],"response_digest":"bc0a9a93dfc45c687262d0e46fceb83a1c7c92d362ccb045210310872c51d35f","service":"weather-agent","span_id":"llm-1","start_ns":1791964800010000000,"status":"ok","tokens":{"cache_read":null,"cache_write":null,"context":82,"input":82,"output":17},"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],"tenant":null,"truncated":true}
 ```
 
 | Field | Type | Description |
@@ -1097,7 +1097,7 @@ curl 'http://localhost:8080/v1/tapes/weather-7?max_steps=1'
 | `steps[].request`, `response` | any | The step's input and output as stored ([precedence](../llm-semantics.md#input-and-output)); omitted when not recorded |
 | `steps[].request_digest`, `response_digest` | string | SHA-256 of the **stored** value's canonical JSON, or the content address of a `$payload` reference |
 | `steps[].fingerprint` | string | `kind:name#` plus 16 hex characters of the request digest |
-| `steps[].tokens` | object | `input`, `output`, `cache_read`, `cache_write`; each `null` when not reported |
+| `steps[].tokens` | object | `input`, `output`, `cache_read`, `cache_write`, each `null` when not reported; and `context`, the context the call carried as the engine reads it — `input` plus the cache counters for a provider whose input leaves its cache out (Anthropic), `input` alone for one whose input includes it (OpenAI) or when nothing was cached, `null` when cache counters came under a provider whose convention is not known ([why](../llm-semantics.md#prompt-caching-and-what-prompt-tokens-means)) |
 | `steps[].cost_usd` | number | Metered, or priced from `--pricing`; omitted when neither |
 | `truncated` | boolean | The run had more than 20,000 spans, or more steps than `max_steps` |
 | `spans_examined` | integer | Spans read, steps and non-steps alike |

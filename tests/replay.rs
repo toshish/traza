@@ -588,7 +588,7 @@ fn tapes_put_every_conventions_steps_in_order_with_their_facts() {
     assert_eq!(first["status"], json!("ok"));
     assert_eq!(
         first["tokens"],
-        json!({"input": 82, "output": 17, "cache_read": null, "cache_write": null})
+        json!({"input": 82, "output": 17, "cache_read": null, "cache_write": null, "context": 82})
     );
     assert_eq!(
         first["request"],

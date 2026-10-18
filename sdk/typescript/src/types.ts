@@ -174,6 +174,10 @@ export interface StepTokens {
   output: number | null;
   cache_read: number | null;
   cache_write: number | null;
+  /** The context the call carried: input plus the cache counters for a
+   * provider whose input leaves its cache out (Anthropic), input alone for
+   * one whose input includes it (OpenAI); `null` when it cannot be told. */
+  context: number | null;
 }
 
 export interface Step {

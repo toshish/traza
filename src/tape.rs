@@ -75,6 +75,13 @@ pub struct StepTokens {
     pub cache_read: Option<u64>,
     /// Prompt tokens written into a provider's cache.
     pub cache_write: Option<u64>,
+    /// The context the call carried, as the engine reads it everywhere
+    /// ([`LlmFacts::context_tokens`]): `input` plus the cache counters for a
+    /// provider whose input leaves its cache out (Anthropic), `input` alone
+    /// for one whose input holds it (OpenAI) or when nothing was cached, and
+    /// `None` when cache counters arrived under a provider whose convention
+    /// is not known — or no input was reported.
+    pub context: Option<u64>,
 }
 
 /// One step of a tape.
@@ -726,6 +733,7 @@ pub(crate) fn tape_step(
         bare_prompt: extras.bare_prompt,
         empty_response: extras.empty_response,
     };
+    let context = llm.context_tokens();
     TapeStep {
         index,
         trace_id: span.trace_id.clone(),
@@ -750,6 +758,7 @@ pub(crate) fn tape_step(
             output: llm.completion_tokens,
             cache_read: llm.cache_read_tokens,
             cache_write: llm.cache_creation_tokens,
+            context,
         },
         cost_usd: llm.cost_usd,
         detail,
@@ -895,6 +904,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_steps_tokens_carry_the_context_the_engine_reads_by_provider() {
+        let fixture = TempStore::open("tape-context", crate::Config::default());
+        let store = fixture.store();
+        let call = |provider: Option<&str>, cache_read: Option<u64>| {
+            let mut attributes = json!({
+                "gen_ai.operation.name": "chat",
+                "gen_ai.request.model": "some-model",
+                "gen_ai.usage.input_tokens": 2,
+                "gen_ai.usage.output_tokens": 555,
+            });
+            if let Some(provider) = provider {
+                attributes["gen_ai.provider.name"] = json!(provider);
+            }
+            if let Some(read) = cache_read {
+                attributes["gen_ai.usage.cache_read.input_tokens"] = json!(read);
+                attributes["gen_ai.usage.cache_creation.input_tokens"] = json!(200);
+            }
+            let span = span("t", "llm", 10, attributes);
+            store.span_step(0, &span).expect("a step").tokens
+        };
+        // Anthropic's input leaves the cache out, so the context adds it.
+        let anthropic = call(Some("anthropic"), Some(40_011));
+        assert_eq!(anthropic.input, Some(2));
+        assert_eq!(anthropic.context, Some(40_213));
+        // OpenAI's prompt count already holds its cached part.
+        assert_eq!(call(Some("openai"), Some(40_011)).context, Some(2));
+        // Cache counters under a provider nobody knows: cannot tell.
+        assert_eq!(call(None, Some(40_011)).context, None);
+        // No cache counters: the input is the context.
+        assert_eq!(call(None, None).context, Some(2));
+    }
+
+    #[test]
     fn a_tape_is_the_runs_steps_in_order_with_their_facts() {
         let fixture = seeded("order", crate::Config::default());
         let tape = fixture
@@ -947,7 +989,7 @@ pub(crate) mod tests {
         assert!(wire.get("model").is_none() && wire.get("detail").is_none());
         assert_eq!(
             wire["tokens"],
-            json!({"input": null, "output": null, "cache_read": null, "cache_write": null})
+            json!({"input": null, "output": null, "cache_read": null, "cache_write": null, "context": null})
         );
         assert_eq!(wire["kind"], json!("tool"));
     }

@@ -476,7 +476,7 @@ describe("@trazadb/sdk against traza-server", () => {
       assert.equal(first.start_ns, T0 + 10n * MS, "a double would have rounded this");
       assert.equal(first.duration_ns, 390n * MS);
       assert.deepEqual(first.request[1], { role: "user", content: "What's the weather in Paris?" });
-      assert.deepEqual(first.tokens, { input: 82, output: 17, cache_read: null, cache_write: null });
+      assert.deepEqual(first.tokens, { input: 82, output: 17, cache_read: null, cache_write: null, context: 82 });
       assert.deepEqual(tool.response, { celsius: 12, forecast: "rain" });
       assert.equal(tape.spans_examined, 4);
       assert.equal((await client.tape("weather-7", { maxSteps: 1 })).truncated, true);
