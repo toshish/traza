@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "cargo_lock_sha256": "422c0b5bbda47615ff87a3f001162f582564cb985bd79124301abb738d4d0496",
+  "cargo_lock_sha256": "1dd8d371078334fa8e00fe0118975a3bb617a489f6bccd0df20d014d41f0c8c5",
   "features": [
     "object-storage"
   ],

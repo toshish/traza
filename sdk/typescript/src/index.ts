@@ -50,4 +50,4 @@ export type { OtelEnvOptions } from "./otel.js";
 export type * from "./types.js";
 
 /** This package's version, which tracks the engine release it was built against. */
-export const VERSION = "0.27.0";
+export const VERSION = "0.28.0";

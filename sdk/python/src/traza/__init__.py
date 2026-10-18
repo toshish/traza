@@ -17,7 +17,7 @@ only.
 
 # Defined before the submodules are imported: client.py reads it for its
 # User-Agent.
-__version__ = "0.27.0"
+__version__ = "0.28.0"
 
 from typing import Any, Optional  # noqa: E402
 
