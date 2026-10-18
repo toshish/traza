@@ -499,6 +499,18 @@ before deploying over an existing setup.
   completed one. The run is now read whole: its path still comes from its
   earliest 20,000 spans (`partial`), but its outcome and `steps` cover every
   span, as the map's fold always did.
+- **`import --since` selects sessions that ran recently, not files that
+  were touched.** Claude Code appends untimestamped bookkeeping (the last
+  prompt, a title, a mode) to transcripts it has not run for months, which
+  moves their modification time: on one real machine a third of the
+  transcripts modified in the last two weeks had not recorded a turn in five
+  to thirteen weeks, so `--since 14d` imported 57 sessions of which 49 had
+  no span in the last 30 days — and every 30-day surface (the Fate Map,
+  TQL, findings) then saw only the 8 that did. A Claude Code file now counts
+  as recent by its newest timestamped record, found by reading backwards
+  from its end (at most 8 MiB, past bookkeeping and an unfinished line); a
+  file whose records cannot tell, and a Codex rollout (which timestamps
+  every record it writes), are still judged by when they were modified.
 
 ### Upgrade
 

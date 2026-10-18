@@ -21,7 +21,7 @@ const DATA_DIR_PAYLOAD_THRESHOLD: usize = 256 * 1024;
 const IMPORT_USAGE: &str = "Usage: traza-server import claude-code|codex [--path DIR] [--watch] \
 [--url URL (default http://127.0.0.1:8080)] [--token TOKEN (default $TRAZA_TOKEN)] \
 | [--data-dir DIR (ingest straight into a data directory no server holds)] | [--dry-run] \
-[--tenant TENANT] [--since DURATION (e.g. 7d, 12h: only files modified that recently)] \
+[--tenant TENANT] [--since DURATION (e.g. 7d, 12h: only sessions active that recently)] \
 [--project-filter SUBSTR (only sessions whose file path or working directory contains it)] \
 [--state FILE (default ~/.traza/import-state.json) | --no-state (send everything)] \
 [--interval-ms N (watch poll interval; default 1000)] [--json]";

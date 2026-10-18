@@ -974,7 +974,8 @@ pub struct ImportOptions {
     /// The tenant to stamp on spans (`None` leaves it to the destination: a
     /// bound credential stamps its own).
     pub tenant: Option<String>,
-    /// Only files modified this recently.
+    /// Only sessions active this recently: a Claude Code file by its newest
+    /// timestamped record, a Codex rollout by its modification time.
     pub since: Option<Duration>,
     /// Only sessions whose file path or working directory contains this.
     pub project_filter: Option<String>,
@@ -1035,6 +1036,7 @@ pub fn run(
     let mut excluded: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut sessions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut ancestry = codex::Ancestry::default();
+    let mut activity = Activity::default();
     let mut first_pass = true;
     // Consecutive passes the destination was unreachable (watch mode only).
     let mut outages: u32 = 0;
@@ -1056,37 +1058,53 @@ pub fn run(
             .since
             .and_then(|since| SystemTime::now().checked_sub(since));
         // `--since` selects sessions, not files: a session any of whose
-        // files changed recently is read whole, so a sub-agent transcript
-        // (or a Codex parent rollout) that went quiet earlier still lands
-        // beside the file that names it.
-        let recent_sessions: std::collections::HashSet<String> = match cutoff {
+        // files recorded activity recently is read whole, so a sub-agent
+        // transcript (or a Codex parent rollout) that went quiet earlier
+        // still lands beside the file that names it. A Claude Code file is
+        // judged by its newest timestamped record, not its modification
+        // time alone: Claude Code appends untimestamped bookkeeping (the
+        // last prompt, a title, a mode) to transcripts it has not run for
+        // months, so a fresh modification time says nothing about when the
+        // session ran. (A Codex rollout timestamps every record it writes,
+        // except a legacy one, whose header alone carries a time: its
+        // modification time is its activity.)
+        let by_records = options.source == Source::ClaudeCode;
+        let recent: std::collections::HashSet<&Path> = match cutoff {
             Some(cutoff) => found
                 .iter()
-                .filter(|file| file.modified >= cutoff)
-                .map(|file| session_key(options.source, &ancestry, &file.path))
+                .filter(|file| {
+                    file.modified >= cutoff
+                        && (!by_records
+                            || tracked.contains_key(&file.path)
+                            || activity.recorded_since(file, cutoff))
+                })
+                .map(|file| file.path.as_path())
                 .collect(),
             None => std::collections::HashSet::new(),
         };
+        if cutoff.is_some() && by_records {
+            activity.retain_present(&found);
+        }
+        let recent_sessions: std::collections::HashSet<String> = found
+            .iter()
+            .filter(|file| recent.contains(file.path.as_path()))
+            .map(|file| session_key(options.source, &ancestry, &file.path))
+            .collect();
         let mut changed_state = false;
         let mut unavailable: Option<String> = None;
         for file in &found {
             if first_pass {
                 stats.files_seen += 1;
             }
-            if let Some(cutoff) = cutoff {
-                if file.modified < cutoff
-                    && !tracked.contains_key(&file.path)
-                    && !recent_sessions.contains(&session_key(
-                        options.source,
-                        &ancestry,
-                        &file.path,
-                    ))
-                {
-                    if first_pass {
-                        stats.files_filtered += 1;
-                    }
-                    continue;
+            if cutoff.is_some()
+                && !recent.contains(file.path.as_path())
+                && !tracked.contains_key(&file.path)
+                && !recent_sessions.contains(&session_key(options.source, &ancestry, &file.path))
+            {
+                if first_pass {
+                    stats.files_filtered += 1;
                 }
+                continue;
             }
             if let Some(filter) = &options.project_filter {
                 let verdict = if excluded.contains(&file.path) {
@@ -1358,6 +1376,121 @@ fn session_key(source: Source, ancestry: &codex::Ancestry, path: &Path) -> Strin
         Source::Codex => ancestry
             .root_of(path)
             .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+    }
+}
+
+/// Bytes from a transcript's end searched for its newest timestamped
+/// record, at most: [`newest_record`] widens its window from
+/// [`TAIL_FIRST_BYTES`] up to this.
+const TAIL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The first window [`newest_record`] reads from a transcript's end.
+const TAIL_FIRST_BYTES: u64 = 64 * 1024;
+
+/// What a transcript's records say about when it was last active.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recorded {
+    /// Its newest timestamped record, in Unix nanoseconds.
+    At(u64),
+    /// Not known: compressed, unreadable, or no record within
+    /// [`TAIL_MAX_BYTES`] of its end carries a timestamp (a legacy Codex
+    /// rollout carries none at all).
+    Unknown,
+}
+
+/// The newest timestamped record of a transcript, read backwards from its
+/// end. Records are appended in time order, so the last line that carries a
+/// top-level `timestamp` is the newest; untimestamped bookkeeping after it
+/// (Claude Code's `last-prompt`, `custom-title`, `mode` records) is skipped,
+/// as is an unfinished last line. A compressed rollout is not decompressed
+/// for this: it is [`Recorded::Unknown`].
+pub(crate) fn newest_record(path: &Path) -> Recorded {
+    #[derive(serde::Deserialize)]
+    struct Stamped<'a> {
+        #[serde(borrow, default)]
+        timestamp: Option<std::borrow::Cow<'a, str>>,
+    }
+    if path
+        .to_str()
+        .is_some_and(|name| name.ends_with(COMPRESSED_SUFFIX))
+    {
+        return Recorded::Unknown;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Recorded::Unknown;
+    };
+    let Ok(size) = file.metadata().map(|meta| meta.len()) else {
+        return Recorded::Unknown;
+    };
+    let mut window = TAIL_FIRST_BYTES.min(size);
+    loop {
+        let start = size - window;
+        let mut buffer = Vec::new();
+        if file.seek(SeekFrom::Start(start)).is_err()
+            || (&mut file).take(window).read_to_end(&mut buffer).is_err()
+        {
+            return Recorded::Unknown;
+        }
+        let mut lines: Vec<&[u8]> = buffer.split(|byte| *byte == b'\n').collect();
+        // A window that starts mid-file starts mid-line.
+        if start > 0 && !lines.is_empty() {
+            lines.remove(0);
+        }
+        for line in lines.iter().rev() {
+            let Ok(record) = serde_json::from_slice::<Stamped<'_>>(line) else {
+                continue;
+            };
+            if let Some(at) = record
+                .timestamp
+                .and_then(|text| crate::mcp::parse_iso(&text).ok())
+            {
+                return Recorded::At(at);
+            }
+        }
+        if start == 0 || window >= TAIL_MAX_BYTES {
+            return Recorded::Unknown;
+        }
+        window = (window * 4).min(TAIL_MAX_BYTES).min(size);
+    }
+}
+
+/// What `--since` learned of each file's newest record, by path and stamp,
+/// so a watch reads a file's tail again only once the file has changed.
+#[derive(Default)]
+struct Activity {
+    known: HashMap<PathBuf, (String, Recorded)>,
+}
+
+impl Activity {
+    /// Whether `file` recorded activity at or after `cutoff`. A file whose
+    /// records cannot tell is judged by its modification time, as before
+    /// records were read: never dropped for want of evidence.
+    fn recorded_since(&mut self, file: &Found, cutoff: SystemTime) -> bool {
+        let recorded = match self.known.get(&file.path) {
+            Some((stamp, recorded)) if *stamp == file.stamp => *recorded,
+            _ => {
+                let recorded = newest_record(&file.path);
+                self.known
+                    .insert(file.path.clone(), (file.stamp.clone(), recorded));
+                recorded
+            }
+        };
+        let cutoff_ns = cutoff
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64);
+        match recorded {
+            Recorded::At(at) => at >= cutoff_ns,
+            Recorded::Unknown => file.modified >= cutoff,
+        }
+    }
+
+    /// Forgets files that are gone.
+    fn retain_present(&mut self, found: &[Found]) {
+        if self.known.len() > found.len() {
+            let present: HashSet<&Path> = found.iter().map(|file| file.path.as_path()).collect();
+            self.known
+                .retain(|path, _| present.contains(path.as_path()));
+        }
     }
 }
 

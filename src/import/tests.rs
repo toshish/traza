@@ -998,6 +998,35 @@ fn watching_a_whole_history_holds_at_most_the_live_cap_of_converters() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Shifts every top-level `timestamp` of the transcript at `path` by one
+/// offset, so its newest record lands `ago` before now, and sets its
+/// modification time to `ago` too: a session that ran that recently.
+fn ran(path: &Path, ago: Duration) {
+    let text = std::fs::read_to_string(path).expect("reads");
+    let newest = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|record| timestamp_ns(&record))
+        .max()
+        .expect("timestamped");
+    let now_ns = crate::mcp::unix_nanos_now();
+    let shift = i128::from(now_ns - ago.as_nanos() as u64) - i128::from(newest);
+    let mut out = String::new();
+    for line in text.lines() {
+        match serde_json::from_str::<Value>(line) {
+            Ok(mut record) if timestamp_ns(&record).is_some() => {
+                let at = timestamp_ns(&record).expect("timestamped");
+                record["timestamp"] = json!(crate::mcp::rfc3339((i128::from(at) + shift) as u64));
+                out.push_str(&record.to_string());
+            }
+            _ => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    std::fs::write(path, out).expect("writes");
+    age(path, ago);
+}
+
 #[test]
 fn since_selects_whole_sessions_not_files() {
     // A Claude Code session whose main transcript changed recently, but
@@ -1005,7 +1034,7 @@ fn since_selects_whole_sessions_not_files() {
     let dir = scratch("since-session");
     copy_tree(&fixtures().join("claude-code"), &dir);
     let project = dir.join("-tmp-demo-shop");
-    age(
+    ran(
         &project.join(format!("{S1}.jsonl")),
         Duration::from_secs(60),
     );
@@ -1060,6 +1089,87 @@ fn since_selects_whole_sessions_not_files() {
         (2, 1),
         "the child, its parent; not the unrelated legacy session"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn since_reads_when_a_session_ran_not_when_its_file_was_touched() {
+    // Claude Code appends untimestamped bookkeeping — the last prompt, a
+    // title, a mode — to transcripts it has not run for months, which
+    // moves their modification time. Measured on one machine: a third of
+    // the transcripts modified in the last two weeks had not recorded a
+    // turn in five to thirteen weeks. `--since` judges a session by when
+    // it last recorded something, so such a session is not "recent".
+    let dir = scratch("since-touched");
+    copy_tree(&fixtures().join("claude-code"), &dir);
+    let project = dir.join("-tmp-demo-shop");
+    // S1 last ran in January (the fixture's own times); today Claude Code
+    // appended its bookkeeping, so its file is a minute old.
+    let touched = project.join(format!("{S1}.jsonl"));
+    let mut text = std::fs::read_to_string(&touched).expect("reads");
+    text.push_str(&format!(
+        "{}\n{}\n",
+        json!({"type": "last-prompt", "lastPrompt": "synthetic", "sessionId": S1}),
+        json!({"type": "custom-title", "customTitle": "synthetic", "sessionId": S1}),
+    ));
+    std::fs::write(&touched, text).expect("writes");
+    age(&touched, Duration::from_secs(60));
+    age(
+        &project
+            .join(S1)
+            .join("subagents")
+            .join("agent-a1b2c3.jsonl"),
+        Duration::from_secs(3 * 86_400),
+    );
+    // S2 ran a minute ago.
+    ran(
+        &project.join(format!("{S2}.jsonl")),
+        Duration::from_secs(60),
+    );
+    assert!(
+        matches!(newest_record(&touched), Recorded::At(at) if at < crate::mcp::unix_nanos_now() - 86_400_000_000_000),
+        "the bookkeeping after S1's last turn carries no time"
+    );
+    let mut recent = options(Source::ClaudeCode, &dir, None);
+    recent.since = Some(Duration::from_secs(3600));
+    let mut sink = Memory::new();
+    let stats = import(&recent, &mut sink);
+    assert_eq!(
+        (stats.files_read, stats.files_filtered),
+        (1, 2),
+        "S2 ran within the hour; S1 and its sub-agent did not"
+    );
+    assert!(sink
+        .sent
+        .iter()
+        .all(|span| span.attributes.get("session.id") == Some(&json!(S2))));
+    // With no window, the touched session is read like any other.
+    let stats = import(&options(Source::ClaudeCode, &dir, None), &mut Memory::new());
+    assert_eq!((stats.files_read, stats.files_filtered), (3, 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_newest_record_is_found_past_bookkeeping_and_a_long_last_turn() {
+    let dir = scratch("newest-record");
+    let path = dir.join("t.jsonl");
+    let early = "2026-01-05T10:00:00.000Z";
+    let late = "2026-01-05T11:00:00.000Z";
+    // A last turn longer than the first window, then bookkeeping, then a
+    // line still being written.
+    let long = "x".repeat(300 * 1024);
+    let text = format!(
+        "{}\n{}\n{}\n{{\"type\":\"assist",
+        json!({"type": "user", "timestamp": early}),
+        json!({"type": "assistant", "timestamp": late, "text": long}),
+        json!({"type": "last-prompt", "lastPrompt": "synthetic"}),
+    );
+    std::fs::write(&path, text).expect("writes");
+    let late_ns = crate::mcp::parse_iso(late).expect("parses");
+    assert_eq!(newest_record(&path), Recorded::At(late_ns));
+    // No timestamp anywhere (a legacy shape): not known.
+    std::fs::write(&path, "{\"type\":\"summary\"}\n").expect("writes");
+    assert_eq!(newest_record(&path), Recorded::Unknown);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

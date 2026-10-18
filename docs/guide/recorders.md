@@ -216,11 +216,16 @@ credential, and — for a batch import — an unreachable server or an exhausted
 quota, stop the import with the server's own words. The exit code is 0, 3 when
 some spans or files were refused, and 2 when the import could not run.
 
-`--since 7d` only reads sessions with a file modified that recently, and reads
-such a session whole: a Claude Code transcript with every sub-agent file of its
-session, a Codex rollout with the rollouts of its parent threads (as far as the
-rollouts on disk tell) — so an `Agent` call keeps its agent and a sub-agent
-thread its root. `--project-filter SUBSTR` only reads sessions whose file path
+`--since 7d` only reads sessions active that recently, and reads such a
+session whole. A Claude Code transcript is judged by its newest timestamped
+record, not by its modification time alone: Claude Code appends untimestamped
+bookkeeping (the last prompt, a title, a mode) to transcripts it has not run for
+months, so a file modified today may hold a session from last quarter. A file
+whose records cannot tell (none within 8 MiB of its end carries a time) and a
+Codex rollout are judged by when they were modified. A session is read whole:
+a Claude Code transcript with every sub-agent file of its session, a Codex
+rollout with the rollouts of its parent threads (as far as the rollouts on disk
+tell) — so an `Agent` call keeps its agent and a sub-agent thread its root. `--project-filter SUBSTR` only reads sessions whose file path
 or working directory contains it. `--json` prints the counts as JSON:
 
 ```json
