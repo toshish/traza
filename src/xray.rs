@@ -30,7 +30,9 @@
 //!   and kind, differing in a stretch at most a tenth of its text — is
 //!   reported as edited, with the bytes that changed, not as lost; when that
 //!   could not be checked (its text was not kept, or a bound was reached),
-//!   the loss is marked `unverified` rather than asserted.
+//!   or this call's context was not read whole (cut at the chunk bound, or
+//!   partly unreadable), the loss is marked `unverified` rather than
+//!   asserted.
 //! - **Why did the cache break?** The Cache Autopsy ([`autopsy`]) compares
 //!   each call with the previous call of its conversation and names the first
 //!   chunk that differs, the bytes that changed in it — usually one volatile
@@ -59,6 +61,16 @@
 //! any bound the answer says so (`chunks_truncated`, `provenance_partial`,
 //! `resolved_partial`, `texts_partial`, `unverified`, `*_truncated`) rather
 //! than looking complete.
+//!
+//! **What was not read is not evidence.** A context cut at the chunk bound,
+//! or holding a value that could not be resolved — its request, its tool
+//! definitions, or for a delta-recorded call an earlier answer it continues
+//! — is not the context the model saw. Content found in it is found; content
+//! missing from it may lie in the part not read. So a loss resting on such
+//! an absence is `unverified`, a cache verdict that what was not compared
+//! could change is `unknown` with nothing counted lost, a partial context
+//! never calibrates, and staleness is not judged on model output that could
+//! not be read.
 
 mod autopsy;
 mod chunk;
@@ -413,8 +425,11 @@ pub struct Dropped {
     pub preview: Option<String>,
     /// The earliest step that held it.
     pub introduced_by: Option<Introduced>,
-    /// This call has a chunk of the same role and kind that could be this
-    /// one edited, but the two were not compared — the old text was not
+    /// Not proven lost. Either this call's context was not read whole — cut
+    /// at [`MAX_CONTEXT_CHUNKS`] (`chunks_truncated`), or partly unreadable
+    /// (`context_unavailable`) — so the chunk may sit in the part not read;
+    /// or this call has a chunk of the same role and kind that could be
+    /// this one edited, but the two were not compared — the old text was not
     /// kept, or the comparison bound was reached — so the chunk may have
     /// been changed rather than lost.
     pub unverified: bool,
@@ -467,6 +482,14 @@ pub struct CacheStep {
     pub chunks: usize,
     /// Their estimated tokens.
     pub est_tokens: u64,
+    /// Its context, or its predecessor's, had more than
+    /// [`MAX_CONTEXT_CHUNKS`] chunks, and the rest was not analysed. The
+    /// comparison then covers the chunks both sides analysed: a divergence
+    /// among them is reported where it is, but a verdict that what lies past
+    /// the cut could change — the whole prefix held, a new turn, a rewrite,
+    /// a removal — is `unknown` with nothing counted lost, and a verdict it
+    /// cannot change counts lost tokens among the chunks compared only.
+    pub chunks_truncated: bool,
     /// Leading chunks identical to the predecessor's.
     pub prefix_chunks_shared: usize,
     /// Their estimated tokens.
@@ -636,7 +659,12 @@ pub struct CacheAutopsy {
     pub summary: CacheSummary,
     /// The run had more spans or model calls than one autopsy reads.
     pub truncated: bool,
-    /// Some offloaded request could not be resolved.
+    /// Some call's context, or its predecessor's, was cut at
+    /// [`MAX_CONTEXT_CHUNKS`] chunks ([`CacheStep::chunks_truncated`]).
+    pub chunks_truncated: bool,
+    /// Some offloaded value — a request, tool definitions, or an answer a
+    /// delta-recorded call continues from — could not be resolved (or
+    /// `resolve=false`); a call whose context it left partial is `unknown`.
     pub resolved_partial: bool,
     /// Some chunk text was not kept for lack of room, so a diff is `null`.
     pub texts_partial: bool,
@@ -662,11 +690,19 @@ pub struct XRay {
     pub start_ns: u64,
     /// The context window, in order.
     pub chunks: Vec<Chunk>,
-    /// Why the context could not be read (`"was not recorded"`, `"was
+    /// Why the context could not be read whole (`"was not recorded"`, `"was
     /// offloaded and could not be resolved"`, `"was offloaded and
-    /// resolve=false"`), or `null` when it was.
+    /// resolve=false"`, tool definitions or — for a call recorded as a delta
+    /// of its conversation — an earlier call or its answer that could not be
+    /// read, or a conversation that cannot be found), or `null` when it was.
+    /// The chunks are then what could be read, a placeholder standing for
+    /// each offloaded value that could not; the context is neither compared
+    /// with its predecessor's nor used to calibrate, and a chunk the
+    /// previous call had and this one lacks is `unverified`.
     pub context_unavailable: Option<&'static str>,
-    /// The context had more than [`MAX_CONTEXT_CHUNKS`] chunks.
+    /// The context had more than [`MAX_CONTEXT_CHUNKS`] chunks. The previous
+    /// call's being cut too is in `cache.chunks_truncated`; only the chunks
+    /// of it that were analysed are checked for losses.
     pub chunks_truncated: bool,
     /// Sizes.
     pub totals: Totals,
@@ -696,8 +732,11 @@ pub struct XRay {
     pub response: Vec<Chunk>,
     /// Some offloaded value could not be resolved (or `resolve=false`).
     pub resolved_partial: bool,
-    /// A provenance or staleness bound was reached, or the history was cut
-    /// short, so `introduced_by` and `stale` are incomplete.
+    /// A provenance or staleness bound was reached, the history was cut
+    /// short, or some of it could not be read (an offloaded value left
+    /// unresolved), so `introduced_by` and `stale` are incomplete. When a
+    /// model output could not be read, or too many words were said, nothing
+    /// is called stale: a result it quoted would look unquoted.
     pub provenance_partial: bool,
     /// Some chunk text was not kept for lack of room: a preview or diff is
     /// `null`, and a lost chunk may be `unverified`.
@@ -808,23 +847,68 @@ fn has_reference(value: &Value) -> bool {
     }
 }
 
-/// Why a context cannot be read, if it cannot.
-fn unavailable(request: Option<&Value>, resolve: bool) -> Option<&'static str> {
-    match request {
-        None => Some(NOT_RECORDED),
-        Some(value) if has_reference(value) && resolve => {
-            Some("was offloaded and could not be resolved")
-        }
-        Some(value) if has_reference(value) => Some("was offloaded and resolve=false"),
-        Some(_) => None,
+/// Resolves `value` when `resolve` says to, returning whether a reference
+/// stayed in it: what resolution left, or — not resolving — every reference
+/// there is.
+fn left_unread(
+    value: &mut Value,
+    resolver: &mut Resolver<'_>,
+    budget: &mut ResolveBudget,
+    resolve: bool,
+) -> Result<bool> {
+    if resolve {
+        Ok(resolver.resolve(value, budget)?.any())
+    } else {
+        Ok(has_reference(value))
     }
 }
 
-/// A model call's context and output, read and chunked.
+/// Why a request whose offloaded messages stayed references cannot be read.
+fn request_unread(resolve: bool) -> &'static str {
+    if resolve {
+        "was offloaded and could not be resolved"
+    } else {
+        "was offloaded and resolve=false"
+    }
+}
+
+/// Why tool definitions that stayed references cannot be read; it reads
+/// after "the request", as every reason does.
+fn definitions_unread(resolve: bool) -> &'static str {
+    if resolve {
+        "carried tool definitions that were offloaded and could not be resolved"
+    } else {
+        "carried tool definitions that were offloaded, and resolve=false"
+    }
+}
+
+/// A model call's context and output, read and chunked — and, part by
+/// part, what of it could not be read. A part left an offloaded reference
+/// is chunked as its placeholder, which is not the content the model saw,
+/// so each part says so separately: its request, its tool definitions and
+/// its answer, which a delta-recorded call after it continues from.
 struct Read {
     context: chunk::Pieces,
     response: Vec<Piece>,
+    /// Why its messages are not all there (its request, or for a
+    /// delta-recorded call the context it continues), when they are not.
     unavailable: Option<&'static str>,
+    /// Why its tool definitions are not, when they are not.
+    definitions_unavailable: Option<&'static str>,
+    /// Its answer was read but kept an offloaded reference unresolved.
+    response_unresolved: bool,
+    /// Some value of its own — request, tool definitions or answer — kept
+    /// an offloaded reference unresolved, so what it held is not all known.
+    unresolved: bool,
+}
+
+impl Read {
+    /// Why the context as chunked is not the whole context the call
+    /// carried, when it is not: such a context is neither compared whole nor
+    /// used to calibrate.
+    fn context_unavailable(&self) -> Option<&'static str> {
+        self.unavailable.or(self.definitions_unavailable)
+    }
 }
 
 /// Resolves (when asked) and chunks one model call.
@@ -837,43 +921,63 @@ fn read_call(
 ) -> Result<Read> {
     let mut step = paired.step.clone();
     let mut definitions = chunk::tool_definitions(&paired.span.attributes);
-    if resolve {
-        resolver.resolve_request(&mut step, budget)?;
+    // What stayed a reference, part by part: what resolution left, or —
+    // not resolving — every reference there is.
+    let (request_left, definitions_left, response_left) = if resolve {
+        let request = resolver.resolve_request(&mut step, budget)?.any();
+        let mut definitions_left = false;
         for definition in &mut definitions {
             // As text first, so definitions recorded as text keep their
             // bytes; then anything nested.
-            resolver.resolve_text(definition, budget)?;
-            resolver.resolve(definition, budget)?;
+            let mut left = resolver.resolve_text(definition, budget)?;
+            left.merge(resolver.resolve(definition, budget)?);
+            definitions_left |= left.any();
         }
-        if with_response {
-            if let Some(response) = step.response.as_mut() {
-                resolver.resolve(response, budget)?;
-            }
-        }
-    }
+        let response = match (with_response, step.response.as_mut()) {
+            (true, Some(response)) => resolver.resolve(response, budget)?.any(),
+            _ => false,
+        };
+        (request, definitions_left, response)
+    } else {
+        (
+            step.request.as_ref().is_some_and(has_reference),
+            definitions.iter().any(has_reference),
+            with_response && step.response.as_ref().is_some_and(has_reference),
+        )
+    };
     let context = chunk::context_pieces(step.request.as_ref(), &definitions, MAX_CONTEXT_CHUNKS);
     let response = match (&step.response, with_response) {
         (Some(response), true) => chunk::response_pieces(response, MAX_CONTEXT_CHUNKS).list,
         _ => Vec::new(),
     };
+    let unavailable = match &step.request {
+        None => Some(NOT_RECORDED),
+        Some(_) => request_left.then(|| request_unread(resolve)),
+    };
     Ok(Read {
         context,
         response,
-        unavailable: unavailable(step.request.as_ref(), resolve),
+        unavailable,
+        definitions_unavailable: definitions_left.then(|| definitions_unread(resolve)),
+        response_unresolved: response_left,
+        unresolved: request_left || definitions_left || response_left,
     })
 }
 
-/// The conversation a model call names ([`CONVERSATION_ATTRIBUTE`]), if any.
+/// The conversation a model call names ([`CONVERSATION_ATTRIBUTE`]), as its
+/// identity: the SHA-256 of the whole id, in hex. An id is producer text of
+/// any length, so it is neither cut short — two ids sharing a long prefix
+/// would become one conversation, each continuing the other's — nor kept
+/// whole, since a request remembers thousands; the digest is fixed in size
+/// and collision-resistant. `None` when the call names none it can be read
+/// by: absent, empty, offloaded or not text.
 fn conversation_of(span: &Span) -> Option<String> {
     span.attributes
         .get(CONVERSATION_ATTRIBUTE)
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
-        .map(|id| chunk::clip(id, MAX_CONVERSATION_ID_CHARS))
+        .map(|id| crate::payload::sha256_hex(id.as_bytes()))
 }
-
-/// Characters of a conversation id kept: ids are producer text.
-const MAX_CONVERSATION_ID_CHARS: usize = 256;
 
 /// Whether a model call recorded only what it added to its conversation
 /// ([`INPUT_DELTA_ATTRIBUTE`]): the boolean `true`, or exactly `"true"`.
@@ -893,6 +997,18 @@ const NOT_RECORDED: &str = "was not recorded";
 const EARLIER_UNREADABLE: &str =
     "could not be rebuilt: an earlier call of its conversation could not be read";
 
+/// Why a delta-recorded call's context could not be rebuilt whole from an
+/// earlier call whose answer could not be read.
+const EARLIER_ANSWER_UNREADABLE: &str =
+    "could not be rebuilt whole: the answer of an earlier call of its conversation was offloaded \
+     and could not be resolved";
+
+/// Why a delta-recorded call that names no conversation it can be read by
+/// shows only part of its context.
+const UNNAMED_DELTA: &str =
+    "could not be rebuilt: it recorded only what it added, and names no conversation \
+     (gen_ai.conversation.id) that can be read to find what it added to";
+
 /// Why a delta-recorded call's context could not be rebuilt.
 const NOT_REBUILT: &str =
     "could not be rebuilt: it recorded only what it added, and its conversation's earlier \
@@ -903,12 +1019,15 @@ const DELTA_ALONE: &str =
     "was recorded as a delta of its conversation, whose earlier calls lie past the read";
 
 /// One conversation's running context: its latest call's whole context and
-/// what that call answered.
+/// what that call answered — each with what of it could not be read, which
+/// the next call inherits along with the content.
 struct Thread {
     context: Vec<Piece>,
     truncated: bool,
     unavailable: Option<&'static str>,
+    definitions_unavailable: Option<&'static str>,
     response: Vec<Piece>,
+    response_unresolved: bool,
     bytes: usize,
     used: u64,
 }
@@ -933,10 +1052,18 @@ struct Threads {
 impl Threads {
     /// Folds one call's read into its conversation, returning the read with
     /// its whole context. A call naming no conversation is returned as it
-    /// is; so is a delta call opening its conversation, whose delta is all
-    /// there was.
+    /// is — unless it recorded only a delta, which then continues a context
+    /// nothing can find, and says so; a delta call opening its conversation
+    /// is returned as it is too, its delta being all there was.
     fn fold(&mut self, span: &Span, mut read: Read) -> Read {
         let Some(conversation) = conversation_of(span) else {
+            if is_delta(span) {
+                read.unavailable = Some(
+                    read.unavailable
+                        .filter(|reason| *reason != NOT_RECORDED)
+                        .unwrap_or(UNNAMED_DELTA),
+                );
+            }
             return read;
         };
         let key = (span.tenant.clone(), conversation);
@@ -949,11 +1076,13 @@ impl Threads {
                     let own_definitions = own.iter().take_while(is_definition).count();
                     let base_definitions = thread.context.iter().take_while(is_definition).count();
                     // Its own definitions when it recorded any, else its
-                    // conversation's; then the conversation, the answer to
-                    // its last call, and what this call added.
+                    // conversation's (and whether those could be read);
+                    // then the conversation, the answer to its last call,
+                    // and what this call added.
                     let definitions = if own_definitions > 0 {
                         &own[..own_definitions]
                     } else {
+                        read.definitions_unavailable = thread.definitions_unavailable;
                         &thread.context[..base_definitions]
                     };
                     let mut list: Vec<Piece> = definitions
@@ -972,8 +1101,12 @@ impl Threads {
                     read.context.list = list;
                     read.context.truncated = truncated;
                     // A delta that added nothing is not an unrecorded one;
-                    // an unreadable earlier call leaves this one partial.
-                    let earlier = thread.unavailable.map(|_| EARLIER_UNREADABLE);
+                    // an unreadable earlier call — or an answer of it left
+                    // a reference, which this context now carries as its
+                    // placeholder — leaves this one partial.
+                    let earlier = thread.unavailable.map(|_| EARLIER_UNREADABLE).or(thread
+                        .response_unresolved
+                        .then_some(EARLIER_ANSWER_UNREADABLE));
                     read.unavailable = match read.unavailable {
                         Some(NOT_RECORDED) => earlier,
                         own => own.or(earlier),
@@ -1029,7 +1162,9 @@ impl Threads {
                 context: read.context.list.clone(),
                 truncated: read.context.truncated,
                 unavailable: read.unavailable,
+                definitions_unavailable: read.definitions_unavailable,
                 response: read.response.clone(),
+                response_unresolved: read.response_unresolved,
                 bytes,
                 used: self.clock,
             },
@@ -1107,6 +1242,8 @@ fn cache_step(store: &Store, verdict: Verdict<'_>, ttl_ns: u64, pool: &TextPool)
         seen_before,
     } = verdict;
     let est_tokens = context.est_tokens();
+    let chunks_truncated =
+        context.truncated || matches!(&predecessor, Ok(Some((previous, _))) if previous.truncated);
     let mut previous_step_index = None;
     let mut gap_ns = None;
     let mut applied = None;
@@ -1173,6 +1310,7 @@ fn cache_step(store: &Store, verdict: Verdict<'_>, ttl_ns: u64, pool: &TextPool)
         previous_step_index,
         chunks: context.chunks.len(),
         est_tokens,
+        chunks_truncated,
         prefix_chunks_shared: comparison.shared_chunks,
         shared_est_tokens: comparison.shared_est_tokens,
         first_divergent_chunk: comparison.divergence,
@@ -1663,6 +1801,13 @@ impl Store {
         if target.is_none() && is_delta(&span) {
             read.unavailable = read.unavailable.or(Some(DELTA_ALONE));
         }
+        let context_unavailable = read.context_unavailable();
+        // Absence from this context is evidence of a loss only where it was
+        // read whole: a chunk not found past the chunk bound, or in a part
+        // that could not be read, may well be there. What is found is found
+        // either way.
+        let messages_whole = !read.context.truncated && read.unavailable.is_none();
+        let definitions_whole = !read.context.truncated && read.definitions_unavailable.is_none();
         let pieces = read.context.list;
         let contents: HashSet<u128> = pieces.iter().map(|piece| piece.content).collect();
         // The call's own texts are held first and never released: its
@@ -1676,6 +1821,12 @@ impl Store {
         let mut call_steps: HashMap<String, Vec<usize>> = HashMap::new();
         let mut first_said: HashMap<u64, usize> = HashMap::new();
         let mut said_overflow = false;
+        // A step held an offloaded value left unresolved: content first seen
+        // there was not seen, so a chunk's introduction may read as later.
+        let mut history_unread = false;
+        // A model output (an answer, a tool's arguments) was left so: a
+        // result it drew on would look unquoted, so staleness is not judged.
+        let mut said_unread = read.response_unresolved;
         let mut output_steps: Vec<usize> = Vec::new();
         let mut recent: VecDeque<Context> = VecDeque::new();
         let mut resolved_partial = !options.resolve;
@@ -1731,6 +1882,8 @@ impl Store {
                             true,
                         )?,
                     };
+                    history_unread |= call.unresolved;
+                    said_unread |= call.response_unresolved;
                     let mut said = false;
                     for piece in call.context.list.iter().chain(call.response.iter()) {
                         note(piece.content, index, &mut provenance);
@@ -1751,7 +1904,7 @@ impl Store {
                             entry.span.start_time_ns,
                             &call.context.list,
                             call.context.truncated,
-                            call.unavailable,
+                            call.context_unavailable(),
                         )
                         .with_agent(agents.of(entry.span))
                         .with_conversation(conversation_of(entry.span));
@@ -1761,14 +1914,26 @@ impl Store {
                 }
                 StepKind::Tool => {
                     let mut step = entry.step.clone();
-                    if options.resolve {
-                        if let Some(response) = step.response.as_mut() {
-                            resolver.resolve(response, &mut history_budget)?;
-                        }
-                        if let Some(request) = step.request.as_mut() {
-                            resolver.resolve(request, &mut history_budget)?;
-                        }
-                    }
+                    let result_left = match step.response.as_mut() {
+                        Some(response) => left_unread(
+                            response,
+                            &mut resolver,
+                            &mut history_budget,
+                            options.resolve,
+                        )?,
+                        None => false,
+                    };
+                    let arguments_left = match step.request.as_mut() {
+                        Some(request) => left_unread(
+                            request,
+                            &mut resolver,
+                            &mut history_budget,
+                            options.resolve,
+                        )?,
+                        None => false,
+                    };
+                    history_unread |= result_left || arguments_left;
+                    said_unread |= arguments_left;
                     if let Some(id) = step.detail.tool_call_id.clone() {
                         call_steps.entry(id).or_default().push(index);
                     }
@@ -1789,9 +1954,12 @@ impl Store {
                         .into_iter()
                         .flatten()
                     {
-                        if options.resolve {
-                            resolver.resolve(value, &mut history_budget)?;
-                        }
+                        history_unread |= left_unread(
+                            value,
+                            &mut resolver,
+                            &mut history_budget,
+                            options.resolve,
+                        )?;
                         if let Some(piece) = chunk::value_piece(value, ChunkKind::Other, None) {
                             note(piece.content, index, &mut provenance);
                         }
@@ -1801,7 +1969,8 @@ impl Store {
             }
         }
         resolved_partial |= target_budget.unresolved || history_budget.unresolved;
-        provenance_partial |= said_overflow;
+        let said_partial = said_overflow || said_unread;
+        provenance_partial |= said_partial || history_unread;
 
         // Provenance, age and staleness per chunk.
         let steps: Vec<&TapeStep> = history.iter().map(|entry| entry.step).collect();
@@ -1845,7 +2014,7 @@ impl Store {
                 (Some(step), Some(age))
                     if piece.kind == ChunkKind::ToolResult
                         && age > options.stale_steps
-                        && !said_overflow =>
+                        && !said_partial =>
                 {
                     let from = step.step_index;
                     let spoke_since = output_steps
@@ -1935,7 +2104,7 @@ impl Store {
             span.start_time_ns,
             &pieces,
             read.context.truncated,
-            read.unavailable,
+            context_unavailable,
         )
         .with_agent(agents.of(&span))
         .with_conversation(conversation_of(&span));
@@ -1973,7 +2142,11 @@ impl Store {
                 // be an edit, which settles most candidates without a text.
                 let old_text = pool.get(kept.exact);
                 let mut partner = None;
-                let mut unverified = false;
+                let mut unverified = if kept.role.as_deref() == Some(TOOLS_ROLE) {
+                    !definitions_whole
+                } else {
+                    !messages_whole
+                };
                 for (slot, &position) in fresh.iter().enumerate() {
                     let piece = &pieces[position];
                     if piece.kind != kept.kind
@@ -2099,7 +2272,7 @@ impl Store {
             provider: llm.provider.clone(),
             start_ns: span.start_time_ns,
             chunks,
-            context_unavailable: read.unavailable,
+            context_unavailable,
             chunks_truncated: read.context.truncated,
             totals,
             composition: Composition {
@@ -2197,7 +2370,7 @@ impl Store {
                 entry.span.start_time_ns,
                 &read.context.list,
                 read.context.truncated,
-                read.unavailable,
+                read.context_unavailable(),
             )
             .with_agent(agents.of(entry.span))
             .with_conversation(conversation);
@@ -2226,6 +2399,7 @@ impl Store {
             }
         }
         let summary = summarize(&steps);
+        let chunks_truncated = steps.iter().any(|step| step.chunks_truncated);
         Deadline::check(deadline, 0)?;
         Ok(Some(CacheAutopsy {
             run: run_id.to_owned(),
@@ -2234,6 +2408,7 @@ impl Store {
             steps,
             summary,
             truncated,
+            chunks_truncated,
             resolved_partial: unresolved || !options.resolve,
             texts_partial: pool.overflowed,
         }))

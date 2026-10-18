@@ -165,7 +165,8 @@ fn render(xray: &XRay, max_bytes: usize) -> String {
         || "a step past the run's read limit".to_owned(),
         |i| format!("step {i}"),
     );
-    // Only a loss checked against every possible edit is called one.
+    // Only a loss checked against every possible edit, in a context read
+    // whole, is called one.
     let instructions_lost = xray
         .dropped_since_previous
         .iter()
@@ -183,11 +184,26 @@ fn render(xray: &XRay, max_bytes: usize) -> String {
             thousands(instructions_lost as u64)
         ));
     }
+    // A context not read whole cannot show a chunk is gone: it may lie in
+    // the part not read.
+    let unread = xray.chunks_truncated || xray.context_unavailable.is_some();
+    let maybe = if unread {
+        "may be edited, or in the part of this context not read"
+    } else {
+        "may be edited"
+    };
     if unverified > 0 {
-        lost.push(format!(
-            "{} possibly edited rather than lost (not compared)",
-            thousands(unverified as u64)
-        ));
+        lost.push(if unread {
+            format!(
+                "{} not proven lost (possibly edited, or in the part of this context not read)",
+                thousands(unverified as u64)
+            )
+        } else {
+            format!(
+                "{} possibly edited rather than lost (not compared)",
+                thousands(unverified as u64)
+            )
+        });
     }
     let head = format!(
         "X-Ray of {at}: {}, ~{} estimated tokens ({reported}). Stale: {} (~{} tokens). \
@@ -253,9 +269,9 @@ fn render(xray: &XRay, max_bytes: usize) -> String {
             "dropped {}{} ({}) ~{} tok: {}",
             dropped.kind,
             if dropped.unverified {
-                " (unverified: may be edited)"
+                format!(" (unverified: {maybe})")
             } else {
-                ""
+                String::new()
             },
             sanitize(
                 dropped
@@ -300,6 +316,11 @@ fn render(xray: &XRay, max_bytes: usize) -> String {
         (
             xray.chunks_truncated,
             "the context had more chunks than one X-Ray analyses",
+        ),
+        (
+            xray.cache.chunks_truncated && !xray.chunks_truncated,
+            "the previous call's context had more chunks than one X-Ray analyses, so only \
+             those were compared",
         ),
         (
             xray.provenance_partial,
@@ -613,6 +634,60 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("some chunk text was not kept"), "{text}");
+    }
+
+    #[test]
+    fn a_loss_from_a_context_not_read_whole_is_not_counted_as_an_instruction() {
+        let fixture = TempStore::open("mcp-xray-cut", crate::Config::default());
+        let turn = |text: String| json!({"role": "user", "content": text});
+        let before: Vec<Value> = (0..crate::xray::MAX_CONTEXT_CHUNKS)
+            .map(|index| turn(format!("turn {index}")))
+            .collect();
+        // One instruction ahead of all of it pushes the last turn past the
+        // chunk bound; nothing was removed.
+        let mut after = vec![turn(
+            "A new instruction placed ahead of the whole history, far longer than any turn"
+                .to_owned(),
+        )];
+        after.extend(before.iter().cloned());
+        let call = |id: &str, start: u64, messages: Vec<Value>| {
+            span(
+                "t3",
+                id,
+                start,
+                json!({"session.id": "s3", "gen_ai.operation.name": "chat",
+                       "gen_ai.request.model": "m", "gen_ai.input.messages": messages}),
+            )
+        };
+        fixture
+            .store()
+            .ingest_batch(vec![call("l0", 100, before), call("l1", 200, after)])
+            .expect("ingests");
+        let xray = fixture
+            .store()
+            .xray(Some(""), "t3", "l1", XrayOptions::default())
+            .expect("reads")
+            .expect("found");
+        let text = render(&xray, 1 << 20);
+        assert!(
+            text.contains(
+                "1 chunk dropped, 1 not proven lost (possibly edited, or in the part of this \
+                 context not read)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("INSTRUCTIONS"), "{text}");
+        assert!(
+            text.contains(
+                "dropped instruction (unverified: may be edited, or in the part of this context \
+                 not read)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("the context had more chunks than one X-Ray analyses"),
+            "{text}"
+        );
     }
 
     #[test]

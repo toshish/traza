@@ -157,6 +157,16 @@ the 32 calls a predecessor can be first, newest first, then older history
 `resolve=false` skips that: an offloaded request is then one opaque chunk,
 `context_unavailable` says why, and the cache verdict is `unknown`.
 
+The same holds for every part of a context, read separately: the request,
+the tool definitions, and — for a call [recorded as a
+delta](#conversations-recorded-as-deltas) — the earlier answer it continues
+from. Whichever part stays a reference (the budget ran out, its bytes are
+gone, or `resolve=false`) is chunked as its placeholder, which is not what
+the model saw, so the context is reported as not read whole
+(`context_unavailable`): it is not compared with its predecessor's (`unknown`),
+not used to calibrate, and a chunk the previous call had that it lacks is
+`unverified` rather than lost. What was not read is never evidence.
+
 ## Provenance: where each chunk came from
 
 `introduced_by` is **the earliest step of the run whose request or response
@@ -204,7 +214,12 @@ without quoting it, and can quote a word that happened to arrive from
 elsewhere. But a long-lived result the model never echoed is the first thing to
 cut when a context is too big, and `totals.stale_est_tokens` says how much
 cutting it would save. When no model output after the result was recorded at
-all, nothing is called stale — there is nothing to judge by.
+all, nothing is called stale — there is nothing to judge by. Nor is anything
+when some model output of the history (an answer, or a tool's arguments) was
+offloaded and could not be read: the words it said are unknown, and a result
+it quoted would look unquoted. `provenance_partial` says so, as it does when
+any value of the history stayed unresolved, since content first seen there
+would read as introduced later.
 
 ## Duplicates
 
@@ -233,8 +248,14 @@ edited (the same role and kind, and a length within a tenth of it) is
 compared with it. When that comparison could not be made — the old text was
 not kept for lack of room (`texts_partial`), or the comparison bound was
 reached — the dropped chunk is marked `"unverified": true`: it may have been
-changed rather than lost. `xray_step` counts only verified losses as lost
-instructions.
+changed rather than lost. So is every dropped chunk when this call's context
+was not read whole — cut at 2,000 chunks (`chunks_truncated`), or partly
+unreadable (`context_unavailable`): a chunk not found in what was read may
+sit in what was not. (Prepend one instruction to a 2,000-chunk history and
+its last chunk falls past the cut; it is listed, unverified, not lost.) A
+chunk found edited is an edit either way. When the *previous* call's context
+was cut (`cache.chunks_truncated`), only its first 2,000 chunks are checked.
+`xray_step` counts only verified losses as lost instructions.
 
 ## Conversations recorded as deltas
 
@@ -259,6 +280,17 @@ task, every answer and every tool result of the forty, with each chunk's
 provenance and age, not the one tool result the transcript recorded for it.
 A call whose delta is empty (a retry) is the conversation so far plus the
 last answer. Any other producer can use the same two attributes.
+
+A conversation is identified by its **whole** id, compared through a SHA-256
+digest of it — never a prefix, so two long ids that begin alike are two
+conversations, and neither continues the other. A delta call that names no
+conversation that can be read (none, or an id so long it was offloaded) has
+nothing to be rebuilt from, and says so (*could not be rebuilt*) rather than
+passing its delta for its whole context. Gaps carry forward too: when an
+earlier call of the conversation, or the answer it gave, could not be read
+(offloaded and unresolved), every later delta call of it is reported with its
+context unavailable — it carries that gap — rather than as a whole context
+with a placeholder inside.
 
 A call that names a conversation **pairs with the nearest earlier call of
 that conversation**, whatever the two share, and never with a call of
@@ -379,7 +411,22 @@ identity; `prefix_chunks_shared` is how far they agree.
 | | A chunk was removed from inside the prefix (pruning) | `removed` |
 | | Less than half of what followed the divergence survives (compaction, truncation) | `rewritten` |
 | `unknown` | This context is a strict prefix of the predecessor's: whether a shorter prompt hits depends on where the provider's cache breakpoints sat, which no trace records | `shrunk` |
-| | This call's or the predecessor's request cannot be read | — |
+| | This call's or the predecessor's context cannot be read whole (`context_unavailable`) | — |
+| | A context was cut at 2,000 chunks and what lies past the cut could change the verdict (below) | — or as compared |
+
+**A context cut at 2,000 chunks** (`chunks_truncated` on the verdict, and on
+the autopsy) is compared as far as it was split, and what lies past the cut
+is never taken to match. A chunk found is found, but one not found may sit
+past the cut, so a verdict is asserted only when nothing there could change
+it: a predecessor read whole that this call starts with is still `stable`,
+and an insertion ahead of history or a move — decided by what was found — is
+still named. A verdict that needs the rest — that the whole prefix held, that
+nothing the predecessor had follows (a new turn), that most of it is gone (a
+rewrite), that a chunk was removed — is `unknown`, with nothing counted lost
+and the explanation saying where the compared chunks diverged and which
+context was cut; `first_divergent_chunk`, when present, describes the chunks
+compared. A verdict that stands counts lost tokens among the compared chunks
+only.
 
 The TTL defaults to 300 seconds — Anthropic's default cache lifetime and the
 low end of OpenAI's — and `ttl_seconds=` sets it per request (up to a day) for
@@ -412,9 +459,11 @@ estimate for the whole context, clamped to 0.25–4×, and `est_tokens_lost` is
 scaled by it so the figure leans toward the provider's tokenizer rather than
 the four-characters rule. It is applied only when the estimate covers what the
 provider counted: not when the context holds media (estimated at zero), uses
-tools without recording their definitions, or was cut at the chunk cap — the
-ratio would then mostly measure what was not recorded — and `calibration` is
-`null` and the raw estimate stands. Even when applied, the ratio absorbs
+tools without recording their definitions, was cut at the chunk cap, or was
+not read whole (an offloaded part — definitions, or an earlier answer of a
+delta-recorded conversation — left as a placeholder) — the ratio would then
+mostly measure what was not recorded — and `calibration` is `null` and the
+raw estimate stands. Even when applied, the ratio absorbs
 anything the provider adds that no span records (injected system text,
 formatting tokens). The explanation quotes the figure reported.
 
@@ -498,15 +547,22 @@ anything.
 - **Bounds.** One request reads its run's first 20,000 spans; a call past that
   is X-rayed alone (`step_index: null` here and in `cache`,
   `provenance_partial: true`, cache `unknown`). A context is split into at most
-  2,000 chunks (`chunks_truncated`). Up to 64 MiB of offloaded payload is
+  2,000 chunks (`chunks_truncated` on the X-Ray, on a verdict when either
+  context compared was cut, and on the autopsy; past the cut nothing is taken
+  to match or to be missing — see [Causes](#causes) and
+  [compaction loss](#what-the-previous-call-had-compaction-loss)). Up to
+  64 MiB of offloaded payload is
   resolved for the call under an X-Ray and as much again for its history — the
   32 calls a predecessor can be first, newest first — and an autopsy resolves
-  up to 64 MiB per call and 512 MiB across all its calls (`resolved_partial`).
+  up to 64 MiB per call and 512 MiB across all its calls (`resolved_partial`;
+  a context a value left unresolved is not read whole, `context_unavailable`).
   These are bounds on reading work, not on response size, which is why they
   are not `--tape-max-bytes` (the cap on content a tape *returns*); the query
   deadline bounds them as well. At most 200,000 content digests are kept for
   provenance and 500,000 words for staleness (`provenance_partial`; staleness
-  is then not judged at all), and 32 MiB of distinct chunk text for previews
+  is then not judged at all), one request remembers 64 running
+  conversations and 4,096 dropped ones, each by the SHA-256 of its id, and
+  32 MiB of distinct chunk text for previews
   and diffs — the examined call's and the comparison window's, released as
   calls leave the window (`texts_partial`). Pairing lost chunks with edited
   ones compares at most 64 MiB of text and 4,096 pairs (`unverified` past it).

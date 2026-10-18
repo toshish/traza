@@ -188,6 +188,9 @@ pub(crate) struct Context {
     pub(crate) contents: HashSet<u128>,
     /// Why the context could not be read, when it could not.
     pub(crate) unavailable: Option<&'static str>,
+    /// The context had more chunks than were split: `chunks` is its first
+    /// part, and a chunk missing from it may lie past the cut.
+    pub(crate) truncated: bool,
     /// Leading tool-definition chunks.
     pub(crate) leading_tools: usize,
     /// Whether the estimate covers what the provider counted, so their ratio
@@ -244,6 +247,7 @@ impl Context {
             chunks,
             contents,
             unavailable,
+            truncated,
             leading_tools,
             calibratable,
             held: Vec::new(),
@@ -655,6 +659,54 @@ fn has_hex_id(text: &str) -> bool {
     false
 }
 
+/// Something the comparison measured past a divergence, over the chunks
+/// split, and whether it holds whatever lies past a cut. Content found is
+/// found; content not found in a context cut at the chunk bound may lie past
+/// the cut, so an absence is sure only in a context split whole — and a
+/// verdict resting on an absence that is not sure is not asserted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fact {
+    holds: bool,
+    sure: bool,
+}
+
+impl Fact {
+    /// Decided by what was compared.
+    fn sure(holds: bool) -> Self {
+        Self { holds, sure: true }
+    }
+
+    /// Whether content was `found` in a context split `whole` or not.
+    fn found(found: bool, whole: bool) -> Self {
+        Self {
+            holds: found,
+            sure: found || whole,
+        }
+    }
+
+    /// Both hold: sure when both surely hold, or when either surely fails.
+    fn and(self, other: Self) -> Self {
+        let holds = self.holds && other.holds;
+        let sure = if holds {
+            self.sure && other.sure
+        } else {
+            (!self.holds && self.sure) || (!other.holds && other.sure)
+        };
+        Self { holds, sure }
+    }
+}
+
+impl std::ops::Not for Fact {
+    type Output = Self;
+
+    fn not(self) -> Self {
+        Self {
+            holds: !self.holds,
+            sure: self.sure,
+        }
+    }
+}
+
 /// The comparison of one call with its predecessor.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Comparison {
@@ -708,9 +760,19 @@ pub(crate) fn compare(
     let gap = human_duration(gap_ns);
     let ttl = human_duration(ttl_ns);
     let from = previous.step_index;
+    // A context cut at the chunk bound is compared as far as it was split:
+    // what was found in it is found, but what was not may lie past the cut.
+    let (p_whole, c_whole) = (!previous.truncated, !current.truncated);
+    let cut = match (p_whole, c_whole) {
+        (false, false) => format!("both this context and step {from}'s"),
+        (false, true) => format!("step {from}'s context"),
+        _ => "this context".to_owned(),
+    };
+    let bound = thousands(super::MAX_CONTEXT_CHUNKS as u64);
 
-    if shared == p.len() {
-        // The predecessor's whole context is a prefix of this one.
+    if shared == p.len() && p_whole {
+        // The predecessor's whole context is a prefix of this one — however
+        // much of this one lies past a cut.
         let (cause, lost, explanation) = if expired {
             (
                 Cause::TtlExpired,
@@ -744,9 +806,34 @@ pub(crate) fn compare(
         };
     }
 
+    if shared == p.len() || (shared == c.len() && !c_whole) {
+        // Every chunk compared matches, but a cut context ends the
+        // comparison before the prefix does: whether the rest held is not
+        // in what was split.
+        return Comparison {
+            cause: Cause::Unknown,
+            shared_chunks: shared,
+            shared_est_tokens,
+            divergence: None,
+            est_tokens_lost: 0,
+            explanation: format!(
+                "the first {} chunks (~{} tokens) match step {from}'s, but {cut} had more than \
+                 {bound} chunks and the rest was not compared, so whether the whole prefix held \
+                 is not known",
+                thousands(shared as u64),
+                thousands(shared_est_tokens)
+            ),
+        };
+    }
+
     if shared == c.len() {
         // This context ended first: a strict prefix of the predecessor's.
         let gone = p.len() - shared;
+        let removed = if p_whole {
+            format!("its last {gone} were removed")
+        } else {
+            format!("the rest of it, more than {gone} chunks, was removed")
+        };
         let at = &p[shared];
         return Comparison {
             cause: Cause::Unknown,
@@ -766,10 +853,9 @@ pub(crate) fn compare(
             }),
             est_tokens_lost: 0,
             explanation: format!(
-                "this context is the first {shared} chunks of step {from}'s — its last {gone} \
-                 were removed (a retry or a rollback); whether the provider serves a shorter \
-                 prompt from its cache depends on where its cache breakpoints sat, which the \
-                 trace does not record"
+                "this context is the first {shared} chunks of step {from}'s — {removed} (a retry \
+                 or a rollback); whether the provider serves a shorter prompt from its cache \
+                 depends on where its cache breakpoints sat, which the trace does not record"
             ),
         };
     }
@@ -781,10 +867,12 @@ pub(crate) fn compare(
             .skip(shared + 1)
             .any(|chunk| chunk.content == content)
     };
-    let before_later_here = position_in(c, before.content);
-    let after_later_there = position_in(p, after.content);
-    let after_anywhere_there = previous.contents.contains(&after.content);
-    let before_anywhere_here = current.contents.contains(&before.content);
+    // Where the two divergent chunks are found: a find is a fact, an
+    // absence one only in a context split whole ([`Fact`]).
+    let before_later_here = Fact::found(position_in(c, before.content), c_whole);
+    let after_later_there = Fact::found(position_in(p, after.content), p_whole);
+    let after_anywhere_there = Fact::found(previous.contents.contains(&after.content), p_whole);
+    let before_anywhere_here = Fact::found(current.contents.contains(&before.content), c_whole);
     let rest = &p[shared + 1..];
     let survived = if rest.is_empty() {
         1.0
@@ -814,38 +902,73 @@ pub(crate) fn compare(
         super::chunk::est_tokens(&new[new.len() - suffix..])
     });
     let structural = carried_after(shared) + in_chunk;
+    // A cut predecessor had more after its last analysed chunk.
+    let rest_empty = Fact::sure(rest.is_empty() && p_whole);
+    // Nothing the predecessor had follows the divergence here. Content
+    // carried is found; its absence needs both contexts whole.
+    let nothing_carried = Fact {
+        holds: structural == 0,
+        sure: structural > 0 || (p_whole && c_whole),
+    };
+    // Under half of what followed the divergence in the predecessor
+    // survives. Of a cut predecessor that is a share of an unknown whole;
+    // against a cut context, a floor.
+    let rewritten = Fact {
+        holds: survived < SURVIVAL_FOR_EDIT,
+        sure: p_whole && (c_whole || survived >= SURVIVAL_FOR_EDIT),
+    };
     // The predecessor's last chunk gave way to new content and nothing it
     // had follows: a new turn, which leaves the cache nothing to lose.
-    let new_turn =
-        rest.is_empty() && !before_later_here && !after_anywhere_there && structural == 0;
-
-    let (cause, change) = if before.content == after.content {
-        (Cause::Reordered, Change::Reserialized)
-    } else if before_later_here && after_later_there {
-        (Cause::Reordered, Change::Moved)
-    } else if new_turn {
-        let change = if edit {
-            Change::Edited
-        } else {
-            Change::Replaced
-        };
-        let cause = if expired {
-            Cause::TtlExpired
-        } else {
-            Cause::Stable
-        };
-        (cause, change)
-    } else if survived < SURVIVAL_FOR_EDIT {
-        (Cause::NewContext, Change::Rewritten)
-    } else if !after_anywhere_there && before_later_here {
-        (Cause::VolatileContent, Change::Inserted)
-    } else if after_anywhere_there && !before_anywhere_here {
-        (Cause::NewContext, Change::Removed)
-    } else if edit {
-        (Cause::VolatileContent, Change::Edited)
+    let new_turn = rest_empty
+        .and(!before_later_here)
+        .and(!after_anywhere_there)
+        .and(nothing_carried);
+    let served = if expired {
+        Cause::TtlExpired
     } else {
-        (Cause::VolatileContent, Change::Replaced)
+        Cause::Stable
     };
+    let in_place = if edit {
+        Change::Edited
+    } else {
+        Change::Replaced
+    };
+    // In order, the first rule that holds names the change. The verdict is
+    // settled only when that rule, and every rule before it, would come out
+    // the same whatever lies past a cut; otherwise it is `unknown`, and the
+    // change describes the chunks compared.
+    let rules = [
+        (
+            Fact::sure(before.content == after.content),
+            (Cause::Reordered, Change::Reserialized),
+        ),
+        (
+            before_later_here.and(after_later_there),
+            (Cause::Reordered, Change::Moved),
+        ),
+        (new_turn, (served, in_place)),
+        (rewritten, (Cause::NewContext, Change::Rewritten)),
+        (
+            (!after_anywhere_there).and(before_later_here),
+            (Cause::VolatileContent, Change::Inserted),
+        ),
+        (
+            after_anywhere_there.and(!before_anywhere_here),
+            (Cause::NewContext, Change::Removed),
+        ),
+    ];
+    let mut settled = true;
+    let mut outcome = (Cause::VolatileContent, in_place);
+    for (fact, named) in rules {
+        settled &= fact.sure;
+        if fact.holds {
+            outcome = named;
+            break;
+        }
+    }
+    let (named_cause, change) = outcome;
+    let cause = if settled { named_cause } else { Cause::Unknown };
+    let new_turn = new_turn.holds;
 
     let (diff, volatile) = match texts {
         (Some(old), Some(new)) => {
@@ -858,7 +981,7 @@ pub(crate) fn compare(
     if expired {
         lost += shared_est_tokens;
     }
-    let lost = scaled(lost);
+    let lost = if settled { scaled(lost) } else { 0 };
     let role = after
         .role
         .clone()
@@ -884,6 +1007,21 @@ pub(crate) fn compare(
     };
     let relabelled = before.role != after.role || before.kind != after.kind;
     let explanation = match change {
+        _ if !settled => {
+            let matched = if shared == 0 {
+                String::new()
+            } else {
+                format!(
+                    "the first {shared} chunks (~{} tokens) match and ",
+                    thousands(shared_est_tokens)
+                )
+            };
+            format!(
+                "{matched}chunk {shared} ({role}) differs from step {from}'s{swapped}, but {cut} \
+                 had more than {bound} chunks and the rest was not compared, so whether this is \
+                 a new turn or a break, and why, is not known{expired_note}"
+            )
+        }
         _ if new_turn => {
             let how = if edit {
                 format!("carries it edited at its end{swapped}")
@@ -1092,6 +1230,134 @@ mod tests {
             .expect("paired");
         assert_eq!(found.step_index, 0);
         assert_eq!(shared, 2);
+    }
+
+    #[test]
+    fn a_cut_context_settles_only_what_the_cut_cannot_change() {
+        let mut pool = TextPool::new(1 << 20);
+        let cut = |step: usize, messages: Value, pool: &mut TextPool| {
+            let mut context = context(step, messages, pool);
+            context.truncated = true;
+            context
+        };
+        let base = json!([
+            msg("system", "s"),
+            msg("user", "a"),
+            msg("assistant", "b"),
+            msg("user", "c"),
+            msg("assistant", "d")
+        ]);
+        let whole = context(0, base.clone(), &mut pool);
+
+        // A whole predecessor that this cut context starts with: stable,
+        // whatever lies past the cut.
+        let mut longer = base.as_array().expect("list").clone();
+        longer.push(msg("user", "e"));
+        let extended = cut(1, Value::Array(longer), &mut pool);
+        assert_eq!(
+            compare(&whole, &extended, 0, TTL, &pool, 1.0).cause,
+            Cause::Stable
+        );
+
+        // A cut predecessor matched as far as it was split: its rest was
+        // not compared.
+        let short = cut(0, json!([msg("system", "s"), msg("user", "a")]), &mut pool);
+        let matched = compare(&short, &whole, 0, TTL, &pool, 1.0);
+        assert_eq!(matched.cause, Cause::Unknown);
+        assert_eq!((matched.shared_chunks, matched.est_tokens_lost), (2, 0));
+        assert!(matched.divergence.is_none());
+        assert!(
+            matched
+                .explanation
+                .contains("step 0's context had more than 2,000 chunks"),
+            "{}",
+            matched.explanation
+        );
+
+        // A new turn needs nothing of the predecessor to follow — which a
+        // cut context cannot show.
+        let two = context(0, json!([msg("system", "s"), msg("user", "a")]), &mut pool);
+        let turn = json!([msg("system", "s"), msg("user", "a different question")]);
+        let whole_turn = context(1, turn.clone(), &mut pool);
+        assert_eq!(
+            compare(&two, &whole_turn, 0, TTL, &pool, 1.0).cause,
+            Cause::Stable
+        );
+        let cut_turn = cut(1, turn, &mut pool);
+        let unsure = compare(&two, &cut_turn, 0, TTL, &pool, 1.0);
+        assert_eq!(unsure.cause, Cause::Unknown, "{}", unsure.explanation);
+        assert_eq!(unsure.est_tokens_lost, 0);
+        let divergence = unsure.divergence.expect("diverged");
+        assert_eq!(divergence.index, 1, "where it diverged is still said");
+        assert!(
+            unsure
+                .explanation
+                .contains("this context had more than 2,000 chunks"),
+            "{}",
+            unsure.explanation
+        );
+
+        // An insertion rests on what was found here and absent from a whole
+        // predecessor: settled, counting the chunks compared.
+        let inserted = cut(
+            1,
+            json!([
+                msg("system", "s"),
+                msg("user", "RAG doc"),
+                msg("user", "a"),
+                msg("assistant", "b"),
+                msg("user", "c")
+            ]),
+            &mut pool,
+        );
+        let comparison = compare(&whole, &inserted, 0, TTL, &pool, 1.0);
+        assert_eq!(comparison.cause, Cause::VolatileContent);
+        assert_eq!(
+            comparison.divergence.map(|d| d.change),
+            Some(Change::Inserted)
+        );
+        assert!(comparison.est_tokens_lost > 0);
+
+        // A removal rests on an absence from this context, which a cut
+        // cannot prove: the same change read whole is a removal.
+        let pruned = json!([msg("system", "s"), msg("assistant", "b"), msg("user", "c")]);
+        let whole_pruned = context(1, pruned.clone(), &mut pool);
+        assert_eq!(
+            compare(&whole, &whole_pruned, 0, TTL, &pool, 1.0)
+                .divergence
+                .map(|d| d.change),
+            Some(Change::Removed)
+        );
+        let cut_pruned = cut(1, pruned, &mut pool);
+        assert_eq!(
+            compare(&whole, &cut_pruned, 0, TTL, &pool, 1.0).cause,
+            Cause::Unknown
+        );
+
+        // A move is two finds: settled with both contexts cut.
+        let p = cut(
+            0,
+            json!([
+                msg("system", "s"),
+                msg("user", "a"),
+                msg("assistant", "b"),
+                msg("user", "c")
+            ]),
+            &mut pool,
+        );
+        let c = cut(
+            1,
+            json!([
+                msg("system", "s"),
+                msg("assistant", "b"),
+                msg("user", "a"),
+                msg("user", "c")
+            ]),
+            &mut pool,
+        );
+        let moved = compare(&p, &c, 0, TTL, &pool, 1.0);
+        assert_eq!(moved.cause, Cause::Reordered);
+        assert_eq!(moved.divergence.map(|d| d.change), Some(Change::Moved));
     }
 
     #[test]
