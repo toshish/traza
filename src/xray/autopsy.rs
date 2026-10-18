@@ -26,7 +26,10 @@
 //! says: the provider's own rules (minimum cacheable length, where cache
 //! breakpoints sit, TTL refreshes on a hit) are not modelled, so the reported
 //! `cache_read` is shown beside every verdict and a disagreement between the
-//! two is counted rather than explained away.
+//! two is counted rather than explained away — with one exception, made in
+//! the caller: the TTL is an assumption rather than anything recorded, so a
+//! provider that reports serving most of an intact prefix past it outranks
+//! it (`served_past_ttl` in the X-Ray).
 
 use std::collections::{HashMap, HashSet};
 
@@ -201,6 +204,10 @@ pub(crate) struct Context {
     /// The texts this context holds in a [`TextPool`], released when it
     /// leaves the comparison window.
     pub(crate) held: Vec<u128>,
+    /// The provider's count of this call's context (input, cache reads and
+    /// writes, across conventions), when it reported one: what a later call
+    /// that continues this one could have had served from the cache.
+    pub(crate) reported_context: Option<u64>,
 }
 
 impl Context {
@@ -251,7 +258,14 @@ impl Context {
             leading_tools,
             calibratable,
             held: Vec::new(),
+            reported_context: None,
         }
+    }
+
+    /// The same context, with the provider's count of it.
+    pub(crate) fn with_reported(mut self, tokens: Option<u64>) -> Self {
+        self.reported_context = tokens;
+        self
     }
 
     /// The same context, attributed to `agent`.

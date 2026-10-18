@@ -1239,6 +1239,55 @@ fn the_autopsy_names_causes_volatile_tokens_and_cost() {
 }
 
 #[test]
+fn a_cache_the_provider_served_did_not_expire_whatever_ttl_was_assumed() {
+    // The last call of `cache_run` comes ten minutes after its predecessor,
+    // past the assumed five-minute TTL, with its prefix intact. When the
+    // provider reports reading that prefix from its cache, the cache lived
+    // longer than assumed (Claude Code and Codex both run caches longer
+    // than five minutes): nothing was lost, and nothing contradicts the
+    // provider. A real coding-agent store showed this on 15 of 25 such
+    // verdicts of one session, millions of tokens counted lost that the
+    // provider had served.
+    let served = |read: u64| {
+        let mut spans = cache_run("claude-x");
+        let last = spans.last_mut().expect("four calls");
+        last.attributes
+            .insert("gen_ai.usage.cache_read.input_tokens".into(), json!(read));
+        let fixture = TempStore::open("xray-ttl-served", priced_config());
+        fixture.store().ingest_batch(spans).expect("ingests");
+        fixture
+            .store()
+            .cache_autopsy(Some(""), "s3", AutopsyOptions::default())
+            .expect("reads")
+            .expect("found")
+    };
+    // The predecessor reported a 900-token context; 850 of it read now.
+    let autopsy = served(850);
+    let last = &autopsy.steps[3];
+    assert_eq!(last.cause, Cause::Stable, "{}", last.explanation);
+    assert_eq!(last.est_tokens_lost, 0);
+    assert_eq!(last.est_cost_lost_usd, Some(0.0));
+    assert_eq!(last.gap_ns, Some(600 * SECOND));
+    assert!(
+        last.explanation.contains("past the 5 min 0 s TTL assumed")
+            && last.explanation.contains("read 850"),
+        "{}",
+        last.explanation
+    );
+    assert_eq!(autopsy.summary.by_cause["ttl_expired"], 0);
+    assert_eq!(autopsy.summary.breaks, 1, "only the timestamp edit");
+    assert_eq!(
+        autopsy.summary.disagreements, 1,
+        "only the stable call with no read: the served one agrees"
+    );
+    // A read of a small part — what a longer-lived system prompt alone
+    // would be — leaves the conversation's prefix expired.
+    let autopsy = served(100);
+    assert_eq!(autopsy.steps[3].cause, Cause::TtlExpired);
+    assert!(autopsy.steps[3].est_tokens_lost > 0);
+}
+
+#[test]
 fn an_unpriced_model_reports_tokens_but_no_money() {
     let fixture = TempStore::open("xray-unpriced", priced_config());
     fixture

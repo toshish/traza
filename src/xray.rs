@@ -1291,7 +1291,9 @@ fn cache_step(store: &Store, verdict: Verdict<'_>, ttl_ns: u64, pool: &TextPool)
                 .calibratable
                 .then(|| calibration(llm, est_tokens))
                 .flatten();
-            autopsy::compare(previous, context, gap, ttl_ns, pool, applied.unwrap_or(1.0))
+            let compared =
+                autopsy::compare(previous, context, gap, ttl_ns, pool, applied.unwrap_or(1.0));
+            served_past_ttl(compared, llm, previous.reported_context)
         }
     };
     let est_tokens_lost = comparison.est_tokens_lost;
@@ -1323,6 +1325,51 @@ fn cache_step(store: &Store, verdict: Verdict<'_>, ttl_ns: u64, pool: &TextPool)
         est_tokens_lost,
         calibration: applied,
         est_cost_lost_usd,
+    }
+}
+
+/// Of what the predecessor reported as its context, the share this call
+/// must report reading from the cache for an expired-TTL verdict to yield
+/// to the provider.
+const SERVED_SHARE: f64 = 0.5;
+
+/// An expired-TTL verdict the provider's own report refutes, made `stable`.
+///
+/// The TTL is an assumption (`ttl_seconds`, five minutes unless asked), not
+/// something a trace records — and real producers run longer caches: Claude
+/// Code's and Codex's outlive five minutes. When the predecessor's context
+/// was carried intact and this call reports reading at least
+/// [`SERVED_SHARE`] of what the predecessor reported as its context, both
+/// counts from the provider's own tokenizer, the cache plainly held: the
+/// prefix was served and nothing was lost. A smaller read — a long-lived
+/// system prompt alone, say — leaves the verdict standing. Only the TTL
+/// verdict yields: what the recording shows changed is never overruled.
+fn served_past_ttl(
+    comparison: autopsy::Comparison,
+    llm: &LlmFacts,
+    reported: Option<u64>,
+) -> autopsy::Comparison {
+    let (Some(read), Some(reported)) = (llm.cache_read_tokens, reported) else {
+        return comparison;
+    };
+    if comparison.cause != Cause::TtlExpired
+        || reported == 0
+        || (read as f64) < reported as f64 * SERVED_SHARE
+    {
+        return comparison;
+    }
+    let explanation = format!(
+        "{} assumed — yet the provider read {} tokens from its cache, of the {} the previous \
+         call reported: the cache outlived the assumed TTL, and the prefix was served",
+        comparison.explanation,
+        autopsy::thousands(read),
+        autopsy::thousands(reported)
+    );
+    autopsy::Comparison {
+        cause: Cause::Stable,
+        est_tokens_lost: 0,
+        explanation,
+        ..comparison
     }
 }
 
@@ -1907,7 +1954,8 @@ impl Store {
                             call.context_unavailable(),
                         )
                         .with_agent(agents.of(entry.span))
-                        .with_conversation(conversation_of(entry.span));
+                        .with_conversation(conversation_of(entry.span))
+                        .with_reported(self.facts(entry.span).context_tokens());
                         context.held = pool.hold(&call.context.list);
                         recent.push_back(context);
                     }
@@ -2107,7 +2155,8 @@ impl Store {
             context_unavailable,
         )
         .with_agent(agents.of(&span))
-        .with_conversation(conversation_of(&span));
+        .with_conversation(conversation_of(&span))
+        .with_reported(llm.context_tokens());
         let found = autopsy::predecessor(&current, recent.iter(), &pool);
         let mut previous = None;
         let mut dropped = Vec::new();
@@ -2364,6 +2413,7 @@ impl Store {
             let read = threads.fold(entry.span, read);
             read_left -= budget.spent();
             unresolved |= budget.unresolved;
+            let llm = self.facts(entry.span);
             let mut context = Context::new(
                 entry.step.index,
                 &entry.span.tenant,
@@ -2373,9 +2423,9 @@ impl Store {
                 read.context_unavailable(),
             )
             .with_agent(agents.of(entry.span))
-            .with_conversation(conversation);
+            .with_conversation(conversation)
+            .with_reported(llm.context_tokens());
             context.held = pool.hold(&read.context.list);
-            let llm = self.facts(entry.span);
             let seen_before = !tenants_seen.insert(entry.span.tenant.as_str());
             let found = autopsy::predecessor(&context, recent.iter(), &pool);
             steps.push(cache_step(

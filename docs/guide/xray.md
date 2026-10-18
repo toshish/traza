@@ -411,7 +411,7 @@ identity; `prefix_chunks_shared` is how far they agree.
 |---|---|---|
 | `stable` | The predecessor's whole context is an unchanged prefix of this one, within the TTL | — |
 | | A **new turn**: everything up to the predecessor's last chunk is unchanged, this call puts new content (or an edit at its very end) in that chunk's place, and nothing the predecessor had follows — a stateless pipeline's next input, a replaced last message. The cache served all it could | `replaced` or `edited` |
-| `ttl_expired` | The prefix is intact (or a new turn), but the TTL had passed since the predecessor began | — or `replaced` / `edited` |
+| `ttl_expired` | The prefix is intact (or a new turn), but the TTL had passed since the predecessor began — unless the provider reports having served it (below), which makes the call `stable` | — or `replaced` / `edited` |
 | `volatile_content` | A chunk inside the prefix changed in place — the same role and kind, at most a tenth of its text differing, verified on both texts — with content the predecessor had after the change | `edited` |
 | | A chunk inside the prefix was swapped for different content while what followed it survives (or its text was not kept, so an edit could not be confirmed) | `replaced` |
 | | A new chunk sits ahead of content the predecessor already had | `inserted` |
@@ -443,6 +443,17 @@ low end of OpenAI's — and `ttl_seconds=` sets it per request (up to a day) for
 deployments on longer-lived caches. `gap_ns` is the time since the predecessor
 *began*, which is when its prompt entered the cache. A structural divergence
 outranks an expired TTL as the cause; the explanation mentions both.
+
+The TTL is an assumption; the provider's report is evidence. When the prefix
+was carried intact past the TTL and the call reports reading at least half of
+what its predecessor reported as its whole context from the cache — both
+counts in the provider's own tokens — the cache plainly outlived the
+assumption: the verdict is `stable`, nothing is counted lost, and the
+explanation says the cache outlived the assumed TTL. Real producers run longer
+caches than five minutes: on one real Claude Code session, 15 of the 25 calls
+a five-minute TTL called expired had read their whole prefix from the cache.
+A smaller read (a long-lived system prompt alone, say) leaves `ttl_expired`
+standing, and no structural verdict ever yields to a reported count.
 
 ### The volatile token
 
@@ -489,9 +500,11 @@ so a total is never silently an undercount.
 every verdict. `summary.disagreements` counts calls where the two contradict
 each other: a `stable` prefix with no cache read reported (the provider did not
 cache — no cache breakpoint set, or a prefix below its minimum cacheable
-length), or a read reported where nothing could have been served (a TTL
-longer than the one assumed). The autopsy does not explain these away; it
-counts them, and `summary.disagreement_advice` lists what to check.
+length), or a read reported where nothing could have been served. The
+autopsy does not explain these away; it counts them, and
+`summary.disagreement_advice` lists what to check. The one report it acts on
+is a read of most of an intact prefix past the assumed TTL (above): that call
+is `stable`, and agrees with the provider.
 
 ## Pricing cached tokens
 

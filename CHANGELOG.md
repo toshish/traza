@@ -521,6 +521,17 @@ before deploying over an existing setup.
   now computed when a pattern first reads it, and recall summarises runs
   from their step signatures alone: searches take 2.4–3.6 s, findings 4.1 s
   and recall 1.2–3.4 s on the same store (release build, a laptop).
+- **The Cache Autopsy believes a provider that served the prefix.** An
+  intact prefix past the assumed five-minute TTL was always `ttl_expired`,
+  its whole prefix counted lost, even when the provider reported reading it
+  from cache — counted as a disagreement but kept in every total. Claude
+  Code runs longer caches: on one real session 24 of its 25 expired
+  verdicts reported a cache read, 15 of them of the whole prefix, and its
+  "9.2 million tokens lost" were two-thirds served. A call that reports
+  reading at least half of what its predecessor reported as its context is
+  now `stable`, nothing lost, its explanation saying the cache outlived the
+  assumed TTL; a smaller read (a long-lived system prompt alone) leaves the
+  verdict standing, and no structural verdict yields to a reported count.
 
 ### Upgrade
 
