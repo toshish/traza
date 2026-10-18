@@ -673,8 +673,9 @@ a metered llm.cost_usd always wins)] \
 [--mcp-allowed-origin ORIGIN (repeatable; browser origins allowed to drive /v1/mcp \
 besides loopback)] \
 [--fuse-max-cost-usd F] [--fuse-max-tokens N] [--fuse-max-steps N] \
-[--fuse-max-duration-seconds N] [--fuse-max-repeats N (default 12)] [--fuse-max-error-streak N] \
-[--fuse-max-handoff-cycles N] \
+[--fuse-max-duration-seconds N] [--fuse-max-repeats N (default 12)] \
+[--fuse-repeat-window-steps N (the steps max-repeats counts over; default 50, at most 1000)] \
+[--fuse-max-error-streak N] [--fuse-max-handoff-cycles N] \
 (the global default run-fuse policy; 0 removes a limit) \
 [--fuse-action stop|warn (default warn)] [--fuse-max-runs N (live runs kept; default 100000)] \
 [--no-fuses (do not observe runs; every /v1/fuses route answers 409)] \
@@ -1039,6 +1040,17 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 }
                 fuses.limits.max_repeats = (limit > 0).then_some(limit);
             }
+            "--fuse-repeat-window-steps" => {
+                i += 1;
+                let window = number(i, "--fuse-repeat-window-steps")?;
+                if window == 0 || window > traza::guard::MAX_REPEAT_WINDOW_STEPS {
+                    return Err(format!(
+                        "--fuse-repeat-window-steps must be 1 to {}",
+                        traza::guard::MAX_REPEAT_WINDOW_STEPS
+                    ));
+                }
+                fuses.limits.repeat_window_steps = Some(window);
+            }
             "--fuse-max-error-streak" => {
                 i += 1;
                 let limit = number(i, "--fuse-max-error-streak")?;
@@ -1141,6 +1153,17 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     // Live runs keep their behaviour paths for foresight, which reads only
     // cached Fate Maps: with the cache off, nothing would read them.
     fuses.live_paths = !fate.cache_ttl.is_zero();
+    // A window narrower than the repeat limit could never trip it.
+    if let (Some(window), Some(repeats)) =
+        (fuses.limits.repeat_window_steps, fuses.limits.max_repeats)
+    {
+        if window < repeats {
+            return Err(format!(
+                "--fuse-repeat-window-steps {window} cannot hold --fuse-max-repeats {repeats} \
+                 repeats; widen the window to at least {repeats} steps"
+            ));
+        }
+    }
 
     Ok(Some(Options {
         data_dir,

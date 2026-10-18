@@ -35,6 +35,18 @@ pub const GLOBAL_POLICY_NAME: &str = "global";
 /// agent reaches before anyone notices.
 pub const DEFAULT_MAX_REPEATS: u64 = 12;
 
+/// The steps `max_repeats` counts over when a policy names no
+/// `repeat_window_steps`: a step fingerprint repeats when it occurs that many
+/// times among the run's last 50 steps. A loop repeats within a few steps of
+/// itself; a long interactive session that takes the same screenshot once an
+/// hour for three days does not, and is not looping.
+pub const DEFAULT_REPEAT_WINDOW_STEPS: u64 = 50;
+
+/// The widest `repeat_window_steps` a policy may set. A run keeps at most
+/// this many of its latest steps for the count, so the bound is what keeps
+/// that memory per run small.
+pub const MAX_REPEAT_WINDOW_STEPS: u64 = 1_000;
+
 /// Default ceiling on live runs held in memory (`--fuse-max-runs`).
 pub const DEFAULT_MAX_RUNS: usize = 100_000;
 
@@ -105,9 +117,16 @@ pub struct Limits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_duration_seconds: Option<u64>,
     /// Ceiling on how often one step fingerprint (same call, same input) may
-    /// occur. Trips at `count >= max_repeats`.
+    /// occur within the run's last `repeat_window_steps` steps. Trips at
+    /// `count >= max_repeats`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_repeats: Option<u64>,
+    /// The steps `max_repeats` counts over: the run's latest this many steps
+    /// (default [`DEFAULT_REPEAT_WINDOW_STEPS`], at most
+    /// [`MAX_REPEAT_WINDOW_STEPS`], and at least `max_repeats` when both are
+    /// set — a narrower window could never hold the repeats).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_window_steps: Option<u64>,
     /// Ceiling on consecutive failed steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_error_streak: Option<u64>,
@@ -141,6 +160,14 @@ impl Limits {
         *self == Self::default()
     }
 
+    /// The steps `max_repeats` counts over: `repeat_window_steps`, else
+    /// [`DEFAULT_REPEAT_WINDOW_STEPS`].
+    pub fn repeat_window(&self) -> usize {
+        self.repeat_window_steps
+            .unwrap_or(DEFAULT_REPEAT_WINDOW_STEPS)
+            .clamp(1, MAX_REPEAT_WINDOW_STEPS) as usize
+    }
+
     /// These limits with every limit `grant` sets replacing this one's.
     pub fn overlaid(&self, grant: &Limits) -> Limits {
         Limits {
@@ -151,6 +178,7 @@ impl Limits {
             max_tool_calls: grant.max_tool_calls.or(self.max_tool_calls),
             max_duration_seconds: grant.max_duration_seconds.or(self.max_duration_seconds),
             max_repeats: grant.max_repeats.or(self.max_repeats),
+            repeat_window_steps: grant.repeat_window_steps.or(self.repeat_window_steps),
             max_error_streak: grant.max_error_streak.or(self.max_error_streak),
             min_success_odds: grant.min_success_odds.or(self.min_success_odds),
             foresight_min_support: grant.foresight_min_support.or(self.foresight_min_support),
@@ -184,6 +212,7 @@ impl Limits {
             ("max_tool_calls", self.max_tool_calls),
             ("max_duration_seconds", self.max_duration_seconds),
             ("max_repeats", self.max_repeats),
+            ("repeat_window_steps", self.repeat_window_steps),
             ("max_error_streak", self.max_error_streak),
             ("max_handoff_cycles", self.max_handoff_cycles),
         ];
@@ -198,6 +227,20 @@ impl Limits {
             return Err(Error::Invalid(format!(
                 "{what}: max_repeats must be at least 2 — a single occurrence is not a repeat"
             )));
+        }
+        if let Some(window) = self.repeat_window_steps {
+            if window > MAX_REPEAT_WINDOW_STEPS {
+                return Err(Error::Invalid(format!(
+                    "{what}: repeat_window_steps must be at most {MAX_REPEAT_WINDOW_STEPS} (got \
+                     {window})"
+                )));
+            }
+            if let Some(repeats) = self.max_repeats.filter(|repeats| window < *repeats) {
+                return Err(Error::Invalid(format!(
+                    "{what}: repeat_window_steps {window} cannot hold max_repeats {repeats} \
+                     repeats; widen the window to at least {repeats} steps"
+                )));
+            }
         }
         Ok(())
     }
@@ -493,6 +536,18 @@ mod tests {
                 "max_cost_usd must be a positive",
             ),
             (json!({"max_repeats": 1}), "at least 2"),
+            (
+                json!({"repeat_window_steps": 0}),
+                "repeat_window_steps must be positive",
+            ),
+            (
+                json!({"repeat_window_steps": 1001}),
+                "repeat_window_steps must be at most 1000",
+            ),
+            (
+                json!({"max_repeats": 12, "repeat_window_steps": 8}),
+                "cannot hold max_repeats 12",
+            ),
         ] {
             let parsed: Limits = serde_json::from_value(limits).expect("parses");
             match parsed.validate("test") {
@@ -534,6 +589,17 @@ mod tests {
         let fine: Limits =
             serde_json::from_value(json!({"max_repeats": 2, "max_cost_usd": 0.5})).expect("parses");
         assert!(fine.validate("test").is_ok());
+        assert_eq!(fine.repeat_window(), 50, "the default window");
+        let windowed: Limits =
+            serde_json::from_value(json!({"max_repeats": 5, "repeat_window_steps": 5}))
+                .expect("parses");
+        assert!(windowed.validate("test").is_ok());
+        assert_eq!(windowed.repeat_window(), 5);
+        let widened = windowed.overlaid(&Limits {
+            repeat_window_steps: Some(200),
+            ..Limits::default()
+        });
+        assert_eq!(widened.repeat_window(), 200, "a grant may widen the window");
     }
 
     #[test]

@@ -162,7 +162,10 @@ class SpanRef:
 class TopRepeat:
     #: ``kind:name#<16 hex of the input digest>``.
     fingerprint: Optional[str] = None
+    #: Occurrences among the run's last ``window_steps`` steps.
     count: Optional[int] = None
+    #: The steps counted over: the policy's ``repeat_window_steps``.
+    window_steps: Optional[int] = None
     example: Optional[SpanRef] = None
 
 
@@ -213,6 +216,8 @@ class Limits:
     max_tool_calls: Optional[int] = None
     max_duration_seconds: Optional[int] = None
     max_repeats: Optional[int] = None
+    #: The steps ``max_repeats`` counts over (the server's default is 50).
+    repeat_window_steps: Optional[int] = None
     max_error_streak: Optional[int] = None
     max_handoff_cycles: Optional[int] = None
 

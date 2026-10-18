@@ -241,7 +241,7 @@ most severe verdict in the batch:
 HTTP/1.1 200 OK
 Traza-Fuse: stop; run=sess-7f3a
 
-{"accepted":1,"durability":"wal","fuses":[{"reasons":["max_repeats 4 reached: tool:search_orders#465a6bab9a1c447d repeated 4 times"],"run":"sess-7f3a","tenant":"","verdict":"stop"}]}
+{"accepted":1,"durability":"wal","fuses":[{"reasons":["max_repeats 4 reached: tool:search_orders#465a6bab9a1c447d repeated 4 times in the last 50 steps"],"run":"sess-7f3a","tenant":"","verdict":"stop"}]}
 ```
 
 `fuses` and the header are absent when nothing is to be reported. The run id
@@ -2613,7 +2613,7 @@ fields are `400`.
 | `verdict` | string | `continue`, `warn` or `stop` |
 | `reasons` | string[] | For a stop, the reasons it tripped with; otherwise the limits reached or approached now. Empty for `continue` |
 | `policy` | string | The policy the run is held to; `global` for the server default |
-| `usage` | object | `steps`, `llm_calls`, `tool_calls`, `tokens`, `cost_usd`, `errors`, `error_streak`, `duration_ns`, `top_repeat` (`{fingerprint, count, example: {trace_id, span_id}}` or `null`), and — only once control has returned to a named agent since the last reset — `top_handoff_cycle` (`{agents: [returned_to, returned_from], count}`; see [steer](steer.md#handoff-cycles-as-a-fuse-limit)) |
+| `usage` | object | `steps`, `llm_calls`, `tool_calls`, `tokens`, `cost_usd`, `errors`, `error_streak`, `duration_ns`, `top_repeat` (`{fingerprint, count, window_steps, example: {trace_id, span_id}}` — the most frequent step fingerprint among the run's last `window_steps` steps, its policy's `repeat_window_steps` — or `null` when none occurred twice there), and — only once control has returned to a named agent since the last reset — `top_handoff_cycle` (`{agents: [returned_to, returned_from], count}`; see [steer](steer.md#handoff-cycles-as-a-fuse-limit)) |
 | `limits` | object | The limits in force: the policy's, with the run's grant over them. Absent limits are unbounded |
 | `grant` | object \| null | Limits raised for this run by resets |
 | `tripped_at_ns` | integer \| null | When the stop tripped |
@@ -2682,7 +2682,7 @@ curl http://127.0.0.1:8080/v1/fuses/runs/sess-7f3a
 ```
 
 ```json
-{"evidence":[{"span_id":"r2","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],"grant":null,"limits":{"max_cost_usd":2.0,"max_error_streak":3,"max_repeats":4,"max_steps":40},"policy":"support","reasons":["max_repeats 4 reached: tool:search_orders#465a6bab9a1c447d repeated 4 times"],"run":"sess-7f3a","source":"rebuilt","tenant":"","tripped_at_ns":1792062221822334000,"tripped_by":"policy","usage":{"cost_usd":0.42,"duration_ns":4250000000,"error_streak":0,"errors":0,"llm_calls":1,"steps":5,"tokens":1920,"tool_calls":4,"top_repeat":{"count":4,"example":{"span_id":"r2","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"fingerprint":"tool:search_orders#465a6bab9a1c447d"}},"verdict":"stop"}
+{"evidence":[{"span_id":"r2","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],"grant":null,"limits":{"max_cost_usd":2.0,"max_error_streak":3,"max_repeats":4,"max_steps":40},"policy":"support","reasons":["max_repeats 4 reached: tool:search_orders#465a6bab9a1c447d repeated 4 times in the last 50 steps"],"run":"sess-7f3a","source":"rebuilt","tenant":"","tripped_at_ns":1792062221822334000,"tripped_by":"policy","usage":{"cost_usd":0.42,"duration_ns":4250000000,"error_streak":0,"errors":0,"llm_calls":1,"steps":5,"tokens":1920,"tool_calls":4,"top_repeat":{"count":4,"example":{"span_id":"r2","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"fingerprint":"tool:search_orders#465a6bab9a1c447d","window_steps":50}},"verdict":"stop"}
 ```
 
 **Errors.** As for the check.
@@ -2762,7 +2762,7 @@ its `id` and `created_at_ns`). Live runs of the tenant are re-judged at once.
 | `name` | string | 1–64 bytes, unique within the tenant. `default` is the tenant's fallback; `global` is reserved |
 | `tenant` | string | Optional; a bound credential is forced to its own |
 | `match` | object | `{"service": string}` (1–256 bytes) — runs whose first span, by start time, came from that service. Required unless the name is `default`, which must not have one |
-| `limits` | object | Any of `max_cost_usd`, `max_tokens`, `max_steps`, `max_llm_calls`, `max_tool_calls`, `max_duration_seconds`, `max_repeats`, `max_error_streak`, `max_handoff_cycles` ([handoff cycles](steer.md#handoff-cycles-as-a-fuse-limit)). Each positive; `max_repeats` at least 2. Absent is unbounded, and nothing is inherited from `default` or `global`. Also the predictive limits `min_success_odds` (in `(0, 1]`), `foresight_min_support` (default 30) and `foresight_after_steps` (default 3), evaluated on the check and verdict queries only — the last two require the first ([predictive fuses](foresight.md#predictive-fuses)) |
+| `limits` | object | Any of `max_cost_usd`, `max_tokens`, `max_steps`, `max_llm_calls`, `max_tool_calls`, `max_duration_seconds`, `max_repeats`, `max_error_streak`, `max_handoff_cycles` ([handoff cycles](steer.md#handoff-cycles-as-a-fuse-limit)). Each positive; `max_repeats` at least 2, counted among the run's last `repeat_window_steps` steps (default 50, at most 1,000, at least `max_repeats` when both are set — see [repeats](guard.md#repeats-count-within-a-window)). Absent is unbounded, and nothing is inherited from `default` or `global`. Also the predictive limits `min_success_odds` (in `(0, 1]`), `foresight_min_support` (default 30) and `foresight_after_steps` (default 3), evaluated on the check and verdict queries only — the last two require the first ([predictive fuses](foresight.md#predictive-fuses)) |
 | `action` | string | `stop` or `warn` (default `warn`) |
 
 ```sh
@@ -2811,7 +2811,7 @@ curl 'http://127.0.0.1:8080/v1/fuses/events?wait_ms=0'
 ```
 
 ```json
-{"events":[{"at_ns":1792062221822334000,"cursor":"1792062221423179000.1","kind":"stop","policy":"support","reasons":["max_repeats 4 reached: tool:search_orders#465a6bab9a1c447d repeated 4 times"],"run":"sess-7f3a","tenant":""},{"at_ns":1792062221847207000,"cursor":"1792062221423179000.2","kind":"warn","policy":"support","reasons":["max_cost_usd 2 at 85%: $1.7 spent"],"run":"sess-9c21","tenant":""},{"at_ns":1792062221850690000,"cursor":"1792062221423179000.3","kind":"reset","policy":"support","reasons":["reset with grant {\"max_repeats\":8}"],"run":"sess-7f3a","tenant":""},{"at_ns":1792062221860163000,"cursor":"1792062221423179000.4","kind":"manual_stop","policy":"support","reasons":["manually tripped: customer escalated; take over by hand"],"run":"sess-9c21","tenant":""}],"next":"1792062221423179000.4"}
+{"events":[{"at_ns":1792062221822334000,"cursor":"1792062221423179000.1","kind":"stop","policy":"support","reasons":["max_repeats 4 reached: tool:search_orders#465a6bab9a1c447d repeated 4 times in the last 50 steps"],"run":"sess-7f3a","tenant":""},{"at_ns":1792062221847207000,"cursor":"1792062221423179000.2","kind":"warn","policy":"support","reasons":["max_cost_usd 2 at 85%: $1.7 spent"],"run":"sess-9c21","tenant":""},{"at_ns":1792062221850690000,"cursor":"1792062221423179000.3","kind":"reset","policy":"support","reasons":["reset with grant {\"max_repeats\":8}"],"run":"sess-7f3a","tenant":""},{"at_ns":1792062221860163000,"cursor":"1792062221423179000.4","kind":"manual_stop","policy":"support","reasons":["manually tripped: customer escalated; take over by hand"],"run":"sess-9c21","tenant":""}],"next":"1792062221423179000.4"}
 ```
 
 `kind` is `warn` (a run entered `warn`, or a `warn` policy's limit was

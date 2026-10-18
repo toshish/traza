@@ -73,7 +73,7 @@ in the body and in a header:
 HTTP/1.1 200 OK
 Traza-Fuse: stop; run=sess-7f3a
 
-{"accepted":1,"durability":"wal","fuses":[{"reasons":["max_repeats 4 reached: tool:search_orders#465a6bab9a1c447d repeated 4 times"],"run":"sess-7f3a","tenant":"","verdict":"stop"}]}
+{"accepted":1,"durability":"wal","fuses":[{"reasons":["max_repeats 4 reached: tool:search_orders#465a6bab9a1c447d repeated 4 times in the last 50 steps"],"run":"sess-7f3a","tenant":"","verdict":"stop"}]}
 ```
 
 Before its next step, another run of the same service asks the gate, with an
@@ -180,14 +180,42 @@ A policy is a name, which runs it is for, a set of limits, and an action:
 | `max_llm_calls` | `llm_calls >= limit` |
 | `max_tool_calls` | `tool_calls >= limit` |
 | `max_duration_seconds` | `duration_ns >= limit × 10⁹` |
-| `max_repeats` | `top_repeat.count >= limit` |
+| `max_repeats` | `top_repeat.count >= limit`: one step fingerprint occurred that often among the run's last `repeat_window_steps` steps — see [repeats](#repeats-count-within-a-window) |
 | `max_error_streak` | `error_streak >= limit` |
 | `min_success_odds` | Runs that took this run's path succeeded so rarely that the 95% interval's upper bound is below the limit — see [predictive limits](#predictive-limits) |
 | `max_handoff_cycles` | `top_handoff_cycle.count >= limit` |
 
 Every limit is optional and an absent one is unbounded. A present one must be
 positive, and `max_repeats` at least 2 — one occurrence is not a repeat.
-`action` is `stop` or `warn` (default `warn`, matching `--fuse-action`).
+`repeat_window_steps` (default 50, at most 1,000) is not a limit but the
+window `max_repeats` counts over, and must be at least `max_repeats` when both
+are set. `action` is `stop` or `warn` (default `warn`, matching `--fuse-action`).
+
+### Repeats count within a window
+
+A step's **fingerprint** is `kind:name#hash` of its input: the same call with
+the same input. `max_repeats` counts how often one fingerprint occurs among
+the run's **last `repeat_window_steps` steps** (default 50), in step order
+(start time, then span), since its last reset — not over the whole run. A
+loop repeats within a few steps of itself and trips; a long interactive
+session that takes the same screenshot once an hour for three days spreads
+its repeats over thousands of steps and never does, however long it runs.
+Widen the window (up to 1,000 steps) to catch slower loops; `usage.top_repeat`
+reports the count, the fingerprint, its latest occurrence and the
+`window_steps` it was counted over, and the reason says so:
+`max_repeats 4 reached: tool:search_orders#465a6bab9a1c447d repeated 4 times
+in the last 50 steps`.
+
+A `warn` is about now: once the loop's steps leave the window the warning
+clears. A `stop` latches where the window first filled, and live state and a
+rebuild agree on it whatever order the spans arrived in: a fold of spans that
+arrive in step order judges each step's window as it lands, exactly as a
+replay of the store does; a batch that changes the run any other way — a
+span starting before the latest one, a re-sent span that moved, changed its
+input or stopped being a step, two steps starting at the same instant — is
+judged by the fullest window anywhere in the run once the batch is folded,
+which is what a replay latches on. Such a stop is timed by the batch rather
+than by the step that filled the window.
 
 **Which policy a run gets.** Exactly one, resolved at every evaluation, so an
 edit applies to live runs at once:
@@ -218,7 +246,8 @@ so one tenant's policy count must not reach into every tenant's ingest.
 holds its runs to that alone; the global policy's repeat limit does not
 reappear underneath it. Set every limit you want on the policy you mean.
 
-**Out of the box** the global policy warns on 12 repeats and nothing else:
+**Out of the box** the global policy warns on 12 repeats within 50 steps and
+nothing else:
 the one limit that is safe without knowing the workload, and a warning,
 because a default that stopped someone's agent would be a decision nobody
 made.
@@ -301,9 +330,11 @@ never dropped to make room.
 Live usage is an in-memory cache over the store, folded from every
 acknowledged batch on the ingest path. It is bounded, with no exceptions: at
 most `--fuse-max-runs` live runs (default 100,000, shared by every tenant),
-at most 1,000,000 span contributions across them (each a 40-byte record under
+at most 1,000,000 span contributions across them (each a 48-byte record under
 an 8-byte key, before hash-table overhead; the steps of the runs' behaviour
-paths count against it too), least recently active evicted
+paths count against it too — and each run also keeps its latest steps, at
+most 1,000 and never more than it has, 24 bytes each, for the repeat
+window), least recently active evicted
 first, and any run idle for six hours evicted. A run is followed from its
 **first step**: a trace of HTTP and database spans costs the observer a read
 of each span and holds no state. A run id longer than 1,024 bytes is not

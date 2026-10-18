@@ -109,7 +109,7 @@ What a refusal looks like, from a real run where a support agent called
 stop policy:
 
 ```text
-FuseTripped: run 'sess-7f3a' is stopped: max_repeats 4 reached: tool:search_orders#54985dc3c12fada7 repeated 4 times
+FuseTripped: run 'sess-7f3a' is stopped: max_repeats 4 reached: tool:search_orders#54985dc3c12fada7 repeated 4 times in the last 50 steps
 ```
 
 `check()` is the same question without the exception — a `stop` there is an

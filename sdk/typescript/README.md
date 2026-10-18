@@ -118,7 +118,7 @@ A refusal, from a real run where a support agent called `search_orders` with
 the same arguments four times under a `max_repeats: 4` stop policy:
 
 ```text
-FuseTripped: run "sess-7f3a" is stopped: max_repeats 4 reached: tool:search_orders#54985dc3c12fada7 repeated 4 times
+FuseTripped: run "sess-7f3a" is stopped: max_repeats 4 reached: tool:search_orders#54985dc3c12fada7 repeated 4 times in the last 50 steps
 ```
 
 `check()` asks the same question without throwing — a `stop` there is an

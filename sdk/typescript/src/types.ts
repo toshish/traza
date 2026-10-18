@@ -80,7 +80,8 @@ export interface RunUsage {
   error_streak: number;
   duration_ns: Nanos;
   /** The step fingerprint seen most often, or `null`. */
-  top_repeat: { fingerprint: string; count: number; example: SpanRef } | null;
+  /** The most frequent step fingerprint among the run's last `window_steps` steps. */
+  top_repeat: { fingerprint: string; count: number; window_steps: number; example: SpanRef } | null;
   /**
    * The most frequent handoff cycle since the last reset — control
    * returning to `agents[0]` straight from `agents[1]` — absent when there
@@ -98,6 +99,8 @@ export interface Limits {
   max_tool_calls?: number;
   max_duration_seconds?: number;
   max_repeats?: number;
+  /** The steps `max_repeats` counts over (the server's default is 50). */
+  repeat_window_steps?: number;
   max_error_streak?: number;
   max_handoff_cycles?: number;
 }

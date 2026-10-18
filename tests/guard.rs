@@ -146,7 +146,7 @@ fn each_limit_stops_the_run_that_reaches_it() {
     let reason = body["fuses"][0]["reasons"][0].as_str().unwrap_or_default();
     assert!(
         reason.starts_with("max_repeats 3 reached: tool:search#")
-            && reason.ends_with(" repeated 3 times"),
+            && reason.ends_with(" repeated 3 times in the last 50 steps"),
         "{body}"
     );
 
@@ -984,4 +984,126 @@ fn mcp_check_run_guard_reports_the_verdict_inside_the_telemetry_frame() {
         frame.contains("run m1") && frame.contains("max_steps 1 reached"),
         "{text}"
     );
+}
+
+/// `run`'s steps: one `screenshot` call with the same input every `gap`
+/// steps, `count` times, and distinct work between.
+fn spread_screenshots(run: &str, count: usize, gap: usize) -> Value {
+    let mut spans = Vec::new();
+    for index in 0..count * gap {
+        let start = 1_000 + 1_000 * index as u64;
+        spans.push(if index % gap == 0 {
+            tool_step(run, &format!("s{index}"), "screenshot", "{}", start)
+        } else {
+            tool_step(
+                run,
+                &format!("s{index}"),
+                "click",
+                &format!("{{\"at\":{index}}}"),
+                start,
+            )
+        });
+    }
+    Value::Array(spans)
+}
+
+#[test]
+fn repeats_count_within_a_window_of_steps_so_a_long_session_is_not_a_loop() {
+    // The global default: warn at 12 repeats within 50 steps.
+    let server = Server::spawn(&[]);
+    // A three-day interactive session: the same screenshot 32 times, every
+    // 60 steps. Never 12 within 50 steps: no warning, however long it runs.
+    let (status, header, body) = ingest(&server, &spread_screenshots("long", 32, 60), &[]);
+    assert_eq!(status, 200, "{body}");
+    assert!(header.is_none() && body.get("fuses").is_none(), "{body}");
+    let doc = verdict(&server, "/v1/fuses/runs/long", &[]);
+    assert_eq!(doc["verdict"], json!("continue"), "{doc}");
+    assert_eq!(doc["usage"]["top_repeat"], Value::Null, "{doc}");
+    // A tight loop still trips: twelve identical calls in a row.
+    let looping: Vec<Value> = (0..12)
+        .map(|index| tool_step("tight", &format!("l{index}"), "search", "{}", index))
+        .collect();
+    let (_, header, body) = ingest(&server, &Value::Array(looping), &[]);
+    assert_eq!(header.as_deref(), Some("warn; run=tight"), "{body}");
+    let doc = verdict(&server, "/v1/fuses/runs/tight", &[]);
+    assert_eq!(doc["usage"]["top_repeat"]["count"], json!(12), "{doc}");
+    assert_eq!(
+        doc["usage"]["top_repeat"]["window_steps"],
+        json!(50),
+        "{doc}"
+    );
+    assert!(
+        reasons(&doc)[0].ends_with("repeated 12 times in the last 50 steps"),
+        "{doc}"
+    );
+
+    // A policy may widen the window; the long session then loops.
+    let (status, policy) = server.json(
+        "POST",
+        "/v1/fuses/policies",
+        Some(&json!({"name": "default", "action": "stop",
+                     "limits": {"max_repeats": 12, "repeat_window_steps": 1000}})),
+        &[],
+    );
+    assert_eq!(status, 200, "{policy}");
+    let (_, header, _) = ingest(&server, &spread_screenshots("wide", 32, 60), &[]);
+    assert_eq!(header.as_deref(), Some("stop; run=wide"));
+    // A window that could never hold the repeats is refused.
+    let (status, error) = server.json(
+        "POST",
+        "/v1/fuses/policies",
+        Some(&json!({"name": "default",
+                     "limits": {"max_repeats": 12, "repeat_window_steps": 8}})),
+        &[],
+    );
+    assert_eq!(status, 400, "{error}");
+
+    // The flag sets the global default's window.
+    let narrow = Server::spawn(&["--fuse-max-repeats", "3", "--fuse-repeat-window-steps", "5"]);
+    let (_, header, _) = ingest(&narrow, &spread_screenshots("spread", 6, 3), &[]);
+    assert!(header.is_none(), "every third step is never three in five");
+    // Every other step, ending on one: three in the last five.
+    let mut dense = spread_screenshots("dense", 3, 2);
+    dense.as_array_mut().expect("steps").pop();
+    let (_, header, _) = ingest(&narrow, &dense, &[]);
+    assert_eq!(header.as_deref(), Some("warn; run=dense"));
+}
+
+#[test]
+fn a_late_step_that_completes_a_loop_in_its_window_stops_live_as_a_rebuild_does() {
+    let mut server = Server::spawn(&[
+        "--fuse-max-repeats",
+        "3",
+        "--fuse-repeat-window-steps",
+        "4",
+        "--fuse-action",
+        "stop",
+    ]);
+    // a, x, a, y, z — then, late, an `a` that started between x and a:
+    // a, x, a', a in four steps.
+    let step = |id: &str, tool: &str, start: u64| tool_step("late", id, tool, "{}", start);
+    let (_, header, _) = ingest(
+        &server,
+        &json!([
+            step("1", "a", 10),
+            step("2", "x", 20),
+            step("3", "a", 30),
+            step("4", "y", 40),
+            step("5", "z", 50)
+        ]),
+        &[],
+    );
+    assert!(header.is_none());
+    let (_, header, body) = ingest(&server, &json!([step("6", "a", 25)]), &[]);
+    assert_eq!(header.as_deref(), Some("stop; run=late"), "{body}");
+    let live = verdict(&server, "/v1/fuses/runs/late", &[]);
+    assert!(
+        reasons(&live)[0].contains("repeated 3 times in the last 4 steps"),
+        "{live}"
+    );
+    // A restart rebuilds the run from the store, and stops it the same way.
+    server.restart();
+    let rebuilt = verdict(&server, "/v1/fuses/runs/late", &[]);
+    assert_eq!(rebuilt["verdict"], json!("stop"), "{rebuilt}");
+    assert_eq!(rebuilt["verdict"], live["verdict"]);
 }

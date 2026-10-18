@@ -197,7 +197,8 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `--fuse-max-tokens N` | off | The global policy's token limit. `0` removes it. |
 | `--fuse-max-steps N` | off | The global policy's step limit (LLM, tool and agent spans). `0` removes it. |
 | `--fuse-max-duration-seconds N` | off | The global policy's duration limit, first span start to last span end by the spans' clocks. `0` removes it. |
-| `--fuse-max-repeats N` | `12` | The global policy's repeat limit: how often one step fingerprint — the same call with the same input — may occur before the run reaches it. At least 2; `0` removes it. |
+| `--fuse-max-repeats N` | `12` | The global policy's repeat limit: how often one step fingerprint — the same call with the same input — may occur among the run's last `--fuse-repeat-window-steps` steps before the run reaches it. At least 2; `0` removes it. |
+| `--fuse-repeat-window-steps N` | `50` | The steps the global policy's repeat limit counts over: a fingerprint repeats when it occurs `--fuse-max-repeats` times among the run's latest N steps, so a long session that repeats a call now and then never reaches it while a tight loop does. 1 to 1000, and at least `--fuse-max-repeats`. See [run fuses § Repeats](guide/guard.md#repeats-count-within-a-window). |
 | `--fuse-max-error-streak N` | off | The global policy's limit on consecutive failed steps. `0` removes it. |
 | `--fuse-max-handoff-cycles N` | off | The global policy's limit on [handoff cycles](guide/steer.md#handoff-cycles-as-a-fuse-limit): how often control may return to a named agent straight from the agent it handed off to (`A → B → A`), for the pair that does it most, since the run's last reset. `0` removes it. |
 | `--fuse-action stop\|warn` | `warn` | What the global policy does at a limit. `warn` reports; `stop` makes the run's verdict `stop` until it is reset. Every policy warns at 80% of a limit either way. The default warns, because a default that stopped someone's agent would be a decision nobody made. |
@@ -450,7 +451,7 @@ same values a `--profile` would give the server.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | `bool` | `true` | As `--no-fuses` inverted. `false` skips the observer and never opens `fuses.jsonl`; the `Store::fuse_*` methods then return `Error::Conflict`. |
-| `limits` | `guard::Limits` | `max_repeats: Some(12)` | The global policy's limits, as the `--fuse-max-*` flags. `None` is unbounded. |
+| `limits` | `guard::Limits` | `max_repeats: Some(12)` | The global policy's limits, as the `--fuse-max-*` flags (and `repeat_window_steps`, as `--fuse-repeat-window-steps`; `None` is 50 steps). `None` is unbounded. |
 | `action` | `guard::Action` | `Warn` | As `--fuse-action`. |
 | `max_runs` | `usize` | `100_000` | As `--fuse-max-runs`. |
 | `live_paths` | `bool` | `true` | Whether every live run keeps its behaviour path (earliest 192 steps, 48 bytes each, inside the span budget) for foresight on the live view and the predictive fuses. `false`: only runs a policy with `min_success_odds` could govern keep one. `traza-server` sets it to `false` under `--fate-cache-seconds 0`. |

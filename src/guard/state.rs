@@ -22,7 +22,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::policy::{Action, Limits, Resolved};
+use super::policy::{Action, Limits, Resolved, DEFAULT_REPEAT_WINDOW_STEPS};
+use super::repeats::{self, RecentSteps, Slot};
 use super::Verdict;
 use crate::semconv::{self, StepKind};
 use crate::steer::handoff::{self, HandoffTracker};
@@ -50,8 +51,11 @@ pub struct SpanRef {
 pub struct TopRepeat {
     /// `{kind}:{name}#{request hash}` (see [`semconv::StepFacts`]).
     pub fingerprint: String,
-    /// Occurrences since the run's last reset.
+    /// Occurrences among the run's last `window_steps` steps (since its
+    /// last reset).
     pub count: u64,
+    /// The steps counted over: the policy's `repeat_window_steps`.
+    pub window_steps: u64,
     /// The latest occurrence.
     pub example: SpanRef,
 }
@@ -87,7 +91,8 @@ pub struct Usage {
     pub error_streak: u64,
     /// First span start to last span end, by the spans' own clocks.
     pub duration_ns: u64,
-    /// The most-repeated step fingerprint, when any step occurred twice.
+    /// The most-repeated step fingerprint among the run's latest steps (the
+    /// policy's `repeat_window_steps`), when one occurred twice there.
     pub top_repeat: Option<TopRepeat>,
     /// The most frequent handoff cycle, when control has returned to a
     /// named agent at least once since the last reset; absent otherwise.
@@ -285,6 +290,9 @@ struct Mark {
     cost_usd: f64,
     /// [`fingerprint_key`], or 0 for a span with no fingerprint.
     fingerprint: u64,
+    /// The span's start: with its key, its place in step order, which the
+    /// repeat window counts by.
+    start_ns: u64,
     /// Absorbed before the run's last reset: it counts toward cumulative
     /// usage but not toward the repeat table or the error streak, which a
     /// reset clears.
@@ -306,9 +314,18 @@ impl Mark {
                 .fingerprint
                 .as_deref()
                 .map_or(0, fingerprint_key),
+            start_ns: observation.start_ns,
             before_reset,
             revision: observation.revision,
         }
+    }
+
+    /// This mark's slot in the repeat window, when it counts there.
+    fn slot(&self, key: u64) -> Option<Slot> {
+        self.counted().then_some(Slot {
+            at: (self.start_ns, key),
+            fingerprint: self.fingerprint,
+        })
     }
 
     /// Whether this span counts in the repeat table.
@@ -351,8 +368,17 @@ pub(crate) struct RunState {
     cost_usd: f64,
     errors: u64,
     error_streak: u64,
+    /// Every fingerprint's count since the last reset, over the whole run —
+    /// kept for its text and latest example, which any fingerprint that
+    /// repeats within the window has (it repeats in the run too).
     repeats: HashMap<u64, Repeats>,
-    top: Option<u64>,
+    /// The latest counted steps, which `max_repeats` is judged over.
+    recent: RecentSteps,
+    /// Whether the steps changed other than by appending since `recent` was
+    /// last rebuilt: it then trails the marks until the fold settles it.
+    recent_unsettled: bool,
+    /// The steps the run's policy counts repeats over, for its usage.
+    repeat_window: usize,
     marks: HashMap<u64, Mark>,
     last_span: Option<SpanRef>,
     /// Whether this state starts from the run's stored history (a rebuild,
@@ -420,7 +446,9 @@ impl RunState {
             errors: 0,
             error_streak: 0,
             repeats: HashMap::new(),
-            top: None,
+            recent: RecentSteps::default(),
+            recent_unsettled: false,
+            repeat_window: DEFAULT_REPEAT_WINDOW_STEPS as usize,
             marks: HashMap::new(),
             last_span: None,
             complete,
@@ -486,7 +514,56 @@ impl RunState {
             return false;
         }
         let withdrawn = self.withdraw(observation);
-        self.land(observation, before_reset, withdrawn)
+        let changed = self.land(observation, before_reset, withdrawn);
+        self.settle_recent();
+        changed
+    }
+
+    /// The steps the run's policy counts repeats over — its usage reports
+    /// the top repeat within them. A fold judges stops by the window of the
+    /// limits it latches at, whatever this says.
+    pub(crate) fn set_repeat_window(&mut self, window: usize) {
+        self.repeat_window = window;
+    }
+
+    /// Places a span's change of slot in the repeat window: an append when
+    /// it lands after every step held, anything else left for
+    /// [`Self::settle_recent`].
+    fn move_slot(&mut self, old: Option<Slot>, new: Option<Slot>) {
+        if old == new {
+            return;
+        }
+        if old.is_some() {
+            self.recent_unsettled = true;
+        }
+        if let Some(new) = new {
+            if self.recent_unsettled || !self.recent.append(new) {
+                self.recent_unsettled = true;
+            }
+        }
+    }
+
+    /// The run's counted steps, in step order.
+    fn counted_slots(&self) -> Vec<Slot> {
+        let mut slots: Vec<Slot> = self
+            .marks
+            .iter()
+            .filter_map(|(key, mark)| mark.slot(*key))
+            .collect();
+        slots.sort_unstable_by_key(|slot| slot.at);
+        slots
+    }
+
+    /// Rebuilds the repeat window from the marks when steps changed other
+    /// than by appending. Returns whether it did.
+    fn settle_recent(&mut self) -> bool {
+        if !self.recent_unsettled {
+            return false;
+        }
+        let slots = self.counted_slots();
+        self.recent.rebuild(&slots);
+        self.recent_unsettled = false;
+        true
     }
 
     /// The first half of replacing the version of `observation`'s span held
@@ -546,6 +623,12 @@ impl RunState {
         let mark = Mark::of(
             observation,
             previous.map_or(before_reset, |previous| previous.before_reset),
+        );
+        // Its place among the counted steps, which a version that only moved
+        // its start changes too.
+        self.move_slot(
+            previous.and_then(|previous| previous.slot(observation.key)),
+            mark.slot(observation.key),
         );
         if previous.is_some() && !withdrawn {
             // A retried batch: the store upserted the same span to the same
@@ -747,10 +830,19 @@ impl RunState {
     /// version: a run the store never held, at a total it never reached,
     /// and a stop latched there is sticky. Withdrawn first, the totals only
     /// climb through the fold and end exactly where the store's versions
-    /// put them, so cost, tokens, steps, LLM and tool calls and repeats
-    /// latch here exactly when a replay of the store would. The error
-    /// streak is not a total to withdraw from: it is judged span by span in
-    /// step order, each failure where its version puts it, as before.
+    /// put them, so cost, tokens, steps, LLM and tool calls latch here
+    /// exactly when a replay of the store would. The error streak is not a
+    /// total to withdraw from: it is judged span by span in step order, each
+    /// failure where its version puts it, as before.
+    ///
+    /// Repeats are counted within a window of the latest steps
+    /// ([`super::repeats`]), which is no total either: steps leave it. A
+    /// replay latches when any window of the run's steps fills, and so does
+    /// this — each appended step's window is judged as it lands, exactly the
+    /// window a replay judges there; a fold that changed the steps any other
+    /// way (a step starting before the latest, one that moved, was renamed
+    /// or stopped being a step, a tie the window orders otherwise) judges
+    /// the fullest window anywhere in the run once it is over.
     ///
     /// `reset_at` absorbs spans that ended at or before it as history the
     /// last reset cleared, which latches nothing (see [`replay`]).
@@ -779,17 +871,47 @@ impl RunState {
             .iter()
             .map(|observation| self.withdraw(observation))
             .collect();
+        // A version that moves its span's slot in the repeat window — to
+        // another place, another fingerprint, or out of it — leaves the old
+        // slot standing until it lands, which may be after other landings:
+        // their windows would hold a step the store no longer has there.
+        if observations.iter().any(|observation| {
+            self.marks.get(&observation.key).is_some_and(|previous| {
+                previous.slot(observation.key).is_some_and(|old| {
+                    Mark::of(observation, previous.before_reset).slot(observation.key) != Some(old)
+                })
+            })
+        }) {
+            self.recent_unsettled = true;
+        }
         let mut resolved: Option<Option<Limits>> = None;
         let mut latched = false;
-        for (observation, withdrawn) in observations.into_iter().zip(withdrawn) {
+        let last = observations.last().copied();
+        let overtaken = overtaken_by_a_tie(&observations);
+        for ((observation, withdrawn), overtaken) in
+            observations.into_iter().zip(withdrawn).zip(overtaken)
+        {
             let before = reset_at.is_some_and(|reset| observation.end_ns <= reset);
-            if !self.land(observation, before, withdrawn) || before || self.trip.is_some() {
+            let changed = self.land(observation, before, withdrawn);
+            if overtaken {
+                // A step landing later in this fold starts at the same
+                // instant but comes before this one in the window's order:
+                // the window this landing closes is not one the run has.
+                self.recent_unsettled = true;
+            }
+            if !changed || before || self.trip.is_some() {
                 continue;
             }
             let limits =
                 *resolved.get_or_insert_with(|| stop_limits(self.service.as_deref().unwrap_or("")));
-            let Some(limits) = limits else { continue };
-            if !reaches(&self.measures(), &limits) {
+            let Some(mut limits) = limits else { continue };
+            // Once this fold has changed the steps other than by appending,
+            // the window is not one any replay passes through: repeats are
+            // judged over the whole run once the fold is over, below.
+            if self.recent_unsettled {
+                limits.max_repeats = None;
+            }
+            if !reaches(&self.measures(&limits), &limits) {
                 continue;
             }
             let assessment = self.assess(&limits, None);
@@ -802,7 +924,53 @@ impl RunState {
                 latched = true;
             }
         }
+        if self.settle_recent() && self.trip.is_none() {
+            let limits =
+                *resolved.get_or_insert_with(|| stop_limits(self.service.as_deref().unwrap_or("")));
+            if let (Some(limits), Some(last)) = (limits, last) {
+                if let Some((reasons, evidence)) = self.peak_trip(&limits) {
+                    self.trip = Some(Trip {
+                        at_ns: stamp(last),
+                        evidence,
+                        reasons,
+                    });
+                    latched = true;
+                }
+            }
+        }
         latched
+    }
+
+    /// The stop `limits` latch for repeats anywhere in the run: when one
+    /// fingerprint filled some window of its steps to `max_repeats` — what a
+    /// replay, judging every window as it forms, latches at. Its reason and
+    /// evidence, or `None` when no window reached it.
+    fn peak_trip(&self, limits: &Limits) -> Option<(Vec<String>, Vec<SpanRef>)> {
+        let limit = limits.max_repeats?;
+        let window = limits.repeat_window();
+        let (fingerprint, count) = repeats::peak(&self.counted_slots(), window)?;
+        if count < limit {
+            return None;
+        }
+        let detail = self
+            .repeats
+            .get(&fingerprint)
+            .and_then(|entry| entry.detail.as_deref());
+        let finding = Finding {
+            dimension: Dimension::Repeats,
+            level: Level::Reached,
+            limit: limit as f64,
+            value: count as f64,
+            delta: 0.0,
+        };
+        let reason = finding.render(detail.map(|(text, _)| text.as_str()), None, window);
+        let mut evidence: Vec<SpanRef> = self.last_span.iter().cloned().collect();
+        if let Some((_, example)) = detail {
+            if !evidence.contains(example) {
+                evidence.push(example.clone());
+            }
+        }
+        Some((vec![reason], evidence))
     }
 
     /// Marks this state as rebuilt from only the earliest of the run's
@@ -845,14 +1013,6 @@ impl RunState {
         if entry.count >= 2 {
             entry.detail = Some(Box::new((fingerprint.to_owned(), observation.span_ref())));
         }
-        let count = entry.count;
-        let top_count = self
-            .top
-            .and_then(|top| self.repeats.get(&top))
-            .map_or(0, |top| top.count);
-        if self.top != Some(key) && count > top_count {
-            self.top = Some(key);
-        }
     }
 
     fn uncount_repeat(&mut self, key: u64) {
@@ -863,15 +1023,6 @@ impl RunState {
             } else if entry.count < 2 {
                 entry.detail = None;
             }
-        }
-        if self.top == Some(key) {
-            // Rare — only a re-ingest that changed a repeated step's input —
-            // so a scan is cheaper than keeping an ordered index for it.
-            self.top = self
-                .repeats
-                .iter()
-                .max_by_key(|(_, entry)| entry.count)
-                .map(|(key, _)| *key);
         }
     }
 
@@ -884,7 +1035,8 @@ impl RunState {
         self.warn_level = 0;
         self.error_streak = 0;
         self.repeats.clear();
-        self.top = None;
+        self.recent.clear();
+        self.recent_unsettled = false;
         self.handoffs = None;
         for mark in self.marks.values_mut() {
             mark.before_reset = true;
@@ -923,13 +1075,22 @@ impl RunState {
         (agent, started, latest)
     }
 
-    fn top_repeat(&self) -> Option<(&Repeats, &str, &SpanRef)> {
-        let entry = self.repeats.get(&self.top?)?;
-        let (fingerprint, example) = entry.detail.as_deref()?;
-        (entry.count >= 2).then_some((entry, fingerprint.as_str(), example))
+    /// The most-repeated fingerprint among the last `window` counted steps,
+    /// when it occurred twice there: its count, text and latest example.
+    fn top_repeat(&self, window: usize) -> Option<(u64, &str, &SpanRef)> {
+        let (fingerprint, count) = self.recent.top(window)?;
+        if count < 2 {
+            return None;
+        }
+        // Repeated within the window, it is repeated in the run, so its
+        // detail is kept.
+        let (text, example) = self.repeats.get(&fingerprint)?.detail.as_deref()?;
+        Some((count, text.as_str(), example))
     }
 
-    fn measures(&self) -> Measures {
+    /// The figures `limits` are judged against. Repeats are counted only
+    /// when a repeat limit is set, over its window.
+    fn measures(&self, limits: &Limits) -> Measures {
         Measures {
             cost_usd: self.cost_usd,
             tokens: self.tokens,
@@ -937,7 +1098,13 @@ impl RunState {
             llm_calls: self.llm_calls,
             tool_calls: self.tool_calls,
             duration_ns: self.duration_ns(),
-            repeats: self.top_repeat().map_or(0, |(entry, _, _)| entry.count),
+            repeats: match limits.max_repeats {
+                Some(_) => self
+                    .recent
+                    .top(limits.repeat_window())
+                    .map_or(0, |(_, count)| count),
+                None => 0,
+            },
             error_streak: self.error_streak,
             handoff_cycles: self
                 .handoffs
@@ -951,8 +1118,14 @@ impl RunState {
         self.last_end_ns.saturating_sub(self.first_start_ns)
     }
 
-    /// The run's usage, for a verdict document.
+    /// The run's usage, for a verdict document, its top repeat counted over
+    /// the window its policy names ([`Self::set_repeat_window`]).
     pub(crate) fn usage(&self) -> Usage {
+        self.usage_within(self.repeat_window)
+    }
+
+    /// The run's usage, its top repeat counted over the last `window` steps.
+    pub(crate) fn usage_within(&self, window: usize) -> Usage {
         Usage {
             steps: self.steps,
             llm_calls: self.llm_calls,
@@ -963,10 +1136,11 @@ impl RunState {
             error_streak: self.error_streak,
             duration_ns: self.duration_ns(),
             top_repeat: self
-                .top_repeat()
-                .map(|(entry, fingerprint, example)| TopRepeat {
+                .top_repeat(window)
+                .map(|(count, fingerprint, example)| TopRepeat {
                     fingerprint: fingerprint.to_owned(),
-                    count: entry.count,
+                    count,
+                    window_steps: window as u64,
                     example: example.clone(),
                 }),
             top_handoff_cycle: self.top_handoff(),
@@ -975,9 +1149,9 @@ impl RunState {
 
     /// What `limits` make of this run's usage, plus `next` hypothetically.
     pub(crate) fn assess(&self, limits: &Limits, next: Option<&NextStep>) -> Assessment {
-        let findings = assess(&self.measures(), limits, next);
+        let findings = assess(&self.measures(limits), limits, next);
         let top = self
-            .top_repeat()
+            .top_repeat(limits.repeat_window())
             .map(|(_, fingerprint, example)| (fingerprint, example));
         let cycle = self.top_handoff().map(|cycle| {
             format!(
@@ -989,7 +1163,11 @@ impl RunState {
         let mut approaching = Vec::new();
         let mut evidence = Vec::new();
         for finding in &findings {
-            let reason = finding.render(top.map(|(fingerprint, _)| fingerprint), cycle.as_deref());
+            let reason = finding.render(
+                top.map(|(fingerprint, _)| fingerprint),
+                cycle.as_deref(),
+                limits.repeat_window(),
+            );
             if finding.dimension == Dimension::Repeats {
                 if let Some((_, example)) = top {
                     evidence.push(example.clone());
@@ -1031,6 +1209,30 @@ pub(crate) struct Assessment {
     pub(crate) evidence: Vec<SpanRef>,
 }
 
+/// For each observation of a fold (in step order), whether one landing
+/// after it starts at the same instant with a smaller span key — so comes
+/// before it in the repeat window's order, `(start, key)`, though the fold
+/// lands it later.
+fn overtaken_by_a_tie(observations: &[&Observation]) -> Vec<bool> {
+    let mut overtaken = vec![false; observations.len()];
+    let mut end = observations.len();
+    while end > 0 {
+        let start_ns = observations[end - 1].start_ns;
+        let mut begin = end - 1;
+        while begin > 0 && observations[begin - 1].start_ns == start_ns {
+            begin -= 1;
+        }
+        // Walk the group backwards, keeping the smallest key seen after.
+        let mut smallest_after = u64::MAX;
+        for index in (begin..end).rev() {
+            overtaken[index] = smallest_after < observations[index].key;
+            smallest_after = smallest_after.min(observations[index].key);
+        }
+        end = begin;
+    }
+    overtaken
+}
+
 /// Replays a run's stored spans, in step order, into a complete state.
 ///
 /// `reset_at` is the run's last reset (server clock): spans that ENDED at
@@ -1061,8 +1263,9 @@ pub(crate) fn replay_following(
     state.fold(observations, reset_at, &stop_limits, &|observation| {
         observation.end_ns
     });
+    let (limits, action) = resolve(state.service.as_deref().unwrap_or(""));
+    state.set_repeat_window(limits.repeat_window());
     if let (Some(reset), None) = (reset_at, state.trip.as_ref()) {
-        let (limits, action) = resolve(state.service.as_deref().unwrap_or(""));
         if action == Action::Stop {
             let assessment = state.assess(&limits, None);
             if !assessment.reached.is_empty() {
@@ -1255,7 +1458,12 @@ fn dimensions(
 
 impl Finding {
     /// The reason line: the limit's name and value, then what the run did.
-    fn render(&self, top_fingerprint: Option<&str>, top_cycle: Option<&str>) -> String {
+    fn render(
+        &self,
+        top_fingerprint: Option<&str>,
+        top_cycle: Option<&str>,
+        repeat_window: usize,
+    ) -> String {
         let (name, limit) = match self.dimension {
             Dimension::Cost => ("max_cost_usd", usd(self.limit)),
             Dimension::Tokens => ("max_tokens", whole(self.limit)),
@@ -1275,12 +1483,13 @@ impl Finding {
             Dimension::ToolCalls => format!("{} tool calls", whole(self.value)),
             Dimension::Duration => format!("the run spans {} s", whole(self.value / 1e9)),
             Dimension::Repeats => format!(
-                "{} repeated {} times",
+                "{} repeated {} times in the last {} steps",
                 truncate_chars(
                     top_fingerprint.unwrap_or("a step"),
                     REASON_FINGERPRINT_CHARS
                 ),
-                whole(self.value)
+                whole(self.value),
+                repeat_window
             ),
             Dimension::ErrorStreak => {
                 format!("{} consecutive failed steps", whole(self.value))
@@ -1549,6 +1758,7 @@ mod tests {
         let observations: Vec<Observation> = (0..6)
             .map(|index| {
                 let mut observation = step(&format!("s{index}"), "tool:loop#1");
+                observation.start_ns = 900 + index;
                 observation.end_ns = 1_000 + index;
                 observation
             })
@@ -1567,7 +1777,7 @@ mod tests {
         assert_eq!(trip.at_ns, 1_002, "the third occurrence crossed");
         assert_eq!(
             trip.reasons,
-            ["max_repeats 3 reached: tool:loop#1 repeated 3 times"]
+            ["max_repeats 3 reached: tool:loop#1 repeated 3 times in the last 50 steps"]
         );
         assert_eq!(trip.evidence[0].span_id, "s2");
 
@@ -1641,8 +1851,10 @@ mod tests {
         // MAX_TRACKED_SPANS is documented in these terms; a field added to
         // Mark has to be a decision about that bound, not a side effect. The
         // write revision took it from 32 to 40: without it a late observer
-        // can put back a version the store replaced.
-        assert_eq!(std::mem::size_of::<Mark>(), 40);
+        // can put back a version the store replaced. The start took it to
+        // 48: without it the repeat window cannot be rebuilt in step order
+        // when a span arrives out of order or moves.
+        assert_eq!(std::mem::size_of::<Mark>(), 48);
     }
 
     #[test]
@@ -1909,7 +2121,9 @@ mod tests {
 
     /// Random batches of upserts against a complete run, under every limit
     /// a run can only climb toward within one fold — cost, tokens, steps,
-    /// LLM and tool calls, repeats: after each batch the live state counts
+    /// LLM and tool calls — and repeats, within windows narrower than the
+    /// run (see the repeat window's own test below for longer runs): after
+    /// each batch the live state counts
     /// exactly what a fresh replay of the store's versions counts, and
     /// latches a stop exactly when that replay does. A stop latched from a
     /// state the store never held — old versions of some spans beside new
@@ -1962,7 +2176,12 @@ mod tests {
                     limits.max_tool_calls = Some(rng.range(2, 5));
                 }
                 if rng.chance(40) {
-                    limits.max_repeats = Some(rng.range(2, 5));
+                    let repeats = rng.range(2, 5);
+                    limits.max_repeats = Some(repeats);
+                    // Narrower than the run, so steps leave the window.
+                    if rng.chance(50) {
+                        limits.repeat_window_steps = Some(rng.range(repeats, 5));
+                    }
                 }
             }
             let resolve = |_: &str| (limits, Action::Stop);
@@ -2034,6 +2253,153 @@ mod tests {
         }
         // The property must have been exercised, not passed vacuously.
         assert!(latches > 300, "only {latches} scenarios latched");
+    }
+
+    /// The repeat window against a replay of the store: random batches of
+    /// new spans and upserts — arriving out of step order, starting
+    /// together, moving, renamed to another fingerprint, turned into no
+    /// step — over runs longer than the window. After every batch the live
+    /// state's top repeat within the window is exactly a fresh replay's, and
+    /// a stop policy latches live exactly when the replay does: a window
+    /// filled anywhere in the run, by steps in any arrival order, stops it,
+    /// and one never filled does not.
+    #[test]
+    fn the_repeat_window_counts_and_latches_exactly_what_a_replay_of_the_store_does() {
+        const KINDS: [StepKind; 3] = [StepKind::Tool, StepKind::Llm, StepKind::Other];
+        fn random(rng: &mut crate::seed::Rng, id: &str, revision: u64) -> Observation {
+            let kind = if rng.chance(85) {
+                StepKind::Tool
+            } else {
+                *rng.pick(&KINDS)
+            };
+            let fingerprint = format!("tool:f#{}", rng.range(0, 2));
+            // Starts often tie, so step order falls back to the span key.
+            let observation = version(
+                id,
+                kind,
+                kind.is_step().then_some(fingerprint.as_str()),
+                rng.range(0, 12) * 10,
+                0.0,
+                revision,
+            );
+            with_token(observation)
+        }
+        let mut rng = crate::seed::Rng::new(0x0dd_5eed);
+        let (mut latches, mut quiet, mut windowed) = (0, 0, 0);
+        for scenario in 0..2_000 {
+            let repeats = rng.range(2, 4);
+            let limits = Limits {
+                max_repeats: Some(repeats),
+                repeat_window_steps: Some(rng.range(repeats, 5)),
+                ..Limits::default()
+            };
+            let window = limits.repeat_window();
+            let action = if rng.chance(50) {
+                Action::Stop
+            } else {
+                Action::Warn
+            };
+            let resolve = |_: &str| (limits, action);
+            let stop = |_: &str| (action == Action::Stop).then_some(limits);
+            let mut stored: HashMap<String, Observation> = HashMap::new();
+            let mut live = replay_following(&[], None, &resolve, false);
+            let mut revision = 0;
+            for round in 0..10 {
+                let mut batch: Vec<Observation> = (0..rng.range(1, 4))
+                    .map(|_| {
+                        revision += 1;
+                        let id = format!("s{}", rng.range(0, 9));
+                        random(&mut rng, &id, revision)
+                    })
+                    .collect();
+                for observation in &batch {
+                    let mut kept = observation.clone();
+                    kept.revision = 0;
+                    stored.insert(kept.span_id.clone(), kept);
+                }
+                if rng.chance(30) {
+                    for index in (1..batch.len()).rev() {
+                        batch.swap(index, rng.range(0, index as u64) as usize);
+                    }
+                }
+                let latched = live.fold(&batch, None, &stop, &|_| 1);
+                let held: Vec<Observation> = stored.values().cloned().collect();
+                let fresh = replay_following(&held, None, &resolve, false);
+                let context = format!("scenario {scenario}, batch {round}, {limits:?}, {action:?}");
+                let top = |run: &RunState| {
+                    run.usage()
+                        .top_repeat
+                        .map(|top| (top.count, top.window_steps))
+                };
+                assert_eq!(top(&live), top(&fresh), "{context}");
+                assert_eq!(
+                    live.trip.is_some(),
+                    fresh.trip.is_some(),
+                    "{context}: live and a replay of the store disagree on a stop"
+                );
+                if live.steps() as usize > window {
+                    windowed += 1;
+                }
+                if latched {
+                    latches += 1;
+                    break;
+                }
+                if action == Action::Warn && top(&live).is_some() {
+                    quiet += 1;
+                }
+            }
+        }
+        // The property must have been exercised, not passed vacuously.
+        assert!(latches > 200, "only {latches} scenarios latched");
+        assert!(quiet > 200, "only {quiet} warn-policy repeats compared");
+        assert!(
+            windowed > 2_000,
+            "only {windowed} batches outgrew the window"
+        );
+    }
+
+    #[test]
+    fn steps_that_leave_the_window_stop_counting() {
+        let limits = Limits {
+            max_repeats: Some(3),
+            repeat_window_steps: Some(4),
+            ..Limits::default()
+        };
+        let at = |id: &str, fingerprint: &str, start: u64| {
+            let mut observation = step(id, fingerprint);
+            observation.start_ns = start;
+            observation.end_ns = start + 1;
+            observation
+        };
+        // The same call every other step: never three in four.
+        let spread: Vec<Observation> = (0..8)
+            .map(|index| {
+                let fingerprint = if index % 2 == 0 {
+                    "tool:shot#1".to_owned()
+                } else {
+                    format!("tool:other#{index}")
+                };
+                at(&format!("s{index}"), &fingerprint, 10 * (index + 1))
+            })
+            .collect();
+        let stop = |_: &str| (limits, Action::Stop);
+        let run = replay(&spread, None, &stop);
+        assert!(run.trip.is_none(), "{:?}", run.trip);
+        // Three in a row: stopped at the third.
+        let looping: Vec<Observation> = (0..5)
+            .map(|index| at(&format!("l{index}"), "tool:shot#1", 10 * (index + 1)))
+            .collect();
+        let run = replay(&looping, None, &stop);
+        let trip = run.trip.expect("three in four steps");
+        assert_eq!(trip.at_ns, 31, "timed by the third occurrence's end");
+        assert_eq!(
+            trip.reasons,
+            ["max_repeats 3 reached: tool:shot#1 repeated 3 times in the last 4 steps"]
+        );
+        // The usage reports the window it counted over.
+        let usage = replay(&looping, None, &|_: &str| (limits, Action::Warn)).usage();
+        let top = usage.top_repeat.expect("a repeat");
+        assert_eq!((top.count, top.window_steps), (4, 4));
     }
 
     /// A step naming `agent`, starting at `start`.

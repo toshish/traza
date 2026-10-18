@@ -80,6 +80,7 @@ pub mod http;
 mod live;
 pub(crate) mod log;
 mod policy;
+mod repeats;
 mod state;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -94,8 +95,8 @@ pub use events::{EventKind, EventPage, FuseEvent, MAX_WAIT_MS};
 pub use live::{LiveCursor, LivePage, LiveRemoval, LiveRemovalReason, LiveRun, LiveUpdate};
 pub use policy::{
     Action, FuseConfig, FusePolicy, Limits, PolicyMatch, PolicySpec, DEFAULT_MAX_REPEATS,
-    DEFAULT_MAX_RUNS, DEFAULT_POLICY_NAME, GLOBAL_POLICY_NAME, MAX_POLICIES_PER_TENANT,
-    MAX_SERVICE_BYTES,
+    DEFAULT_MAX_RUNS, DEFAULT_POLICY_NAME, DEFAULT_REPEAT_WINDOW_STEPS, GLOBAL_POLICY_NAME,
+    MAX_POLICIES_PER_TENANT, MAX_REPEAT_WINDOW_STEPS, MAX_SERVICE_BYTES,
 };
 pub use state::{HandoffCycle, LiveStep, NextStep, SpanRef, TopRepeat, TrippedBy, Usage};
 
@@ -105,7 +106,7 @@ use state::{Observation, RunState, Trip};
 
 use crate::{erasure, semconv, Deadline, Error, Result, Span, Store};
 
-/// Ceiling on span contributions held across every live run — each a 40-byte
+/// Ceiling on span contributions held across every live run — each a 48-byte
 /// record under an 8-byte key, before hash-table overhead — plus the steps of
 /// the runs' behaviour paths (48 bytes each, at most the earliest 192 per
 /// run; see [`crate::fate`] and [`FuseConfig::live_paths`]).
@@ -694,6 +695,13 @@ impl Guard {
                 }
                 let before = run.tracked();
                 let latched = run.fold(&observations, None, &limits, &|_| now);
+                // The window its usage reports repeats over: its policy's,
+                // as the fold just left the run's service.
+                let service = run.service.as_deref().unwrap_or("");
+                let window = in_force(policies, &self.config, &key.tenant, service, grant)
+                    .limits
+                    .repeat_window();
+                run.set_repeat_window(window);
                 ((before, run.tracked()), latched)
             };
             // A behaviour path can shrink (a step re-ingested as no step), so
@@ -1434,7 +1442,7 @@ impl State {
 
     fn doc(&self, key: &RunKey, judged: Judgement, source: Source) -> VerdictDoc {
         let usage = match self.runs.get(key) {
-            Some(run) => run.usage(),
+            Some(run) => run.usage_within(judged.limits.repeat_window()),
             None => self
                 .parked
                 .get(key)
