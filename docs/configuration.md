@@ -227,6 +227,52 @@ write; a `kill -9`, a panic, or an OS crash cannot. On Linux `fsync` carries
 the usual guarantee. See the README's durability section for the full
 discussion.
 
+## `traza-server import` and `traza-server blame`
+
+Two client subcommands of the same binary. Neither opens a data directory a
+server is using; both speak plain HTTP to the server named by `--url` (TLS
+belongs in front of the server), presenting `--token` or `TRAZA_TOKEN`. See
+the [recorders guide](guide/recorders.md).
+
+**`traza-server import claude-code|codex`** records coding-agent transcripts as
+runs.
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--path DIR` | `~/.claude/projects` / `~/.codex/sessions` | Where the transcripts are. Searched recursively (eight levels) for `*.jsonl`, and for Codex also `*.jsonl.zst`. |
+| `--url URL` | `http://127.0.0.1:8080` | The server to `POST /v1/spans` to; needs `rw`. A bound credential stamps its tenant on every span. |
+| `--token TOKEN` | `$TRAZA_TOKEN` | Bearer token for `--url`. |
+| `--data-dir DIR` | — | Ingest straight into a data directory instead (refused while a server holds it), with the server's default 256 KiB payload threshold. |
+| `--dry-run` | off | Convert and count; send and record nothing. |
+| `--tenant TENANT` | none | Tenant to stamp on spans (for an unbound credential or `--data-dir`). |
+| `--since DURATION` | all | Only files modified within `30m`/`12h`/`7d`/`2w`; a selected session is imported whole. |
+| `--project-filter SUBSTR` | all | Only sessions whose file path or working directory contains `SUBSTR`. |
+| `--watch` | off | Keep polling for appended lines and new files. At most 64 active files keep their converters in memory, each dropped after 10 idle minutes. |
+| `--interval-ms N` | `1000` | Watch poll interval (50–60000). |
+| `--state FILE` | `~/.traza/import-state.json` | Per-destination progress, so a re-run or restart sends only what is new. Written atomically. |
+| `--no-state` | off | Ignore and do not write the state file: send everything (idempotent — derived ids, last write wins). |
+| `--json` | off | Print the final counts as JSON instead of a summary line. |
+
+Exit status `0`; `3` when some spans or files were refused (named in the
+output); non-zero with the reason on stderr when the import could not run —
+an unreadable state file, a refused credential, an unreachable server.
+
+**`traza-server blame FILE:LINE`** reads line `LINE` (from 1) of `FILE` and asks
+[`GET /v1/blame`](guide/http-api.md#get-v1blame) which agent step introduced
+it, sending the path relative to the repository root (the nearest directory
+holding `.git`) when there is one.
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--url URL` | `http://127.0.0.1:8080` | The server to ask. |
+| `--token TOKEN` | `$TRAZA_TOKEN` | Bearer token (`ro` suffices). |
+| `--tenant TENANT` | none | Tenant scope for an unbound credential. |
+| `--limit N` | `5` | Introductions to show, earliest first (at most 50). |
+| `--json` | off | Print the route's JSON instead of the human rendering. |
+
+Exit status `0` when an introduction was found, `1` when no recorded edit
+introduced the line, other non-zero on errors.
+
 ## Model pricing
 
 OpenTelemetry defines no cost attribute, so a span carries one only if the
@@ -309,7 +355,7 @@ metered-cost-only rather than leaving derived figures behind.
 | `TRAZA_UI_DIR` | `traza-server` | First place searched for the built dashboard when `--ui-dir` is unset. |
 | `TRAZA_SOCKET_TIMEOUT_MS` | `traza-server` | Per-read/write socket deadline; default 30,000. Primarily for tests. |
 | `TRAZA_TEST_PANIC` | `traza-server` | Latched once at startup; set to anything but empty or `0`, `GET /v1/test-panic` exists and panics its handler — the reachable panic the slot-guard tests need. Unset, empty, or `0` — the same "`0` disables" convention as every other knob — the route 404s as always. Primarily for tests. |
-| `TRAZA_TOKEN` | `seed` | Bearer token the seeder presents. |
+| `TRAZA_TOKEN` | `seed`, `traza-server mcp`, `traza-server import`, `traza-server blame` | Bearer token the client presents when no `--token` is given. |
 | `TRAZA_BENCH_SERVER` | `ingest-bench` | Path to a different `traza-server` build, so a before/after comparison runs through one client. |
 | `TRAZA_BENCH_SPANS` | `bench` | Corpus size, so other sizes can be run without overwriting the published figures. |
 | `TRAZA_BENCH_COMPACTION_FANOUT`, `TRAZA_BENCH_COMPACTION_MAX_SEGMENT_BYTES` | `bench` | Compaction settings for the read-path benchmark. |

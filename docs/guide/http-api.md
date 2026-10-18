@@ -143,6 +143,7 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `POST` | [`/v1/replays/{id}/tools/next`](#post-v1replaysidtoolsnext) | The next recorded tool result |
 | `GET` | [`/v1/diff`](#get-v1diff) | Two runs aligned, and where they first diverge |
 | `GET` | [`/v1/recall`](#get-v1recall) | Earlier runs containing the same words, successes first |
+| `GET` | [`/v1/blame`](#get-v1blame) | Agent Blame: the tool step that introduced a line of code |
 | `POST` | [`/v1/annotations`](#post-v1annotations) | Attach a score or feedback record |
 | `GET` | [`/v1/annotations`](#get-v1annotations) | Query annotations |
 | `POST` | [`/v1/datasets`](#post-v1datasets) | Create a dataset |
@@ -1289,6 +1290,56 @@ with the most matches among them; `truncated: true` says the first bound
 applied. A `q` with no ASCII letters or digits is `400` — it could match
 nothing — and so is a `q` whose words appear in more than 200,000 spans, too
 many to rank by recency; add a word.
+
+### `GET /v1/blame`
+
+Agent Blame: the earliest tool steps whose edit introduced an exact line of
+code into a file — and the session, step, prompt and model behind each. Edits
+are read from recorded tool-call arguments by shape (Claude Code `Edit`,
+`MultiEdit`, `Write`, `NotebookEdit`; Anthropic's text-editor tool; Codex
+`apply_patch` patches and file-change items), so it works on any run that
+recorded them, not only [imported](recorders.md) ones. The
+[recorders guide](recorders.md#agent-blame) explains the matching rules.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `path` | string, required | The file's path, or a suffix of it (`src/cart.rs`); matched by path component, a leading `/` is not an anchor |
+| `line` | string, required | The exact line text; compared with whitespace normalised (runs fold to one space, ends trimmed) |
+| `limit` | integer | Introductions to return, earliest first. Default 5, capped at 50 |
+| `tenant` | string | Tenant scope |
+
+```sh
+curl 'http://localhost:8080/v1/blame?path=src/item.rs&line=pub%20price%3A%20u64%2C'
+```
+
+```json
+{"line":"pub price: u64,","matches":[{"agent":"general-purpose","at_ns":1767607225000000000,"file":"/tmp/demo-shop/src/item.rs","model":"claude-haiku-4-5-20251001","prompt":"Add a price field to Item in src/item.rs","run":"11111111-1111-4111-8111-111111111111","service":"claude-code","span_id":"fe06d3b7c5815378","step_index":10,"tenant":"","tool":"MultiEdit","trace_id":"257eaef69d566d3579947aac638045ca"}],"path":"src/item.rs","searched_spans":7,"truncated":false}
+```
+
+A step **introduces** a line when its edit adds it more times than it removes
+it, so a context line an edit kept, or a line it only re-indented, is not
+authorship. Each match names its `run`, `tenant`, `trace_id` and `span_id`, the
+`tool`, the `file` as the edit recorded it (relative patch paths joined with
+the recorded working directory), `at_ns` (the tool step's start), `model` (of
+the response that requested the edit), `step_index` (its position on the run's
+[tape](#get-v1tapesrun), from zero; `null` past a tape's 20,000-span read),
+`service`, and when known `prompt` — the `gen_ai.user.message` of the nearest
+ancestor, cut to 500 characters: the turn's prompt, or the task a sub-agent was
+given, in which case `agent` names the sub-agent. `line` and `path` echo what
+was compared.
+
+Candidates come from the content index (the file name's words and the line's
+words that a JSON-escaped copy of it tokenises the same way) and every one is
+verified by parsing its edit. `searched_spans` counts the candidates verified;
+at most 200,000 are, and `truncated: true` says more existed, so an earlier
+introduction may be missing. The search and the reading of each match's run
+spend one [query deadline](../configuration.md#server-flags).
+
+`400` for a missing `path` or `line`, an empty line, a line and file name with
+no searchable word between them (ASCII letters or digits), an invalid `limit`,
+or an unknown parameter; `403` when a bound credential names another tenant.
+Lines written by shell commands are not found — they are not edits a tool
+call's arguments describe.
 
 ---
 

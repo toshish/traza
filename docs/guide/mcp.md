@@ -114,7 +114,7 @@ over `curl`.
 
 ## The tools
 
-Sixteen tools: fourteen reads and two gated writers. They are shaped like the
+Seventeen tools: fifteen reads and two gated writers. They are shaped like the
 questions somebody asks at 2am, not like the route index — two routes may serve
 one tool, and one route may serve two. Most of them describe what is in the
 store; `diagnose_session` and `compare_runs` are the ones that answer a
@@ -136,6 +136,7 @@ question about it.
 | `get_run_tape` | What did this run do, step by step? |
 | `compare_runs` | **Where did this run part from that one, and why?** |
 | `recall_runs` | Has this been done before, and how did it go? |
+| `blame_line` | **Which agent step wrote this line of code, and why?** |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -144,13 +145,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the fourteen readers | `true` | — | — | `false` |
+| the fifteen readers | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises fourteen read tools as though each might delete something and
+omits them advertises fifteen read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -206,6 +207,19 @@ The reasoning behind these is worth knowing:
   an agent harness, and letting the model under test create one would let
   stored telemetry choose which recording its next run is fed.
 
+**`blame_line` answers "why does this code look like this?"** before an
+agent changes it. It takes `path` (a file path or a suffix such as
+`src/cart.rs`), `line` (the exact text; indentation does not matter) and an
+optional `limit` (default 5, at most 50), and returns the earliest recorded
+tool steps whose edit added that line — Claude Code `Edit`/`MultiEdit`/`Write`,
+Codex patches and file changes, Anthropic's text-editor tool — each with its
+run, step, model, tool, file and the prompt the agent was following. It is the
+same search as [`GET /v1/blame`](http-api.md#get-v1blame); see the
+[recorders guide](recorders.md#agent-blame) for what counts as introducing a
+line. Paths, tool and model names, run ids and prompts render inside the
+telemetry block: a prompt is the producer's text, never an instruction to the
+caller.
+
 **`check_run_guard` reads a run's [fuse](guard.md) verdict** — `continue`,
 `warn` or `stop` — with its reasons, policy, limits and usage: the same
 document as [`GET /v1/fuses/runs/{run}`](http-api.md#get-v1fusesrunsrun), as
@@ -219,7 +233,7 @@ stopped agent cannot talk its way past its own fuse. It answers what is
 recorded, which is the pre-call check without an estimate; an agent wanting
 to price its next step uses
 [`POST /v1/fuses/check`](http-api.md#post-v1fusescheck). On a server started
-with `--no-fuses` it is not listed — thirteen reads, then — and a call naming it
+with `--no-fuses` it is not listed — fourteen reads, then — and a call naming it
 is refused as invalid params.
 
 **The eval entities are not on this surface.** Datasets, versions, examples,

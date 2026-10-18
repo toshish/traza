@@ -77,6 +77,22 @@ impl Server {
         }
     }
 
+    /// Starts the server on an existing data directory — one an offline
+    /// tool (such as `traza-server import --data-dir`) filled — with extra
+    /// `args`. The directory is removed on drop, like any other.
+    pub fn spawn_in(data_dir: PathBuf, args: &[&str]) -> Self {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        let (child, port, stderr) = launch(&data_dir, &args, &[]);
+        Self {
+            child,
+            port,
+            data_dir,
+            args,
+            env: Vec::new(),
+            stderr,
+        }
+    }
+
     /// Kills the server — SIGKILL, a crash rather than a shutdown — and
     /// starts it again on the same data directory with the same arguments and
     /// environment. What survives is exactly what was durable. The port
@@ -215,6 +231,11 @@ pub fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str
         .iter()
         .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.as_str())
+}
+
+/// A fresh private temporary directory (not removed automatically).
+pub fn temp_dir() -> PathBuf {
+    fresh_dir()
 }
 
 fn fresh_dir() -> PathBuf {

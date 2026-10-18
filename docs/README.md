@@ -14,6 +14,7 @@ to the right document. Start with the row that matches what you are doing.
 | Let a coding agent read the store over MCP | [MCP server](guide/mcp.md) · [demo](../examples/mcp-demo/README.md) |
 | Stop a runaway agent run before its next step | [Run fuses](guide/guard.md) · [demo](../examples/guard/README.md) · [Claude Code hook](../examples/guard/README.md#the-claude-code-hook) |
 | Re-run a recorded agent run with zero model calls, or diff two runs | [Replay](guide/replay.md) · [demo](../examples/replay/README.md) |
+| Record every Claude Code and Codex session with zero setup, or ask which agent step wrote a line of code | [Recorders and Agent Blame](guide/recorders.md) |
 | Prove what the store committed, for an auditor or a notary | [Ledger and evidence packs](guide/ledger.md) · [demo](../examples/prove/README.md) |
 | Call the guard, replays, diff, recall or the ledger from Python or TypeScript | [Client libraries](guide/clients.md) |
 | Watch the claims proven live before reading further | [The demo tour](../examples/README.md) |
@@ -53,6 +54,10 @@ Sending traces to Traza and getting answers back out.
   every published generation and erasure, verifying it with or without the
   server, external anchors, and the evidence pack a notary signs; with what
   it proves and what it does not.
+- **[Recorders and Agent Blame](guide/recorders.md)** — `traza-server import
+  claude-code|codex` turns coding-agent transcripts into runs (live with
+  `--watch`), and `traza-server blame` names the step, prompt and model that
+  introduced a line of code.
 - **[Client libraries](guide/clients.md)** — the zero-dependency Python and
   TypeScript clients for the routes an agent harness calls: the pre-call
   guard and the rest of the run fuses, tapes and replays, diffs, recall, the
