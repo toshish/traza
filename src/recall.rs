@@ -336,7 +336,11 @@ impl Store {
 
     /// A filtered query under a caller-anchored budget, so recall's content
     /// search and its run reads spend one budget between them.
-    fn query_under(&self, filter: &SpanFilter, deadline: Option<Deadline>) -> Result<Vec<Span>> {
+    pub(crate) fn query_under(
+        &self,
+        filter: &SpanFilter,
+        deadline: Option<Deadline>,
+    ) -> Result<Vec<Span>> {
         let mask = self.erasure_mask();
         // Lock order: writer before segments (see Store field docs). Both are
         // released before any run is read, which takes them again.

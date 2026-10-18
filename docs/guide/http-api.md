@@ -100,7 +100,7 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `401` | Missing, malformed, unknown, expired, or revoked bearer token — including a request admitted in open mode whose body arrived after the store's first credential. Carries `WWW-Authenticate: Bearer` |
 | `403` | Valid token without the grant this request needs — the body's `"required"` names it (`rw`, `admin`, `unbound`) — or a tenant-bound credential naming a foreign tenant; in open mode, also a browser request from a non-loopback page to an admin operation |
 | `404` | No such route, or the requested trace/session/payload/dataset/experiment/credential/replay does not exist. Cross-tenant reads answer `404`, never `403` — existence is a fact about another tenant |
-| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation, a first credential that is not an unbound admin, a `/v1/fuses/*` route — or a live-run or nudge route — on a server started with `--no-fuses`, a run's 33rd pending nudge, a 65th live-run stream, an anchor whose `target_head` is not the recorded head. Also a run that cannot be replayed, a strict replay's divergence, and a replayed answer too large to render — see [replays](#post-v1replays) for which of those a retry cannot fix |
+| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation, a first credential that is not an unbound admin, a `/v1/fuses/*` route — or a live-run or nudge route — on a server started with `--no-fuses`, a run's 33rd pending nudge, a 65th live-run stream, an anchor whose `target_head` is not the recorded head. Also a run that cannot be replayed, a strict replay's divergence, a replayed answer too large to render, and a fork's call past its live point (`replay_live`) — see [replays](#post-v1replays) for which of those a retry cannot fix |
 | `410` | A tombstoned dataset version: the content is withheld, the fact of the deletion is not. Also a replay that is exhausted or that an erasure withdrew |
 | `413` | A gzip body that decompresses past the 64 MiB body cap |
 | `415` | A `Content-Encoding` other than `gzip` on an ingest route, or any coding elsewhere; a `/v1/admin/` body not declared `application/json` |
@@ -154,6 +154,8 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `GET` | [`/v1/trajectories/explain`](#get-v1trajectoriesexplain) | How a TQL pattern was read |
 | `GET` | [`/v1/detectors`](#get-v1detectors) | The detector library |
 | `GET` | [`/v1/detectors/findings`](#get-v1detectorsfindings) | The detector library run over a window |
+| `GET` | [`/v1/forks`](#get-v1forks) | A run's forks, each diffed against it |
+| `GET` | [`/v1/goldens`](#get-v1goldens) | The runs marked as regression baselines |
 | `POST` | [`/v1/annotations`](#post-v1annotations) | Attach a score or feedback record |
 | `GET` | [`/v1/annotations`](#get-v1annotations) | Query annotations |
 | `POST` | [`/v1/datasets`](#post-v1datasets) | Create a dataset |
@@ -1118,6 +1120,8 @@ curl -X POST http://localhost:8080/v1/replays -d '{"run":"weather-7","mode":"loo
 | `run` | string, required | The run to replay |
 | `tenant` | string | Tenant scope; a bound credential's own tenant by default |
 | `mode` | `strict` / `loose` | `strict` (default) refuses a request whose messages do not match the recorded step; `loose` serves in order regardless. See [matching](#post-v1replaysidopenaiv1chatcompletions) |
+| `edits` | array | Makes the replay a **fork** ([guide](fork.md)): up to 64 of `{"step": n, "response": …}` (a model answer at an llm step: text, an assistant message in OpenAI, Anthropic or normalised shape, a list of them, or a response body with `choices`) or `{"step": n, "tool_result": …}` (any JSON at a tool step), at most one per step, served instead of the recording. Strict matching applies up to and including the first edited step and not after it |
+| `live_after` | integer | Makes the replay a fork: after this tape step every model call and `tools/next` answers `409 replay_live`. Steps after it are not held, so they need not be replayable — nor read, for a run past 20,000 spans whose first 20,000 hold this step |
 
 `201` on success. The replay lives in memory for one hour from creation and
 does not survive a restart. A replay created under a tenant is usable by that
@@ -1129,12 +1133,24 @@ and not held. `unreadable_tool_steps` lists the tape indices of tool steps
 whose value could not be resolved, or that recorded no result at all (see
 [`tools/next`](#post-v1replaysidtoolsnext)).
 
+A fork's response adds `fork_id` (`fk_` and 32 hex characters) and `fork`:
+`{"id", "parent", "step", "edits": [{"step", "kind"}], "live_after",
+"attributes"}`, where `step` is the cut — the first edited step or the step
+after `live_after`, whichever is first — and `attributes` are the span
+attributes the forked run's harness stamps on its spans
+(`traza.fork.parent`, `traza.fork.step`, `traza.fork.id`). An edited answer
+is served with the recording's model, an invented response id and zero
+usage. `llm_steps` counts the model steps held — none past the live point.
+A fork of a run longer than 20,000 spans whose live point falls within the
+steps those spans hold is accepted, with `"steps_truncated": true`: `steps`
+then counts the steps read, not the run's.
+
 | Response | Cause |
 |---|---|
-| `400 {"error":"…"}` | Missing `run`, unknown field, or a bad `mode` / `tenant` |
+| `400 {"error":"…"}` | Missing `run`, unknown field, or a bad `mode` / `tenant`; malformed `edits` or `live_after`; an edit naming a step the run does not have or of the other kind, an edit after the live point, a live point past the last step, or an edited answer with neither text nor a tool call — each named |
 | `403` | A bound credential named another tenant |
 | `404 {"error":"run not found"}` | No spans carry that run id in scope |
-| `409 {"error":"step 0 (llm:gpt-4o) recorded no response — …"}` | The run cannot be replayed: a model step with no recorded answer (content capture off); an offloaded answer that cannot be read, or that is past `--tape-max-bytes` (the message says which); in strict mode a request that cannot be read or was not recorded as a message list — a bare prompt (text or a JSON object, with or without system instructions beside it), or a list holding something other than messages; a run of more than 20,000 spans; or a snapshot larger than one tenant's whole share (64 MiB), which can never be held — refused as soon as building it passes the share. The message names the step and the remedy. Carries `x-should-retry: false` |
+| `409 {"error":"step 0 (llm:gpt-4o) recorded no response — …"}` | The run cannot be replayed: a model step with no recorded answer (content capture off); an offloaded answer that cannot be read, or that is past `--tape-max-bytes` (the message says which); in strict mode a request that cannot be read or was not recorded as a message list — a bare prompt (text or a JSON object, with or without system instructions beside it), or a list holding something other than messages; a run of more than 20,000 spans (unless a fork goes live within its first 20,000); or a snapshot larger than one tenant's whole share (64 MiB), which can never be held — refused as soon as building it passes the share. The message names the step and the remedy. Carries `x-should-retry: false` |
 | `429` with `Retry-After` | No room now. Each tenant's data — and the operator view, as a share of its own — may be held by 64 live replays and 64 MiB of memory; the registry as a whole by 1,024 replays and 512 MiB. Memory is everything a replay retains, counted generously: answers, tool records, identifiers, erasure bookkeeping, collection overhead, and its call log at its 4,096-entry bound (about 96 KiB). A full share answers with the seconds until enough of that share's replays expire. A full registry answers the same to unbound operators and a flat `60` to bound credentials, which do not learn when another tenant's replay expires. A live replay is never evicted |
 
 ### `GET /v1/replays/{id}`
@@ -1142,14 +1158,19 @@ whose value could not be resolved, or that recorded no result at all (see
 What a replay has served.
 
 ```json
-{"calls":[{"at_ns":1792062255964194000,"matched":true,"step":0}],"diverged":null,"expires_at_ns":1792065849919268000,"id":"rp_70235b53074a150e1cca9771c76a88bf","mode":"loose","remaining":1,"run":"weather-7","served":1,"unreadable_tool_steps":[]}
+{"calls":[{"at_ns":1792062255964194000,"matched":true,"step":0}],"diverged":null,"exhausted_calls":0,"expires_at_ns":1792065849919268000,"id":"rp_70235b53074a150e1cca9771c76a88bf","mode":"loose","remaining":1,"run":"weather-7","served":1,"unreadable_tool_steps":[]}
 ```
 
 `served` and `remaining` count model steps. `calls` lists each model call
 served or refused for divergence — `step` is its tape index and `matched`
 whether its messages matched the recording (informational in loose mode) — up
 to 4,096 entries. `diverged` is the first divergence, `{"step",
-"expected_digest", "got_digest"}`, or `null`. An unknown, expired or foreign
+"expected_digest", "got_digest"}` plus its `difference` once explained (see
+[matching](#post-v1replaysidopenaiv1chatcompletions)), or `null`.
+`exhausted_calls` counts model calls refused because every recorded step had
+been served. A fork adds `fork_id` and `fork`: `{"id", "parent", "step",
+"edits": [{"step", "kind", "served"}], "live_after", "live_at_ns",
+"live_calls"}` — when a call first answered `replay_live`, and how many have. An unknown, expired or foreign
 replay is `404 {"error":"replay not found"}`. A replay withdrawn by an
 erasure is `410 {"error":"…","type":"replay_erased","erasure":N}` on this and
 every route under it, from the moment the erasure is recorded until the
@@ -1183,7 +1204,8 @@ messages are compared — not the model or other parameters.
 | `200` | The next recorded answer; the step is consumed |
 | `400 {"error":{"type":"invalid_request_error",…}}` | The body is not a JSON object with a `messages` array; or a path other than `chat/completions` under the base URL |
 | `404 {"error":{"type":"not_found_error",…}}` | Unknown, expired or foreign replay — including one that expired while the call waited for an earlier call to the same replay to render, or while its own answer rendered; nothing is consumed |
-| `409 {"error":{"type":"replay_divergence","message","step","expected_digest","got_digest"}}` | Strict mode: the messages do not match recorded step `step`. The step is **not** consumed. Carries `x-should-retry: false` |
+| `409 {"error":{"type":"replay_divergence","message","step","expected_digest","got_digest","difference"?}}` | Strict mode: the messages do not match recorded step `step`. The step is **not** consumed. `difference` says where they first differ — `{"message", "role", "field"` (`role`, `content`, `tool_call_id`, `tool_calls`, or `missing` / `extra`), `"at_char", "recorded", "got"` (120-character quotes from just before `at_char`; `role` cut to 32 characters), `"recorded_messages", "got_messages"}` — read by re-reading the recorded request from its span under the query budget; absent when that cannot be done, and once a replay has re-read its recording 8 times (the first divergence's, kept, is still given for that same request). Carries `x-should-retry: false` |
+| `409 {"error":{"type":"replay_live","message","live_after","served","fork_id"}}` | A [fork](fork.md)'s call past its live point: send it to the real provider. Nothing is consumed, and every later call answers the same. Carries `x-should-retry: false` |
 | `409 {"error":{"type":"response_too_large","message","step","limit"}}` | The next recorded answer would render past 64 MiB in the asked-for shape — a stream can be many times its recording. The step is **not** consumed; the same step unstreamed may fit. Carries `x-should-retry: false` |
 | `410 {"error":{"type":"replay_exhausted","message","served"}}` | Every recorded model step has been served. Carries `x-should-retry: false` |
 | `410 {"error":{"type":"replay_erased","message","erasure"}}` | An erasure recorded after the replay was created covers content it held; the replay is withdrawn. Carries `x-should-retry: false` |
@@ -1229,6 +1251,8 @@ body or `{}` takes the next of any name.
 {"arguments":{"city":"Paris"},"result":{"celsius":12,"forecast":"rain"},"step":1,"tool":"get_weather"}
 ```
 
+A fork's edited result is served the same way, with `"edited": true`.
+
 Errors on this route, and on `GET /v1/replays/{id}`, take the API's own
 shape — `{"error": "<message>"}` with the machine-readable kind beside it as
 `type` — rather than a provider's:
@@ -1238,6 +1262,7 @@ shape — `{"error": "<message>"}` with the machine-readable kind beside it as
 | `400 {"error":"…"}` | A body that is not `{}` or `{"tool": "<name>"}` |
 | `404 {"error":"replay not found"}` | Unknown, expired or foreign replay |
 | `409 {"error":"…","type":"tool_unreadable","step"}` | The next tool step's arguments or result was offloaded and could not be resolved — erased, swept by retention, or past `--tape-max-bytes` — or it recorded no result at all (content capture off). A result recorded as `""` or `null` is served as recorded. The step is **not** consumed. Carries `x-should-retry: false` |
+| `409 {"error":"…","type":"replay_live","live_after","served","fork_id"}` | A fork holds no unserved tool step (of that name) before its live point: run the real tool. Carries `x-should-retry: false` |
 | `410 {"error":"…","type":"replay_exhausted"}` | No unserved tool step (of that name) remains. Carries `x-should-retry: false` |
 | `410 {"error":"…","type":"replay_erased","erasure"}` | The replay was withdrawn by an erasure. Carries `x-should-retry: false` |
 
@@ -1828,6 +1853,70 @@ filter left out included), `runs_in_window`, `window_capped`, `stopped`,
 `next_until_ns`, `truncated`, `spans_skipped`, `runs_skipped`, `since_ns`,
 `until_ns`. Detectors with findings come first, by severity, then by runs
 matched. The [guide](tql.md#findings) has a worked response.
+### `GET /v1/forks`
+
+A run's forks: the runs whose spans carry `traza.fork.parent = <run>`, the
+most recently started first, each diffed against its parent read in the
+fork's own tenant. See the [fork guide](fork.md#finding-a-runs-forks).
+
+| Parameter | Type | Description |
+|---|---|---|
+| `run` | string, required | The parent run |
+| `limit` | integer | Forks to list. Default 20, capped at 50 |
+| `tenant` | string | Tenant scope |
+
+```sh
+curl 'http://localhost:8080/v1/forks?run=weather-7'
+```
+
+```json
+{"forks":[{"cost_usd":0.0,"delta":{"cost_usd":0.0,"duration_ns":0,"errors":0,"steps":0,"tokens":0},"diffed":true,"diverged_before_cut":false,"errors":0,"first_divergence":{"a":1,"b":1,"explanation":"step 1 of a and step 1 of b (tool:get_weather) received the same input and produced a different output: response 25ac26944464 in a, 05b04b8ed40a in b","kind":"decision"},"first_start_ns":1791964860000000000,"fork_id":"fk_b6956c347b2ab03ff5b1fc530c36754d","fork_step":1,"last_end_ns":1791964861000000000,"outcome":"success","run":"fk_b6956c347b2ab03ff5b1fc530c36754d","steps":3,"tagged_spans":4,"tenant":"","truncated":false}],"merged_into_parent":0,"parent":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-7","steps":3,"tokens":233,"truncated":false},"run":"weather-7","spans_examined":4,"truncated":false}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `parent` | object or null | The parent run summarised as on [`GET /v1/diff`](#get-v1diff), read under the request's scope; `null` when it has no spans there |
+| `forks[].run`, `tenant` | string | The forked run and its tenant |
+| `forks[].fork_id`, `fork_step` | string, integer | The `traza.fork.id` and `traza.fork.step` its spans carry, when they do |
+| `forks[].first_start_ns`, `last_end_ns`, `tagged_spans` | integer | Over its tagged spans |
+| `forks[].diffed` | boolean | Whether it was compared with its parent; when not, `skipped` is `deadline` (the query budget ran out before it) or `parent_missing` (the parent has no spans in its tenant), and the fields below are `null` |
+| `forks[].steps`, `outcome`, `cost_usd`, `errors` | | The fork, as the differ summarises a side |
+| `forks[].first_divergence`, `delta` | object | The differ's, with the parent as `a` and the fork as `b` |
+| `forks[].diverged_before_cut` | boolean or null | It parted from the parent before the step it was cut at: the replayed beginning did not re-execute as recorded |
+| `merged_into_parent` | integer | Tagged spans whose own run id is the parent's: a fork without a session of its own, whose spans joined the parent run |
+| `truncated` | boolean | More than 10,000 tagged spans (the listing is then built from the earliest-starting 10,000, so the newest forks may be missing), more forks than `limit`, or a fork the budget did not reach |
+
+`404 {"error":"run not found"}` when neither the run nor any fork of it has a
+span in scope; `400` when `run` is missing, `limit` is not a positive
+integer, or the tagged-span read or the parent's read does not fit the
+request's one `--query-deadline-ms` budget. The forks' reads and diffs spend
+the same budget; a fork it does not reach is listed undiffed rather than
+refusing the listing.
+
+### `GET /v1/goldens`
+
+The runs marked as regression baselines, ordered by tenant then run id: a
+run with a span carrying `traza.golden = true`, or whose newest annotation
+named `traza.golden` on its session (`session_id`) or its trace (`trace_id`
+with no span, naming the run `trace:<trace_id>`) says `true`. A newer
+annotation saying `false` un-marks a run, whatever its spans say. Both read
+a value by one rule: the boolean, or exactly the string `"true"` /
+`"false"` (`"True"` decides nothing). See [golden runs](fork.md#golden-runs-and-traza-test).
+
+| Parameter | Type | Description |
+|---|---|---|
+| `limit` | integer | Runs to list. Default 200, capped at 1,000 |
+| `tenant` | string | Tenant scope |
+
+```json
+{"annotations_examined":1,"runs":[{"run":"weather-7","source":"annotation","tagged_at_ns":1792298442062521000,"tenant":""}],"spans_examined":0,"truncated":false}
+```
+
+`source` is `attribute` or `annotation` — what marked the run; `tagged_at_ns`
+is the newest tagged span's start, or the deciding annotation's timestamp.
+`truncated` says more than 20,000 tagged spans or 10,000 annotations were
+found, or more runs than `limit`. `400` for a bad `limit`, an unknown
+parameter, or a tagged-span read past the query budget.
 
 ---
 

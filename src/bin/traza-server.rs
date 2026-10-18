@@ -206,6 +206,9 @@ impl RouteClass {
             ("GET", path) if path.starts_with("/v1/fate/") => Self::Stats,
             ("GET", traza::radar::ROUTE) => Self::Stats,
             ("GET", path) if tql_routes::handles(path) => Self::Stats,
+            // Fork listings read and diff many runs; golden listings fold
+            // tagged spans and annotations.
+            ("GET", "/v1/forks" | "/v1/goldens") => Self::Stats,
             _ => Self::Other,
         }
     }

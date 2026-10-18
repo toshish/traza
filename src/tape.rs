@@ -314,6 +314,18 @@ impl Store {
     }
 }
 
+impl Store {
+    /// One span as the tape step at `index`, or `None` when it is no step —
+    /// for a reader that needs one known span's step, not the whole run's.
+    pub(crate) fn span_step(&self, index: usize, span: &Span) -> Option<TapeStep> {
+        let (facts, extras, llm) = self.step_facts_detailed(span);
+        facts
+            .kind
+            .is_step()
+            .then(|| tape_step(index, span, facts, extras, llm))
+    }
+}
+
 /// Payload bytes still available to one tape's resolution, and what it left
 /// unresolved.
 ///

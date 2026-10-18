@@ -114,7 +114,7 @@ over `curl`.
 
 ## The tools
 
-Twenty-three tools: twenty-one reads and two gated writers. They are shaped like the
+Twenty-four tools: twenty-two reads and two gated writers. They are shaped like the
 questions somebody asks at 2am, not like the route index — two routes may serve
 one tool, and one route may serve two. Most of them describe what is in the
 store; `diagnose_session` and `compare_runs` are the ones that answer a
@@ -143,6 +143,7 @@ question about it.
 | `xray_step` | **What exactly did the model see at this step — and why did its cache break?** |
 | `what_changed` | **What changed in this agent, and did it make things worse?** |
 | `find_behavior` | **Which runs did *this*?** — a behaviour pattern, or a named detector |
+| `list_forks` | Which branches of this run were tried, and how did each go? |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -151,13 +152,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the twenty-one readers | `true` | — | — | `false` |
+| the twenty-two readers | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises twenty-one read tools as though each might delete something and
+omits them advertises twenty-two read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -254,6 +255,16 @@ The reasoning behind these is worth knowing:
   reported missing. Agent names,
   values, prompt text, tool names and run ids render inside the telemetry
   block.
+- **`list_forks` reads the branches a harness already made** of a run
+  ([forks](fork.md)): the most recent first, each with the step it was cut
+  at, how it ended, its cost, and where it first parted from the parent —
+  the step, the kind of difference and the differ's explanation, all inside
+  the untrusted block. It takes `run_id` and an optional `limit` (default 20,
+  at most 50), reads the same listing as
+  [`GET /v1/forks`](http-api.md#get-v1forks) under the caller's tenant, and
+  says when a fork was not compared (the query budget ran out first, or the
+  parent has no spans in its tenant). There is no tool that creates a fork,
+  for the reason there is none that creates a replay.
 
 **`foresee_run` reads a run against its agent's [Fate Map](foresight.md).** It
 takes `run_id`, an optional `tenant` (for an unbound credential; a bound one
@@ -310,7 +321,7 @@ the run's `foresight` too, and a foresight stop reads as any other reason;
 in `structuredContent` the reasons and the foresight's explanation and next
 tool are made JSON-safe, as `foresee_run` makes the same text. On a server
 started with `--no-fuses` it is not listed, nor is `list_live_runs` —
-nineteen reads, then — and a call naming either is refused.
+twenty reads, then — and a call naming either is refused.
 
 **`list_live_runs` and `run_topology` are [steering](steer.md)'s reads.**
 `list_live_runs` is [`GET /v1/runs/live`](http-api.md#get-v1runslive): the

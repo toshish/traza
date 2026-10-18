@@ -12,6 +12,9 @@ with that recording afterwards:
 - **recall** earlier runs that dealt with the same thing, successful ones
   first.
 
+Forking a run at a step — an edited answer, then the real provider — and
+replaying recorded runs as tests have [a guide of their own](fork.md).
+
 All of it runs in the one `traza-server` process. Traza never calls a model:
 a replay answers *in place of* the provider, from what was recorded. Route
 shapes are in the [HTTP API reference](http-api.md#runs-tapes-replays-diffs-and-recall).
@@ -177,7 +180,8 @@ could not be read, or that recorded no result at all, is listed in
 [tools](#tools-still-execute-live--unless-you-replay-them-too)). A run with
 more than 20,000 spans is refused (`409`) rather than replayed as its
 beginning, which would end the agent's run early as if the recording stopped
-there.
+there — unless a [fork](fork.md#forking-a-run) goes live within the steps
+those spans hold, so nothing past them is served.
 
 **3. Point the SDK at it and run the agent.**
 
@@ -255,6 +259,7 @@ curl -s localhost:8080/v1/replays/rp_ac879985abef9cba12bb342bdc3b8bd1 \
     {"step": 0, "matched": true, "at_ns": 1792062055501840000},
     {"step": 2, "matched": true, "at_ns": 1792062063623225000}
   ],
+  "exhausted_calls": 0,
   "unreadable_tool_steps": [],
   "expires_at_ns": 1792065649987347000
 }
@@ -263,7 +268,8 @@ curl -s localhost:8080/v1/replays/rp_ac879985abef9cba12bb342bdc3b8bd1 \
 Both recorded model steps were served and both requests matched the
 recording. Nothing was sent to a model provider: the replay routes make no
 outbound request of any kind. A third model call would get `410` with
-`{"error": {"type": "replay_exhausted", …}}`.
+`{"error": {"type": "replay_exhausted", …}}`, and `exhausted_calls` would
+count it.
 
 ### Streaming
 
@@ -323,6 +329,17 @@ x-should-retry: false
   "expected_digest":"6db28425e9e18cdbf0bb3dd925d6afa9352b5f91e8a33438e5d4a29f03993f9d",
   "got_digest":"cd1ff438bb759f43d89b1089fc5ca10b67a08a6311fee65adc9d4bee844c8fc3"}}
 ```
+
+The refusal also says **where** the request first differs, when the recorded
+request can be read again: `difference` names the message, its role, the
+field (`role`, `content`, `tool_call_id`, `tool_calls`, or `missing` /
+`extra`), the character, and a quote of each side — `{"message": 1, "role":
+"user", "field": "content", "at_char": 22, "recorded": "What's the weather
+in Paris?", "got": "What's the weather in Lyon?", …}`. The replay keeps it
+with its first divergence. Explaining costs a re-read of the recording, so a
+replay does it at most 8 times; past that a divergence is refused without
+one. It is what makes a strict replay a usable
+[tape test](fork.md#tape-tests).
 
 A divergence means your agent asked a different question than it asked when
 the run was recorded — a changed prompt, a different tool result, a new
@@ -525,10 +542,11 @@ all of them, so words that appear in more than 200,000 spans are refused with
 
 ## From an agent: the MCP tools
 
-With `--mcp`, three read tools put the same answers in front of a model:
+With `--mcp`, four read tools put the same answers in front of a model:
 `get_run_tape` (a compact rendering of the tape with input and output
 previews), `compare_runs` (the alignment and first divergence, with
-structured content), and `recall_runs` (recalled runs and their skeletons).
+structured content), `recall_runs` (recalled runs and their skeletons), and
+`list_forks` (a run's [forks](fork.md) and where each parted from it).
 Stored text in their results stays inside the untrusted-telemetry block, as
 everywhere on that surface. There is no replay tool: a replay is for an agent
 *harness*, and letting the model under test create one would let stored
@@ -545,7 +563,7 @@ telemetry choose which recording its next run is fed. See the
   `--tape-max-bytes` — refuses it the same way (`409`), and the message says
   which of those it was. A tool step that recorded no result is refused by
   `tools/next` rather than served as `null`. A run longer than 20,000 spans
-  is refused rather than cut.
+  is refused rather than cut, except as a rewind that goes live inside it.
 - **Only chat completions and messages are replayed.** The OpenAI Responses
   API, embeddings and legacy completions under the replay's base URL answer
   `400`.

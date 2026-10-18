@@ -1062,10 +1062,14 @@ fn strict_divergence_is_refused_without_consuming_the_step() {
     assert_eq!(tape["steps"][0]["request_digest"], json!(expected));
 
     let (_, report) = send_json(&server, "GET", &format!("/v1/replays/{id}"), None, &[]);
+    // The divergence is kept with where the request first differed, as the
+    // refusal reported it.
     assert_eq!(
         report["diverged"],
-        json!({"step": 0, "expected_digest": expected, "got_digest": got})
+        json!({"step": 0, "expected_digest": expected, "got_digest": got,
+               "difference": error["error"]["difference"]})
     );
+    assert_eq!(error["error"]["difference"]["field"], json!("content"));
     assert_eq!(report["served"], json!(0), "a divergence consumes nothing");
     assert_eq!(report["calls"][0]["matched"], json!(false));
 

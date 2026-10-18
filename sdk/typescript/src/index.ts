@@ -4,8 +4,10 @@
  * Not instrumentation — OpenTelemetry records the spans ({@link otelEnv}
  * writes its exporter settings). This package asks the server about what was
  * recorded: run fuses and the pre-call guard, tapes and replays, diffs,
- * recall, the ledger and evidence packs. No runtime dependencies: the global
- * `fetch` is the transport.
+ * recall, the ledger and evidence packs — and it forks a recorded run at any
+ * step ({@link Client.fork}) and replays recorded runs as tests
+ * ({@link replayTest}). No runtime dependencies: the global `fetch` is the
+ * transport.
  *
  * ```ts
  * import { Client } from "@trazadb/sdk";
@@ -28,6 +30,18 @@ export type {
   RequestOptions,
 } from "./client.js";
 export { AuthError, Conflict, FuseTripped, Gone, NotFound, QuotaExceeded, TrazaError } from "./errors.js";
+export { FORK_CONTEXT_KEY, FORK_ID, FORK_PARENT, FORK_STEP, Fork } from "./fork.js";
+export type {
+  ForkOptions,
+  ForkSpanProcessor,
+  LiveProvider,
+  OtelContext,
+  OtelContextApi,
+  SpanProcessorOptions,
+  TaggableSpan,
+} from "./fork.js";
+export { describeReplay, replayTest, TapeMismatch } from "./testing.js";
+export type { ReplayTestOptions } from "./testing.js";
 export type { TrazaErrorOptions } from "./errors.js";
 export { verifyEvidenceDigest } from "./evidence.js";
 export { parseJson, RawNumber, stringifyJson } from "./json.js";

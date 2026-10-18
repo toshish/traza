@@ -10,12 +10,17 @@
 
 import { errorFromResponse, FuseTripped, TrazaError } from "./errors.js";
 import { verifyEvidenceDigest } from "./evidence.js";
+import { Fork, type ForkOptions } from "./fork.js";
 import { parseJson, stringifyJson } from "./json.js";
 import type {
   DeliveredNudge,
   Diff,
   EvidencePack,
+  ForkEdit,
+  ForkInfo,
+  Forks,
   FuseEvent,
+  Goldens,
   Identity,
   LedgerHead,
   Limits,
@@ -392,14 +397,71 @@ export class Client {
   /**
    * Snapshots `run` into a replay that serves its model answers back.
    * `strict` (the default) refuses a request whose messages differ from the
-   * recorded step; `loose` serves in order regardless. It lives in server
-   * memory for an hour.
+   * recorded step (the refusal names the first difference); `loose` serves
+   * in order regardless. It lives in server memory for an hour.
+   *
+   * `edits` and `liveAfter` make it a fork (see {@link fork}, which also
+   * switches the agent to the real provider at the cut): each edit is served
+   * instead of the recording at its step, and after step `liveAfter` every
+   * call answers `409 replay_live`.
    */
-  async replay(run: string, options: CallOptions & { mode?: "strict" | "loose" } = {}): Promise<Replay> {
+  async replay(
+    run: string,
+    options: CallOptions & { mode?: "strict" | "loose"; edits?: ForkEdit[]; liveAfter?: number } = {},
+  ): Promise<Replay> {
     const body: Record<string, unknown> = { run, mode: options.mode ?? "strict" };
+    if (options.edits?.length) body.edits = options.edits;
+    if (options.liveAfter !== undefined) body.live_after = options.liveAfter;
     if (this.tenant !== undefined) body.tenant = this.tenant;
     const document = await this.#object<ReplayDocument>("POST", "/v1/replays", { signal: options.signal, body });
     return new Replay(this, document);
+  }
+
+  /**
+   * Branches `run` at tape step `atStep`. Steps before it are replayed from
+   * the recording, strictly; at it the agent receives `response` (a model
+   * answer) or `toolResult` (from {@link Fork.toolResult}) instead — or, with
+   * neither, the recording stops there; with `live` (the default) every
+   * later call goes to the real provider through the fork's switching
+   * `fetch`. See {@link Fork}.
+   */
+  async fork(run: string, options: ForkOptions): Promise<Fork> {
+    const { edits, liveAfter } = Fork.spec(options);
+    const replay = await this.replay(run, { mode: options.mode, edits, liveAfter, signal: options.signal });
+    return new Fork(this, replay, run, options);
+  }
+
+  /** The recorded forks of `run`, newest first, each diffed against it. */
+  forks(run: string, options: CallOptions & { limit?: number } = {}): Promise<Forks> {
+    return this.#object<Forks>("GET", "/v1/forks", {
+      signal: options.signal,
+      query: { ...this.#tenantQuery(), run, limit: options.limit },
+    });
+  }
+
+  /** The runs marked golden, by span attribute or by annotation. */
+  goldens(options: CallOptions & { limit?: number } = {}): Promise<Goldens> {
+    return this.#object<Goldens>("GET", "/v1/goldens", {
+      signal: options.signal,
+      query: { ...this.#tenantQuery(), limit: options.limit },
+    });
+  }
+
+  /**
+   * Marks `run` as a regression baseline — or with `golden: false` un-marks
+   * it — by an annotation named `traza.golden` on its session (or, for
+   * `trace:<id>`, its trace). The newest one decides. Needs an `rw` credential.
+   */
+  async markGolden(run: string, options: CallOptions & { golden?: boolean; source?: string } = {}): Promise<void> {
+    const body: Record<string, unknown> = {
+      name: "traza.golden",
+      value: options.golden ?? true,
+      source: options.source ?? "human:traza-sdk",
+    };
+    if (run.startsWith("trace:")) body.trace_id = run.slice("trace:".length);
+    else body.session_id = segmentCheck(run);
+    if (this.tenant !== undefined) body.tenant = this.tenant;
+    await this.#object("POST", "/v1/annotations", { signal: options.signal, body });
   }
 
   /** Aligns two runs' steps and names the first place they diverge. */
@@ -611,10 +673,15 @@ export class Replay implements ReplayDocument {
   readonly run: string;
   readonly mode: "strict" | "loose";
   readonly steps: number;
+  /** Present (true) when `steps` counts only the run's beginning. */
+  readonly steps_truncated?: boolean;
   readonly llm_steps: number;
   readonly expires_at_ns: bigint;
   readonly unreadable_tool_steps: number[];
   readonly base_urls: { openai: string; anthropic: string };
+  /** Present when the replay is a fork. */
+  readonly fork_id?: string;
+  readonly fork?: ForkInfo;
   readonly #client: Client;
 
   constructor(client: Client, document: ReplayDocument) {
@@ -627,6 +694,9 @@ export class Replay implements ReplayDocument {
     this.expires_at_ns = document.expires_at_ns;
     this.unreadable_tool_steps = document.unreadable_tool_steps;
     this.base_urls = document.base_urls;
+    if (document.steps_truncated !== undefined) this.steps_truncated = document.steps_truncated;
+    if (document.fork_id !== undefined) this.fork_id = document.fork_id;
+    if (document.fork !== undefined) this.fork = document.fork;
   }
 
   // Concatenated rather than resolved with `new URL(path, base)`: the
@@ -763,8 +833,12 @@ function jsonKind(value: unknown): string {
 
 /** Percent-encodes one path segment: a run id may contain `/`. */
 function segment(value: string): string {
+  return encodeURIComponent(segmentCheck(value));
+}
+
+function segmentCheck(value: string): string {
   if (typeof value !== "string" || value === "") throw new TypeError("expected a non-empty string");
-  return encodeURIComponent(value);
+  return value;
 }
 
 /**

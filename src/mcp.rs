@@ -41,7 +41,7 @@ use crate::analytics::{LlmAggregateRow, LlmGroupBy, SessionOrder};
 use crate::annotations::Annotation;
 use crate::{semconv, Error, Span, SpanCursor, SpanFilter, SpanSort, Store};
 
-// get_run_tape, compare_runs and recall_runs live beside this file.
+// get_run_tape, compare_runs, recall_runs and list_forks live beside this file.
 mod replay_tools;
 // v0.28's tools live beside this file too: foresee_run (the Fate Map),
 // list_live_runs and run_topology (steering), blame_line (Agent Blame),

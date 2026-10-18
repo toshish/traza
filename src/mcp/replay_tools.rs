@@ -1,19 +1,22 @@
-//! MCP tools over runs: a run's tape, two runs compared, and earlier runs
-//! recalled by the words they contain.
+//! MCP tools over runs: a run's tape, two runs compared, earlier runs
+//! recalled by the words they contain, and a run's forks.
 //!
 //! Facades over [`Store::tape`](crate::Store::tape),
-//! [`Store::diff_runs`](crate::Store::diff_runs) and
-//! [`Store::recall`](crate::Store::recall) — the same calls `GET
-//! /v1/tapes/{run}`, `GET /v1/diff` and `GET /v1/recall` make — under the
-//! module's rules: every stored string (prompts, tool names, model names, run
-//! ids from telemetry, goals) renders inside the untrusted-telemetry block or,
-//! in structured content, made JSON-safe; results are clamped to the server's
-//! ceiling with the loss stated. All three are reads.
+//! [`Store::diff_runs`](crate::Store::diff_runs),
+//! [`Store::recall`](crate::Store::recall) and
+//! [`Store::forks`](crate::Store::forks) — the same calls `GET
+//! /v1/tapes/{run}`, `GET /v1/diff`, `GET /v1/recall` and `GET /v1/forks`
+//! make — under the module's rules: every stored string (prompts, tool names,
+//! model names, run ids from telemetry, goals) renders inside the
+//! untrusted-telemetry block or, in structured content, made JSON-safe;
+//! results are clamped to the server's ceiling with the loss stated. All four
+//! are reads.
 //!
-//! There is deliberately no replay tool. A replay is an execution surface for
-//! an agent HARNESS — it answers model calls in place of a provider — and
-//! handing its creation to the model under test would let stored telemetry
-//! steer which recording the next run is fed.
+//! There is deliberately no replay or fork tool. A replay is an execution
+//! surface for an agent HARNESS — it answers model calls in place of a
+//! provider — and handing its creation to the model under test would let
+//! stored telemetry steer which recording the next run is fed. Listing the
+//! forks a harness already made only reads.
 
 use serde_json::{json, Map, Value};
 
@@ -24,6 +27,7 @@ use super::{
     ToolError, ToolResult, VALUE_CHARS,
 };
 use crate::diff::{Aligned, Op, RunDiff, RunSide};
+use crate::fork::{ForkSummary, Forks, DEFAULT_FORK_LIMIT, MAX_FORK_LIMIT};
 use crate::recall::{OutcomeFilter, RecalledRun, DEFAULT_RECALL_LIMIT, MAX_RECALL_LIMIT};
 use crate::tape::{TapeOptions, TapeStep};
 
@@ -48,6 +52,9 @@ const COMPARE_NARROW: &str = "Compare shorter runs, or open each with get_run_ta
 
 /// What to do about a `recall_runs` result the ceiling cut short.
 const RECALL_NARROW: &str = "Ask for a smaller 'limit', or add words to 'query'.";
+
+/// What to do about a `list_forks` result the ceiling cut short.
+const FORKS_NARROW: &str = "Ask for a smaller 'limit'.";
 
 /// The tool definitions, appended to the server's read tools.
 pub(super) fn definitions() -> Vec<Tool> {
@@ -141,12 +148,47 @@ pub(super) fn definitions() -> Vec<Tool> {
             Nature::Read,
         )
         .with_output_schema(recall_output_schema()),
+        tool(
+            "list_forks",
+            "List a run's forks",
+            "Which branches of this run were tried, and how did each go? A fork re-ran an \
+             agent against its recording up to a step, then served an edited answer or tool \
+             result there, or let it continue live. Lists every recorded fork of a run — the \
+             most recent first — with the step it was cut at, how it ended, its cost, and \
+             where it first parted from the parent run (step, kind of difference, and a \
+             one-sentence explanation). Use it to find the fork that fixed a failure, then \
+             open it with get_run_tape or compare it in full with compare_runs.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "run_id": {
+                        "type": "string",
+                        "description": "The parent run: a session id, or 'trace:<trace_id>'.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_FORK_LIMIT,
+                        "description": format!(
+                            "Forks to list. Default {DEFAULT_FORK_LIMIT}, capped at \
+                             {MAX_FORK_LIMIT}."
+                        ),
+                    },
+                },
+                "required": ["run_id"],
+                "additionalProperties": false,
+            }),
+            Nature::Read,
+        ),
     ]
 }
 
 /// Whether `name` is one of this module's tools.
 pub(super) fn handles(name: &str) -> bool {
-    matches!(name, "get_run_tape" | "compare_runs" | "recall_runs")
+    matches!(
+        name,
+        "get_run_tape" | "compare_runs" | "recall_runs" | "list_forks"
+    )
 }
 
 /// Calls one of this module's tools.
@@ -159,8 +201,113 @@ pub(super) fn call(
     match name {
         "get_run_tape" => get_run_tape(server, arguments, context),
         "compare_runs" => compare_runs(server, arguments, context),
+        "list_forks" => list_forks(server, arguments, context),
         _ => recall_runs(server, arguments, context),
     }
+}
+
+fn list_forks(
+    server: &Server<'_>,
+    arguments: &Map<String, Value>,
+    context: &Context,
+) -> ToolResult {
+    known_keys(arguments, &["run_id", "limit"], "list_forks")?;
+    let run_id = required_str(arguments, "run_id")?;
+    let limit = optional_usize(arguments, "limit")?
+        .unwrap_or(DEFAULT_FORK_LIMIT)
+        .clamp(1, MAX_FORK_LIMIT);
+    let forks: Forks = server
+        .store
+        .forks(context.scope(), run_id, limit, context.now_ns)?
+        .ok_or_else(|| {
+            ToolError(
+                "No run with that id, and no fork names it as its parent. A run id is a \
+                 session id (take one from list_sessions or recall_runs) or 'trace:' followed \
+                 by a trace id."
+                    .to_owned(),
+            )
+        })?;
+    let head = format!(
+        "Run {} has {}.{}{}",
+        sanitize(run_id),
+        count(forks.forks.len() as u64, "recorded fork"),
+        match &forks.parent {
+            Some(parent) => format!("\n{}", side_phrase("parent", parent)),
+            None => " The parent run itself has no spans in scope (erased, or never recorded \
+                     here); its forks cannot be compared with it."
+                .to_owned(),
+        },
+        if forks.truncated {
+            " TRUNCATED: there are more forks than listed, or the query budget ran out \
+             before every fork was compared (those say 'not compared')."
+        } else {
+            ""
+        },
+    );
+    let rows: Vec<String> = forks.forks.iter().map(fork_line).collect();
+    let mut notes = vec![
+        "A fork's 'cut' is the first step whose answer was not the parent's. 'parted' is \
+         where its steps first differ from the parent's: at the cut is expected; before it \
+         means the replayed beginning did not re-execute as recorded (a tool that ran live, \
+         typically)."
+            .to_owned(),
+    ];
+    if forks.merged_into_parent > 0 {
+        notes.push(format!(
+            "{} carry the fork tag but belong to the parent run itself: a harness forked \
+             without giving the fork a session of its own, so those spans joined the parent.",
+            count(forks.merged_into_parent as u64, "span")
+        ));
+    }
+    Ok(text_result(clamp_report_narrowing(
+        &head,
+        &rows,
+        &notes,
+        server.limits.max_result_bytes,
+        FORKS_NARROW,
+    )))
+}
+
+/// One fork's row: id, cut, outcome, cost and where it parted.
+fn fork_line(fork: &ForkSummary) -> String {
+    let cut = fork
+        .fork_step
+        .map_or_else(|| "cut ?".to_owned(), |step| format!("cut at step {step}"));
+    let id = fork
+        .fork_id
+        .as_deref()
+        .map(|id| format!(" [{}]", sanitize(id)))
+        .unwrap_or_default();
+    if !fork.diffed {
+        let why = match fork.skipped {
+            Some("deadline") => "not compared: the query budget ran out first",
+            _ => "not compared: the parent has no spans in this fork's tenant",
+        };
+        return format!("{}{id} · {cut} · {why}", sanitize(&fork.run));
+    }
+    let outcome = fork.outcome.map_or("unknown", outcome_word);
+    let parted = match &fork.first_divergence {
+        None => "matches the parent step for step".to_owned(),
+        Some(first) => format!(
+            "parted at step {} ({}){}: {}",
+            first.b,
+            first.kind.as_str(),
+            if fork.diverged_before_cut == Some(true) {
+                ", BEFORE its cut"
+            } else {
+                ""
+            },
+            sanitize(&first.explanation)
+        ),
+    };
+    format!(
+        "{}{id} · {cut} · {} · {} · ${:.4} · {}",
+        sanitize(&fork.run),
+        outcome,
+        count(fork.steps.unwrap_or(0) as u64, "step"),
+        fork.cost_usd.unwrap_or(0.0),
+        parted,
+    )
 }
 
 fn get_run_tape(

@@ -37,7 +37,8 @@
 //! own, digested and dropped — strict mode compares against the digest, so
 //! keeping a long conversation's ever-growing prompts would spend the budget
 //! on content nothing reads. A run longer than the span cap is refused rather
-//! than replayed as its beginning.
+//! than replayed as its beginning — except by a fork that goes live within
+//! the steps read, which serves nothing past its live point.
 //!
 //! A replay is a copy taken out of the store, so erasure must reach it: every
 //! call first checks whether an erasure recorded since the replay was created
@@ -95,6 +96,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 
 use crate::erasure::{EraseRecord, Subject};
+use crate::fork::{EditValue, ForkInfo, ForkSpec, MAX_EDITS};
 use crate::semconv::{self, ResponseSource, StepKind};
 use crate::tape::{self, Leftover, ResolveBudget, Resolver, TapeStep};
 use crate::{Deadline, Span, Store};
@@ -161,6 +163,29 @@ pub const MAX_IDENTIFIER_BYTES: usize = 256;
 /// log stops growing and serving continues.
 const MAX_RECORDED_CALLS: usize = 4096;
 
+/// Characters of each side a divergence's first difference quotes
+/// ([`Registry::explain_divergence`]).
+const DIFFERENCE_CHARS: usize = 120;
+
+/// Characters a quoted difference starts before the first differing
+/// character, so a reader sees where it sits.
+const DIFFERENCE_CONTEXT: usize = 40;
+
+/// Characters of a role a divergence's first difference keeps.
+const DIFFERENCE_ROLE_CHARS: usize = 32;
+
+/// Store reads one replay may spend explaining divergences.
+const MAX_EXPLANATIONS: usize = 8;
+
+/// What a recorded first difference may hold at most, charged up front with
+/// the rest of a replay's bookkeeping, as [`crate::tail::value_bytes`]
+/// measures a JSON value: two quotes of [`DIFFERENCE_CHARS`] characters and a
+/// role of [`DIFFERENCE_ROLE_CHARS`] (up to four bytes each, plus the `…`
+/// marking a cut), and the eight entries around them. Every string in it is
+/// cut to one of those bounds whatever the request held, and a difference
+/// measuring more is never kept ([`Registry::explain_divergence`]).
+const DIFFERENCE_BYTES: usize = 4096;
+
 /// Characters per streamed delta window. Large texts use larger windows so
 /// that an answer stays a bounded number of events (see [`deltas`]).
 const STREAM_DELTA_CHARS: usize = 16;
@@ -203,6 +228,33 @@ impl Mode {
     }
 }
 
+/// Which provider's wire a request to a replay was shaped for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provider {
+    /// OpenAI chat completions.
+    OpenAi,
+    /// Anthropic messages.
+    Anthropic,
+}
+
+impl Provider {
+    /// The normalised digest of a request body in this provider's shape
+    /// ([`openai_request_digest`], [`anthropic_request_digest`]).
+    pub fn request_digest(self, body: &Value) -> Result<Option<String>, String> {
+        match self {
+            Self::OpenAi => openai_request_digest(body),
+            Self::Anthropic => anthropic_request_digest(body),
+        }
+    }
+
+    fn messages(self, body: &Value) -> Result<Vec<Normalised>, String> {
+        match self {
+            Self::OpenAi => openai_messages(body),
+            Self::Anthropic => anthropic_messages(body),
+        }
+    }
+}
+
 /// The bounds one [`Registry`] enforces. [`Limits::default`] is the
 /// documented set; tests lower them to reach the edges cheaply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,7 +271,8 @@ pub struct Limits {
     /// largest replay that can ever be created.
     pub max_bytes_per_tenant: usize,
     /// Spans a replayed run may have. A longer run is refused, never replayed
-    /// as its beginning.
+    /// as its beginning — unless a fork's live point falls within the steps
+    /// read, when that beginning is all the fork serves.
     pub max_spans: usize,
     /// The largest response one call renders.
     pub max_response_bytes: usize,
@@ -320,6 +373,17 @@ pub enum ReplayError {
         /// The erasure's id in the tombstone log.
         erasure: u64,
     },
+    /// A fork's live point: the recording is not served after step
+    /// `live_after`, so this call belongs to the real provider (or, from
+    /// `tools/next`, the real tool). Nothing is consumed.
+    Live {
+        /// The fork's live point.
+        live_after: usize,
+        /// Llm steps the replay served before it.
+        served: usize,
+        /// The fork's id.
+        fork_id: Option<String>,
+    },
     /// The store refused the read the replay needed.
     Engine(crate::Error),
 }
@@ -395,6 +459,12 @@ impl fmt::Display for ReplayError {
                 "the recording this replay held was erased (erasure {erasure}) after the \
                  replay was created; the replay is withdrawn and serves nothing more"
             ),
+            Self::Live { live_after, .. } => write!(
+                f,
+                "this fork goes live after step {live_after}: the recording is not served past \
+                 it, so send this call to the real provider (or run the real tool) — the run \
+                 continues from here as a new branch"
+            ),
             Self::Engine(error) => write!(f, "the replay could not be served: {error}"),
         }
     }
@@ -421,6 +491,10 @@ pub struct Created {
     pub run: String,
     /// Steps on the run's tape: llm, tool and agent.
     pub steps: usize,
+    /// Whether `steps` counts only the run's beginning: a fork whose live
+    /// point falls inside the first [`Limits::max_spans`] spans of a longer
+    /// run replays that beginning, and the rest of the run was never read.
+    pub steps_truncated: bool,
     /// Llm steps the replay will serve.
     pub llm_steps: usize,
     /// The matching mode.
@@ -431,12 +505,16 @@ pub struct Created {
     /// snapshotted; `tools/next` refuses them rather than serving a payload
     /// reference as if it were the recorded value.
     pub unreadable_tool_steps: Vec<usize>,
+    /// When the replay is a fork — created with edits or a live point
+    /// ([`crate::fork`]) — what kind of fork.
+    pub fork: Option<ForkInfo>,
 }
 
 impl Created {
-    /// The `201` body of `POST /v1/replays`.
+    /// The `201` body of `POST /v1/replays`. A fork adds `fork_id` and
+    /// `fork` ([`ForkInfo::to_json`]).
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut body = json!({
             "id": self.id,
             "run": self.run,
             "steps": self.steps,
@@ -448,7 +526,15 @@ impl Created {
                 "openai": format!("/v1/replays/{}/openai/v1", self.id),
                 "anthropic": format!("/v1/replays/{}/anthropic", self.id),
             },
-        })
+        });
+        if self.steps_truncated {
+            body["steps_truncated"] = json!(true);
+        }
+        if let Some(fork) = &self.fork {
+            body["fork_id"] = json!(fork.id);
+            body["fork"] = fork.to_json();
+        }
+        body
     }
 }
 
@@ -480,17 +566,24 @@ pub struct ServedTool {
     /// The recorded result — `null` or `""` only when it was recorded so. A
     /// step whose result was never captured is refused, not served.
     pub result: Value,
+    /// Whether `result` is a fork's edit rather than the recording's.
+    pub edited: bool,
 }
 
 impl ServedTool {
-    /// The `tools/next` response body.
+    /// The `tools/next` response body. A fork's edited result adds
+    /// `"edited": true`.
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut body = json!({
             "step": self.step,
             "tool": self.tool,
             "arguments": self.arguments,
             "result": self.result,
-        })
+        });
+        if self.edited {
+            body["edited"] = json!(true);
+        }
+        body
     }
 }
 
@@ -522,6 +615,15 @@ struct LlmStep {
     expected_digest: Option<String>,
     choices: Vec<Choice>,
     tokens: tape::StepTokens,
+    /// Whether an incoming request must match the recording to be served:
+    /// strict mode, up to and including a fork's first edited step.
+    strict: bool,
+    /// Whether the answer is a fork's edit rather than the recording's.
+    edited: bool,
+    /// Where the step was recorded — its span's tenant, trace and span — so
+    /// a divergence can be explained by re-reading the recorded request
+    /// rather than holding every request for the replay's life.
+    origin: (String, String, String),
 }
 
 /// A recorded tool step inside a live replay.
@@ -535,6 +637,8 @@ struct ToolStep {
     /// Why the arguments or result could not be snapshotted, when they could
     /// not; such a step is refused rather than served.
     unreadable: Option<String>,
+    /// Whether the result is a fork's edit rather than the recording's.
+    edited: bool,
 }
 
 /// One served or refused call, for the status document.
@@ -551,6 +655,57 @@ struct Divergence {
     step: usize,
     expected_digest: Option<String>,
     got_digest: Option<String>,
+    /// Where the request first differed from the recording, once explained
+    /// ([`Registry::explain_divergence`]).
+    difference: Option<Value>,
+}
+
+/// A fork's state inside a live replay.
+#[derive(Clone, Debug)]
+struct ForkState {
+    info: ForkInfo,
+    /// Each edit's step, kind and whether it has been served.
+    edits: Vec<(usize, &'static str, bool)>,
+    /// When a call was first answered `replay_live`.
+    live_at_ns: Option<u64>,
+    /// Calls answered `replay_live`.
+    live_calls: u64,
+}
+
+impl ForkState {
+    fn served(&mut self, step: usize) {
+        if let Some(edit) = self.edits.iter_mut().find(|edit| edit.0 == step) {
+            edit.2 = true;
+        }
+    }
+
+    /// The refusal for a call past the live point, noting it.
+    fn live(&mut self, served: usize, now_ns: u64) -> Option<ReplayError> {
+        let live_after = self.info.live_after?;
+        self.live_at_ns.get_or_insert(now_ns);
+        self.live_calls = self.live_calls.saturating_add(1);
+        Some(ReplayError::Live {
+            live_after,
+            served,
+            fork_id: Some(self.info.id.clone()),
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.info.id,
+            "parent": self.info.parent,
+            "step": self.info.step,
+            "edits": self
+                .edits
+                .iter()
+                .map(|(step, kind, served)| json!({"step": step, "kind": kind, "served": served}))
+                .collect::<Vec<_>>(),
+            "live_after": self.info.live_after,
+            "live_at_ns": self.live_at_ns,
+            "live_calls": self.live_calls,
+        })
+    }
 }
 
 /// Everything an erasure could name that a replay holds a copy of: the spans
@@ -667,6 +822,15 @@ struct Replay {
     /// registry's lock, so without a turn of its own each concurrent call
     /// would render the same step and all but one throw the work away.
     serving: Arc<Mutex<()>>,
+    /// Model calls refused because every recorded step had been served — an
+    /// agent that asked more than the recording holds, which a tape test
+    /// counts as a failure.
+    exhausted_calls: u64,
+    /// When the replay is a fork, its edits and live point.
+    fork: Option<ForkState>,
+    /// Store reads spent explaining divergences, at most
+    /// [`MAX_EXPLANATIONS`].
+    explanations: usize,
 }
 
 impl Replay {
@@ -703,6 +867,7 @@ impl Replay {
         self.calls = Vec::new();
         self.diverged = None;
         self.coverage = Coverage::default();
+        self.fork = None;
         self.bytes = 0;
     }
 
@@ -835,6 +1000,57 @@ impl Registry {
         tape_max_bytes: usize,
         now_ns: u64,
     ) -> Result<Created, ReplayError> {
+        self.create_fork(
+            store,
+            tenant,
+            run_id,
+            mode,
+            &ForkSpec::default(),
+            tape_max_bytes,
+            now_ns,
+        )
+    }
+
+    /// [`Self::create`], forked as `fork` says ([`crate::fork`]): its edits
+    /// are served in place of the recorded answers at their steps, strict
+    /// matching applies only up to and including the first edited step, and
+    /// after its live point every call is refused as [`ReplayError::Live`].
+    /// Steps after the live point are not snapshotted at all, so they need
+    /// not be replayable; nor need an edited step's recorded answer.
+    ///
+    /// Refused as [`ReplayError::Invalid`] when an edit names a step the run
+    /// does not have or of another kind, when the live point is past the
+    /// run's last step, or when an edited answer holds no assistant message —
+    /// the last checked before the store is read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_fork(
+        &self,
+        store: &Store,
+        tenant: Option<&str>,
+        run_id: &str,
+        mode: Mode,
+        fork: &ForkSpec,
+        tape_max_bytes: usize,
+        now_ns: u64,
+    ) -> Result<Created, ReplayError> {
+        // Edited answers decoded first: a malformed one is the caller's
+        // mistake and should not cost a store read.
+        let mut plan = Plan {
+            edits: HashMap::new(),
+            live_after: fork.live_after,
+            strict_through: fork.first_edit(),
+        };
+        for edit in fork.edits.iter().take(MAX_EDITS) {
+            let edited = match &edit.value {
+                EditValue::Response(value) => {
+                    Edited::Answer(edited_choices(value).map_err(|why| {
+                        ReplayError::Invalid(format!("the edit at step {}: {why}", edit.step))
+                    })?)
+                }
+                EditValue::ToolResult(value) => Edited::ToolResult(value.clone()),
+            };
+            plan.edits.insert(edit.step, edited);
+        }
         let call = self.arrived(now_ns);
         // Cheap refusal first: a full share should not cost a store read.
         {
@@ -851,20 +1067,30 @@ impl Registry {
         if read.spans.is_empty() {
             return Err(ReplayError::RunNotFound);
         }
-        if read.truncated {
+        // A run past the cap is refused rather than replayed as its
+        // beginning — unless the fork goes live inside what was read: then
+        // nothing past the live point is served (every edit is at or before
+        // it), and the read's steps are exactly the run's first steps.
+        let rewinds_inside = fork.live_after.is_some_and(|cut| cut < read.steps.len());
+        if read.truncated && !rewinds_inside {
             return Err(ReplayError::Unreplayable(format!(
                 "the run has more than {max_spans} spans, more than one replay holds; replaying \
                  its first {max_spans} would end the agent's run early with every later model \
-                 call refused as if the recording ended there"
+                 call refused as if the recording ended there (a fork whose live_after falls \
+                 within its first {} steps can still rewind it)",
+                read.steps.len()
             )));
         }
+        fork.check_against(&read.steps)
+            .map_err(ReplayError::Invalid)?;
         let steps = read.steps.len();
+        let steps_truncated = read.truncated;
         let budget = SnapshotBudget {
             tape_max_bytes,
-            overhead: replay_overhead(run_id, tenant),
+            overhead: replay_overhead(run_id, tenant, fork),
             share_bytes: self.share_bytes(),
         };
-        let snapshot = snapshot(store, tenant, deadline, read.steps, mode, budget)?;
+        let snapshot = snapshot(store, tenant, deadline, read.steps, mode, budget, plan)?;
 
         // Room judged at the time the snapshot is done, which may be a whole
         // query budget after the request arrived; the replay's lifetime still
@@ -872,8 +1098,19 @@ impl Registry {
         let (mut replays, at_ns) = self.lock_at(call);
         self.purge(&mut replays, at_ns);
         self.ensure_room(&replays, tenant, snapshot.bytes, at_ns)?;
-        let id = new_id();
+        let id = new_id("rp_");
         let ttl_ns = self.limits.ttl.as_nanos().min(u128::from(u64::MAX)) as u64;
+        let fork = fork.cut().map(|step| ForkInfo {
+            id: new_id("fk_"),
+            parent: run_id.to_owned(),
+            step,
+            edits: fork
+                .edits
+                .iter()
+                .map(|edit| (edit.step, edit.value.kind()))
+                .collect(),
+            live_after: fork.live_after,
+        });
         let replay = Replay {
             run: run_id.to_owned(),
             tenant: tenant.map(str::to_owned),
@@ -889,15 +1126,29 @@ impl Registry {
             erasure_epoch,
             erased: None,
             serving: Arc::new(Mutex::new(())),
+            exhausted_calls: 0,
+            fork: fork.clone().map(|info| ForkState {
+                edits: info
+                    .edits
+                    .iter()
+                    .map(|(step, kind)| (*step, *kind, false))
+                    .collect(),
+                info,
+                live_at_ns: None,
+                live_calls: 0,
+            }),
+            explanations: 0,
         };
         let created = Created {
             id: id.clone(),
             run: run_id.to_owned(),
             steps,
+            steps_truncated,
             llm_steps: replay.llm.len(),
             mode,
             expires_at_ns: replay.expires_at_ns,
             unreadable_tool_steps: replay.unreadable_tool_steps(),
+            fork,
         };
         replays.insert(id, replay);
         Ok(created)
@@ -1105,7 +1356,7 @@ impl Registry {
         let _turn = serving
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (served, cursor, matched) = {
+        let (served, cursor, matched, edited) = {
             // Checked afresh: the replay may have been withdrawn, or have
             // expired, while this call waited for its turn — and expiry is
             // judged at the time the turn came, not the time the call arrived.
@@ -1114,16 +1365,27 @@ impl Registry {
             let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
             let cursor = replay.served;
             let Some(step) = replay.llm.get(cursor).cloned() else {
+                // Steps after a fork's live point were never held, so running
+                // off the end of what is held is reaching the live point.
+                if let Some(live) = replay
+                    .fork
+                    .as_mut()
+                    .and_then(|fork| fork.live(cursor, now_ns))
+                {
+                    return Err(live);
+                }
+                replay.exhausted_calls = replay.exhausted_calls.saturating_add(1);
                 return Err(ReplayError::Exhausted { served: cursor });
             };
             let matched = step.expected_digest.is_some() && step.expected_digest == got_digest;
-            if replay.mode == Mode::Strict && !matched {
+            if step.strict && !matched {
                 replay.record(step.step, false, now_ns);
                 if replay.diverged.is_none() {
                     replay.diverged = Some(Divergence {
                         step: step.step,
                         expected_digest: step.expected_digest.clone(),
                         got_digest: got_digest.clone(),
+                        difference: None,
                     });
                 }
                 return Err(ReplayError::Diverged {
@@ -1142,7 +1404,7 @@ impl Registry {
                 tokens: step.tokens,
                 max_response_bytes: self.limits.max_response_bytes,
             };
-            (served, cursor, matched)
+            (served, cursor, matched, step.edited)
         };
         let rendered = render(&served)?;
         // An erasure recorded while the step rendered withdraws the replay
@@ -1157,6 +1419,11 @@ impl Registry {
         );
         replay.record(served.step, matched, now_ns);
         replay.served += 1;
+        if edited {
+            if let Some(fork) = replay.fork.as_mut() {
+                fork.served(served.step);
+            }
+        }
         Ok(rendered)
     }
 
@@ -1182,6 +1449,16 @@ impl Registry {
             !candidate.served && tool.map_or(true, |name| candidate.tool.as_deref() == Some(name))
         });
         let Some(next) = next else {
+            // A fork holds no tool step after its live point: none left to
+            // serve means the harness runs the real tool from here.
+            let served = replay.served;
+            if let Some(live) = replay
+                .fork
+                .as_mut()
+                .and_then(|fork| fork.live(served, now_ns))
+            {
+                return Err(live);
+            }
             return Err(ReplayError::ToolsExhausted {
                 tool: tool.map(str::to_owned),
             });
@@ -1194,12 +1471,115 @@ impl Registry {
             });
         }
         next.served = true;
-        Ok(ServedTool {
+        let served = ServedTool {
             step: next.step,
             tool: next.tool.clone(),
             arguments: next.arguments.clone(),
             result: next.result.clone(),
-        })
+            edited: next.edited,
+        };
+        if served.edited {
+            if let Some(fork) = replay.fork.as_mut() {
+                fork.served(served.step);
+            }
+        }
+        Ok(served)
+    }
+
+    /// Where a request refused as a divergence at tape step `step` first
+    /// differs from the recorded request, or `None` when that cannot be said
+    /// — the recorded request is gone (erased), unreadable, not a message
+    /// list, or the read does not fit the query budget.
+    ///
+    /// A replay holds only each recorded request's digest, so the recorded
+    /// request is read again here, from the step's own span, under the
+    /// span's tenant and the configured query budget, and outside the
+    /// registry's lock. Both sides are normalised exactly as strict matching
+    /// normalises them and compared message by message; the answer names the
+    /// first message that differs, its role, the first field that differs
+    /// (`role`, `content`, `tool_call_id`, `tool_calls`; or `missing` /
+    /// `extra` when one side has fewer messages), the character where it
+    /// differs, and a quote of each side from just before that character:
+    ///
+    /// `{"message": 1, "role": "user", "field": "content", "at_char": 22,
+    ///   "recorded": "What's the weather in Paris?", "got": "What's the
+    ///   weather in Lyon?", "recorded_messages": 2, "got_messages": 2}`
+    ///
+    /// When `step` is the replay's first divergence and this request is the
+    /// one that caused it, the difference is kept with it, so the status
+    /// document shows it too — every string in it cut to a fixed length, so
+    /// what is kept never outgrows the charge taken for it up front
+    /// ([`DIFFERENCE_BYTES`]). That same request refused again is answered
+    /// from what was kept, with no read.
+    ///
+    /// Any other request costs a read of the step's trace, so one replay
+    /// spends at most [`MAX_EXPLANATIONS`] of them: past that a divergence
+    /// is refused without saying where it differs. A harness whose every
+    /// retry differs (a timestamp in the prompt) cannot turn a route that
+    /// otherwise reads nothing into a store read per call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn explain_divergence(
+        &self,
+        store: &Store,
+        id: &str,
+        binding: Option<&str>,
+        step: usize,
+        request: &Value,
+        provider: Provider,
+        now_ns: u64,
+    ) -> Option<Value> {
+        let call = self.arrived(now_ns);
+        let got_digest = provider.request_digest(request).ok().flatten();
+        let origin = {
+            let latest_erasure = store.erasures.latest_id().ok()?;
+            let (mut replays, now_ns) = self.lock_at(call);
+            let replay = self
+                .live(&mut replays, store, latest_erasure, id, binding, now_ns)
+                .ok()?;
+            // The same request refused again — a harness retrying — is
+            // answered from what was already worked out, not by another read.
+            if let Some(divergence) = &replay.diverged {
+                if divergence.step == step && divergence.got_digest == got_digest {
+                    if let Some(difference) = &divergence.difference {
+                        return Some(difference.clone());
+                    }
+                }
+            }
+            let origin = replay
+                .llm
+                .iter()
+                .find(|held| held.step == step)?
+                .origin
+                .clone();
+            // Spent before the read, under the lock, so concurrent calls
+            // cannot all slip under the cap together.
+            if replay.explanations >= MAX_EXPLANATIONS {
+                return None;
+            }
+            replay.explanations += 1;
+            origin
+        };
+        let difference = first_difference(store, &origin, request, provider).ok()??;
+        if crate::tail::value_bytes(&difference) > DIFFERENCE_BYTES {
+            // Unreachable while every string in it is cut to its bound; if
+            // that ever changes, the difference is dropped, not kept past
+            // its charge.
+            return None;
+        }
+        let latest_erasure = store.erasures.latest_id().ok()?;
+        let (mut replays, now_ns) = self.lock_at(call);
+        let replay = self
+            .live(&mut replays, store, latest_erasure, id, binding, now_ns)
+            .ok()?;
+        if let Some(divergence) = replay.diverged.as_mut() {
+            if divergence.step == step
+                && divergence.difference.is_none()
+                && divergence.got_digest == got_digest
+            {
+                divergence.difference = Some(difference.clone());
+            }
+        }
+        Some(difference)
     }
 
     /// The status document of `GET /v1/replays/{id}`.
@@ -1219,21 +1599,33 @@ impl Registry {
             .iter()
             .map(|call| json!({"step": call.step, "matched": call.matched, "at_ns": call.at_ns}))
             .collect();
-        Ok(json!({
+        let mut status = json!({
             "id": id,
             "run": replay.run,
             "mode": replay.mode.as_str(),
             "served": replay.served,
             "remaining": replay.llm.len() - replay.served,
-            "diverged": replay.diverged.as_ref().map(|divergence| json!({
-                "step": divergence.step,
-                "expected_digest": divergence.expected_digest,
-                "got_digest": divergence.got_digest,
-            })),
+            "diverged": replay.diverged.as_ref().map(|divergence| {
+                let mut diverged = json!({
+                    "step": divergence.step,
+                    "expected_digest": divergence.expected_digest,
+                    "got_digest": divergence.got_digest,
+                });
+                if let Some(difference) = &divergence.difference {
+                    diverged["difference"] = difference.clone();
+                }
+                diverged
+            }),
             "calls": calls,
+            "exhausted_calls": replay.exhausted_calls,
             "unreadable_tool_steps": replay.unreadable_tool_steps(),
             "expires_at_ns": replay.expires_at_ns,
-        }))
+        });
+        if let Some(fork) = &replay.fork {
+            status["fork_id"] = json!(fork.info.id);
+            status["fork"] = fork.to_json();
+        }
+        Ok(status)
     }
 
     /// Live replays, withdrawn ones included, for tests and diagnostics.
@@ -1319,6 +1711,25 @@ struct SnapshotBudget {
     share_bytes: usize,
 }
 
+/// A fork's edit, decoded for serving.
+enum Edited {
+    /// The answer served at an llm step.
+    Answer(Vec<Choice>),
+    /// The result served at a tool step.
+    ToolResult(Value),
+}
+
+/// How a snapshot is forked: what to serve in place of the recording, where
+/// the recording stops being served, and how far strict matching applies.
+#[derive(Default)]
+struct Plan {
+    edits: HashMap<usize, Edited>,
+    live_after: Option<usize>,
+    /// The first edited step; strict matching applies up to and including
+    /// it. `None` for no edit: then it applies to every held step.
+    strict_through: Option<usize>,
+}
+
 /// What a recorded request came to, for strict matching.
 enum RecordedRequest {
     /// The step recorded no request.
@@ -1344,6 +1755,7 @@ fn snapshot(
     steps: Vec<TapeStep>,
     mode: Mode,
     budget: SnapshotBudget,
+    mut plan: Plan,
 ) -> Result<Snapshot, ReplayError> {
     let mut resolver = Resolver::new(store, tenant, deadline);
     // Only what the replay RETAINS is charged: answers and tool records.
@@ -1354,9 +1766,29 @@ fn snapshot(
         if !matches!(step.kind, StepKind::Llm | StepKind::Tool) {
             continue;
         }
+        // Past a fork's live point nothing is served, so nothing is held —
+        // and nothing there needs to be replayable. Steps come in tape
+        // order, so the first one past it ends the snapshot.
+        if plan.live_after.is_some_and(|cut| step.index > cut) {
+            break;
+        }
+        let edit = plan.edits.remove(&step.index);
+        let strict = mode == Mode::Strict
+            && plan
+                .strict_through
+                .map_or(true, |through| step.index <= through);
         out.coverage.add(&step);
         if step.kind == StepKind::Llm {
+            let edited = match edit {
+                Some(Edited::Answer(choices)) => Some(choices),
+                // A tool result edit at an llm step was refused when the
+                // spec was checked against the tape.
+                Some(Edited::ToolResult(_)) | None => None,
+            };
             let answer = match step.response.as_mut() {
+                // An edited step's recorded answer is never served, so it is
+                // never resolved — nor charged, nor required to be readable.
+                _ if edited.is_some() => Leftover::default(),
                 // A text-bearing answer is held as the text it was written
                 // as — inline, or its payload's raw bytes — because the
                 // value rule's parse is lossy, and text may be served as is.
@@ -1399,21 +1831,33 @@ fn snapshot(
                         .map_or(RecordedRequest::BarePrompt, RecordedRequest::Digest)
                 }
             };
-            let llm = llm_snapshot(&step, mode, answer, request, &retained)?;
+            let llm = llm_snapshot(&step, strict, edited, answer, request, &retained)?;
             steps_heap += llm.heap();
             out.llm.push(llm);
         } else {
+            let edited = match edit {
+                Some(Edited::ToolResult(result)) => Some(result),
+                Some(Edited::Answer(_)) | None => None,
+            };
             let mut leftover = Leftover::default();
-            for value in [&mut step.request, &mut step.response]
-                .into_iter()
-                .flatten()
-            {
-                leftover.merge(resolver.resolve(value, &mut retained)?);
+            if let Some(arguments) = step.request.as_mut() {
+                leftover.merge(resolver.resolve(arguments, &mut retained)?);
+            }
+            // An edited result replaces the recorded one, which is then
+            // never read.
+            if edited.is_none() {
+                if let Some(response) = step.response.as_mut() {
+                    leftover.merge(resolver.resolve(response, &mut retained)?);
+                }
             }
             // A result recorded as empty is a result; one never recorded —
             // content capture was off — has nothing to serve, and serving
             // `null` in its place would hand the harness an invented result.
-            let result = step.response.take().or(step.detail.empty_response.take());
+            let is_edited = edited.is_some();
+            let result = match edited {
+                Some(result) => Some(result),
+                None => step.response.take().or(step.detail.empty_response.take()),
+            };
             let unreadable = match (leftover.unreadable, leftover.past_budget, &result) {
                 (true, _, _) => Some(
                     "its recorded arguments or result is an offloaded payload that could not \
@@ -1441,6 +1885,7 @@ fn snapshot(
                 result: result.unwrap_or(Value::Null),
                 served: false,
                 unreadable,
+                edited: is_edited,
             };
             steps_heap += tool.heap();
             out.tools.push(tool);
@@ -1465,31 +1910,110 @@ fn snapshot(
 /// record and its call log — at its full bound, charged up front so that a
 /// replay's growth after admission can never take its share or the registry
 /// past their budgets.
-fn replay_overhead(run: &str, tenant: Option<&str>) -> usize {
+fn replay_overhead(run: &str, tenant: Option<&str>, fork: &ForkSpec) -> usize {
     // A hash map's slots hold entries inline and run up to half empty after
     // the table grows.
-    2 * std::mem::size_of::<(String, Replay)>()
+    let mut bytes = 2 * std::mem::size_of::<(String, Replay)>()
         + "rp_".len()
         + 32
         + run.len()
         + tenant.map_or(0, str::len)
-        // The divergence's two digests, 64 hex characters each.
+        // The divergence's two digests, 64 hex characters each, and the
+        // explanation of where it differed, at its bound.
         + 2 * 64
+        + DIFFERENCE_BYTES
         + MAX_RECORDED_CALLS * std::mem::size_of::<CallRecord>()
         // The serving lock's shared allocation: two reference counts and
         // the mutex.
         + 2 * std::mem::size_of::<usize>()
-        + std::mem::size_of::<Mutex<()>>()
+        + std::mem::size_of::<Mutex<()>>();
+    if fork.is_fork() {
+        // Its id twice (the creation's and the state's copy), its parent's
+        // run id, and its edits' bookkeeping twice over.
+        bytes += 2 * ("fk_".len() + 32)
+            + run.len()
+            + 2 * fork.edits.len() * std::mem::size_of::<(usize, &'static str, bool)>();
+    }
+    bytes
 }
 
 fn llm_snapshot(
     step: &TapeStep,
-    mode: Mode,
+    strict: bool,
+    edited: Option<Vec<Choice>>,
     answer: Leftover,
     request: RecordedRequest,
     retained: &ResolveBudget,
 ) -> Result<LlmStep, ReplayError> {
     let label = || format!("step {} ({})", step.index, step.detail.signature);
+    let is_edited = edited.is_some();
+    let choices = match edited {
+        Some(choices) => choices,
+        None => recorded_answer(step, answer, retained, &label)?,
+    };
+    let (expected_digest, why) = match request {
+        RecordedRequest::Digest(digest) => (Some(digest), ""),
+        RecordedRequest::Missing => (None, "recorded no request"),
+        RecordedRequest::Unreadable => (
+            None,
+            "has a request that is an offloaded payload that could not be read — erased, or \
+             swept by retention",
+        ),
+        RecordedRequest::BarePrompt => (
+            None,
+            "recorded its request as a bare prompt (text or a JSON object), or as a list of \
+             something other than messages, rather than as a message list",
+        ),
+    };
+    if strict && expected_digest.is_none() {
+        return Err(ReplayError::Unreplayable(format!(
+            "{} {why}, so strict mode has nothing to compare an incoming request against; \
+             create the replay with \"mode\": \"loose\" to serve steps in order",
+            label()
+        )));
+    }
+    // Identifiers a stream repeats in every chunk are kept only at a length
+    // a provider could have produced (see MAX_IDENTIFIER_BYTES).
+    let identifier = |value: &Option<String>| {
+        value
+            .clone()
+            .filter(|value| value.len() <= MAX_IDENTIFIER_BYTES)
+    };
+    Ok(LlmStep {
+        step: step.index,
+        model: identifier(&step.model),
+        // An edited answer is not the provider's, so it carries neither the
+        // recorded answer's id nor its usage: the id is invented and the
+        // usage reads zero.
+        response_id: match is_edited {
+            true => None,
+            false => identifier(&step.detail.response_id),
+        },
+        start_ns: step.start_ns,
+        expected_digest,
+        choices,
+        tokens: match is_edited {
+            true => tape::StepTokens::default(),
+            false => step.tokens.clone(),
+        },
+        strict,
+        edited: is_edited,
+        origin: (
+            step.detail.tenant.clone(),
+            step.trace_id.clone(),
+            step.span_id.clone(),
+        ),
+    })
+}
+
+/// A held llm step's recorded answer as choices, or why it cannot be
+/// replayed.
+fn recorded_answer(
+    step: &TapeStep,
+    answer: Leftover,
+    retained: &ResolveBudget,
+    label: &dyn Fn() -> String,
+) -> Result<Vec<Choice>, ReplayError> {
     let Some(response) = &step.response else {
         return Err(ReplayError::Unreplayable(format!(
             "{} recorded no response — content capture was off when the run was recorded \
@@ -1524,43 +2048,31 @@ fn llm_snapshot(
             label()
         )));
     }
-    let (expected_digest, why) = match request {
-        RecordedRequest::Digest(digest) => (Some(digest), ""),
-        RecordedRequest::Missing => (None, "recorded no request"),
-        RecordedRequest::Unreadable => (
-            None,
-            "has a request that is an offloaded payload that could not be read — erased, or \
-             swept by retention",
-        ),
-        RecordedRequest::BarePrompt => (
-            None,
-            "recorded its request as a bare prompt (text or a JSON object), or as a list of \
-             something other than messages, rather than as a message list",
-        ),
+    Ok(choices)
+}
+
+/// A fork's edited answer as choices: answer text, one assistant message in
+/// any shape a recording may hold (OpenAI's, Anthropic's content blocks, the
+/// normalised one, OTel `parts`), a list of them, or an OpenAI response body
+/// with `choices`. Refused when it holds no text and no tool call — a model
+/// answer that says nothing cannot be served as one.
+fn edited_choices(value: &Value) -> Result<Vec<Choice>, String> {
+    let choices = match value {
+        Value::String(text) => vec![text_choice(text.clone())],
+        other => decoded(other, ResponseSource::Body).ok_or(
+            "a \"response\" edit is answer text, an assistant message ({\"content\", \
+             \"tool_calls\"} or content blocks), a list of messages, or a response body \
+             with \"choices\"",
+        )?,
     };
-    if mode == Mode::Strict && expected_digest.is_none() {
-        return Err(ReplayError::Unreplayable(format!(
-            "{} {why}, so strict mode has nothing to compare an incoming request against; \
-             create the replay with \"mode\": \"loose\" to serve steps in order",
-            label()
-        )));
+    if choices.is_empty()
+        || choices
+            .iter()
+            .all(|choice| choice.text.is_none() && choice.calls.is_empty())
+    {
+        return Err("a \"response\" edit must hold answer text or a tool call".to_owned());
     }
-    // Identifiers a stream repeats in every chunk are kept only at a length
-    // a provider could have produced (see MAX_IDENTIFIER_BYTES).
-    let identifier = |value: &Option<String>| {
-        value
-            .clone()
-            .filter(|value| value.len() <= MAX_IDENTIFIER_BYTES)
-    };
-    Ok(LlmStep {
-        step: step.index,
-        model: identifier(&step.model),
-        response_id: identifier(&step.detail.response_id),
-        start_ns: step.start_ns,
-        expected_digest,
-        choices,
-        tokens: step.tokens.clone(),
-    })
+    Ok(choices)
 }
 
 // ---------------------------------------------------------------- footprint
@@ -1632,6 +2144,9 @@ impl Footprint for LlmStep {
             + self.response_id.heap()
             + self.expected_digest.heap()
             + self.choices.heap()
+            + self.origin.0.heap()
+            + self.origin.1.heap()
+            + self.origin.2.heap()
     }
 }
 
@@ -1654,13 +2169,14 @@ fn set_heap<T>(set: &HashSet<T>) -> usize {
     }
 }
 
-/// A fresh replay id: `rp_` and 32 hex characters.
+/// A fresh id: `prefix` (`rp_` for a replay, `fk_` for a fork) and 32 hex
+/// characters.
 ///
 /// Drawn from the standard library's per-process hash keys, which are seeded
 /// from the operating system's randomness, over a counter and the clock. Ids
 /// are hard to guess, but they are not credentials: every call through a
 /// replay still authenticates, and its tenant binding is checked.
-fn new_id() -> String {
+fn new_id(prefix: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let state = std::collections::hash_map::RandomState::new();
     let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1676,14 +2192,14 @@ fn new_id() -> String {
     second.write_u64(high);
     second.write_u64(serial.wrapping_add(0x9e37_79b9_7f4a_7c15));
     let low = second.finish();
-    format!("rp_{high:016x}{low:016x}")
+    format!("{prefix}{high:016x}{low:016x}")
 }
 
 // ------------------------------------------------------------ normalisation
 
 /// One message in the normalised shape: the fields step facts reassemble from
 /// an indexed layout.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct Normalised {
     role: Option<Value>,
     content: Option<Value>,
@@ -1846,6 +2362,12 @@ fn parts_message(message: &Value, parts: &[Value]) -> Normalised {
 /// would match. Whether the list itself was sent as messages is the
 /// caller's to check ([`tape::StepDetail::bare_prompt`]).
 fn recorded_digest(request: &Value) -> Option<String> {
+    normalised_digest(recorded_messages(request)?)
+}
+
+/// A RECORDED request's messages in the normalised shape, under the rules of
+/// [`recorded_digest`] — `None` when it is not a message list.
+fn recorded_messages(request: &Value) -> Option<Vec<Normalised>> {
     let messages = request.as_array()?;
     let mut normalised = Vec::with_capacity(messages.len());
     for message in messages {
@@ -1861,7 +2383,7 @@ fn recorded_digest(request: &Value) -> Option<String> {
         }
         normalised.push(message);
     }
-    normalised_digest(normalised)
+    Some(normalised)
 }
 
 /// The normalised digest of an OpenAI chat-completions request body.
@@ -1871,13 +2393,17 @@ fn recorded_digest(request: &Value) -> Option<String> {
 /// each tool call's `id`, `function.name` and `function.arguments`. Errs when
 /// `messages` is not a list.
 pub fn openai_request_digest(body: &Value) -> Result<Option<String>, String> {
+    Ok(normalised_digest(openai_messages(body)?))
+}
+
+/// An OpenAI chat-completions request body's messages, normalised as
+/// [`openai_request_digest`] digests them.
+fn openai_messages(body: &Value) -> Result<Vec<Normalised>, String> {
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
         .ok_or("the request body must carry a \"messages\" array")?;
-    Ok(normalised_digest(
-        messages.iter().map(normalised_message).collect(),
-    ))
+    Ok(messages.iter().map(normalised_message).collect())
 }
 
 /// The normalised digest of an Anthropic messages request body.
@@ -1887,6 +2413,12 @@ pub fn openai_request_digest(body: &Value) -> Result<Option<String>, String> {
 /// followed by each message's `role` and `content` (a list of content blocks
 /// as the list). Errs when `messages` is not a list.
 pub fn anthropic_request_digest(body: &Value) -> Result<Option<String>, String> {
+    Ok(normalised_digest(anthropic_messages(body)?))
+}
+
+/// An Anthropic messages request body's messages, normalised as
+/// [`anthropic_request_digest`] digests them: a `system` prompt first.
+fn anthropic_messages(body: &Value) -> Result<Vec<Normalised>, String> {
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
@@ -1904,7 +2436,200 @@ pub fn anthropic_request_digest(body: &Value) -> Result<Option<String>, String> 
         content: non_empty(message.get("content")),
         ..Normalised::default()
     }));
-    Ok(normalised_digest(normalised))
+    Ok(normalised)
+}
+
+// ---------------------------------------------------- divergence explained
+
+/// The recorded request of the step at `origin` (its span's tenant, trace
+/// and span), re-read and compared with `request`; see
+/// [`Registry::explain_divergence`].
+fn first_difference(
+    store: &Store,
+    origin: &(String, String, String),
+    request: &Value,
+    provider: Provider,
+) -> crate::Result<Option<Value>> {
+    let (tenant, trace_id, span_id) = origin;
+    let Ok(got) = provider.messages(request) else {
+        return Ok(None);
+    };
+    let deadline = store.query_deadline(Instant::now());
+    let run = format!("{}{trace_id}", semconv::TRACE_RUN_PREFIX);
+    // The trace is read to find the span, but only that span is made a step:
+    // extracting every span's facts would be work proportional to the run.
+    let read = store.run_spans(Some(tenant), &run, tape::MAX_TAPE_SPANS, deadline)?;
+    let Some(mut recorded) = read
+        .spans
+        .iter()
+        .find(|span| span.span_id == *span_id)
+        .and_then(|span| store.span_step(0, span))
+    else {
+        return Ok(None);
+    };
+    drop(read);
+    let leftover = Resolver::new(store, Some(tenant), deadline)
+        .resolve_request(&mut recorded, &mut ResolveBudget::new(usize::MAX))?;
+    if leftover.any() || recorded.detail.bare_prompt {
+        return Ok(None);
+    }
+    let Some(expected) = recorded.request.as_ref().and_then(recorded_messages) else {
+        return Ok(None);
+    };
+    Deadline::check(deadline, 0)?;
+    Ok(describe_difference(&expected, &got))
+}
+
+/// The first place `got` differs from `expected`, as
+/// [`Registry::explain_divergence`] describes it; `None` when they
+/// normalise alike.
+fn describe_difference(expected: &[Normalised], got: &[Normalised]) -> Option<Value> {
+    let counts = |mut body: Value| {
+        body["recorded_messages"] = json!(expected.len());
+        body["got_messages"] = json!(got.len());
+        body
+    };
+    for index in 0..expected.len().max(got.len()) {
+        match (expected.get(index), got.get(index)) {
+            (Some(recorded), Some(asked)) => {
+                if normalised_digest(vec![recorded.clone()])
+                    == normalised_digest(vec![asked.clone()])
+                {
+                    continue;
+                }
+                let fields = [
+                    (
+                        "role",
+                        field_text(recorded.role.as_ref()),
+                        field_text(asked.role.as_ref()),
+                    ),
+                    (
+                        "content",
+                        field_text(recorded.content.as_ref()),
+                        field_text(asked.content.as_ref()),
+                    ),
+                    (
+                        "tool_call_id",
+                        field_text(recorded.tool_call_id.as_ref()),
+                        field_text(asked.tool_call_id.as_ref()),
+                    ),
+                    (
+                        "tool_calls",
+                        calls_text(&recorded.tool_calls),
+                        calls_text(&asked.tool_calls),
+                    ),
+                ];
+                let (field, before, after) = fields
+                    .into_iter()
+                    .find(|(_, before, after)| before != after)
+                    .unwrap_or(("message", String::new(), String::new()));
+                let at = before
+                    .chars()
+                    .zip(after.chars())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                return Some(counts(json!({
+                    "message": index,
+                    "role": role_text(recorded).or_else(|| role_text(asked)),
+                    "field": field,
+                    "at_char": at,
+                    "recorded": quote_from(&before, at),
+                    "got": quote_from(&after, at),
+                })));
+            }
+            (Some(recorded), None) => {
+                return Some(counts(json!({
+                    "message": index,
+                    "role": role_text(recorded),
+                    "field": "missing",
+                    "at_char": 0,
+                    "recorded": quote_from(&message_text(recorded), 0),
+                    "got": null,
+                })))
+            }
+            (None, Some(asked)) => {
+                return Some(counts(json!({
+                    "message": index,
+                    "role": role_text(asked),
+                    "field": "extra",
+                    "at_char": 0,
+                    "recorded": null,
+                    "got": quote_from(&message_text(asked), 0),
+                })))
+            }
+            (None, None) => break,
+        }
+    }
+    None
+}
+
+/// A normalised field as the text a reader compares: under the value rule
+/// strict matching applies ([`semconv::field_value`] — JSON-shaped text is
+/// read as JSON), a string as itself, anything else as compact JSON, and an
+/// absent field as nothing.
+fn field_text(value: Option<&Value>) -> String {
+    match value.map(semconv::field_value) {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) => text,
+        Some(other) => json_text(&other),
+    }
+}
+
+/// A message's tool calls as one comparable text.
+fn calls_text(calls: &[[Option<Value>; 3]]) -> String {
+    if calls.is_empty() {
+        return String::new();
+    }
+    let rendered: Vec<Value> = calls
+        .iter()
+        .map(|[id, name, arguments]| {
+            json!({
+                "id": id.as_ref().map(semconv::field_value),
+                "name": name.as_ref().map(semconv::field_value),
+                "arguments": arguments.as_ref().map(semconv::field_value),
+            })
+        })
+        .collect();
+    json_text(&Value::Array(rendered))
+}
+
+/// A whole message as one text, for a message only one side has.
+fn message_text(message: &Normalised) -> String {
+    let content = field_text(message.content.as_ref());
+    if content.is_empty() {
+        calls_text(&message.tool_calls)
+    } else {
+        content
+    }
+}
+
+/// A message's role, cut to [`DIFFERENCE_ROLE_CHARS`] characters (marked
+/// with `…`): the request chooses it, and a difference is kept for the
+/// replay's lifetime at a fixed charge.
+fn role_text(message: &Normalised) -> Option<String> {
+    let role = message.role.as_ref().and_then(Value::as_str)?;
+    let mut kept: String = role.chars().take(DIFFERENCE_ROLE_CHARS).collect();
+    if role.chars().nth(DIFFERENCE_ROLE_CHARS).is_some() {
+        kept.push('…');
+    }
+    kept.shrink_to_fit();
+    Some(kept)
+}
+
+/// [`DIFFERENCE_CHARS`] characters of `text` starting a little before
+/// character `at`, marked with `…` where it was cut.
+fn quote_from(text: &str, at: usize) -> String {
+    let start = at.saturating_sub(DIFFERENCE_CONTEXT);
+    let mut quote: String = text.chars().skip(start).take(DIFFERENCE_CHARS).collect();
+    if start > 0 {
+        quote.insert(0, '…');
+    }
+    if text.chars().nth(start + DIFFERENCE_CHARS).is_some() {
+        quote.push('…');
+    }
+    // Held at the length it has, not the capacity collecting it grew to.
+    quote.shrink_to_fit();
+    quote
 }
 
 // --------------------------------------------------------- recorded answers
@@ -4378,5 +5103,517 @@ mod tests {
                 "{case}: the expired replay is still held"
             );
         }
+    }
+
+    // ------------------------------------------------------------- forks
+
+    fn fork_spec(edits: Value, live_after: Value) -> ForkSpec {
+        ForkSpec::parse(Some(&edits), Some(&live_after)).expect("parses")
+    }
+
+    fn render_openai(step: &ServedStep) -> Result<Value, ReplayError> {
+        let rendered = step.openai(&json!({}))?;
+        Ok(serde_json::from_slice(&rendered.body).expect("json"))
+    }
+
+    #[test]
+    fn a_fork_serves_its_edit_matched_strictly_up_to_it_and_loosely_after() {
+        let fixture = TempStore::open("fork-edit", crate::Config::default());
+        let store = fixture.store();
+        openllmetry_run(store);
+        let registry = Registry::default();
+        let spec = fork_spec(
+            json!([{"step": 0, "response": {"content": "It is sunny in Paris."}}]),
+            Value::Null,
+        );
+        let created = registry
+            .create_fork(store, Some(""), "run-1", Mode::Strict, &spec, 1 << 20, NOW)
+            .expect("creates");
+        let fork = created.fork.clone().expect("a fork");
+        assert!(fork.id.starts_with("fk_") && fork.id.len() == 35);
+        assert_eq!((fork.parent.as_str(), fork.step), ("run-1", 0));
+        let body = created.to_json();
+        assert_eq!(body["fork_id"], json!(fork.id));
+        assert_eq!(
+            body["fork"]["attributes"],
+            json!({"traza.fork.parent": "run-1", "traza.fork.step": 0, "traza.fork.id": fork.id})
+        );
+
+        // Step 0 is the edited step: the agent still asks the recorded
+        // question there, so a different one is refused.
+        let mut wrong = first_request();
+        wrong["messages"][1]["content"] = json!("Weather in Rome?");
+        assert!(matches!(
+            registry.next_llm(
+                store,
+                &created.id,
+                Some(""),
+                openai_request_digest(&wrong).expect("parses"),
+                NOW,
+                render_openai
+            ),
+            Err(ReplayError::Diverged { step: 0, .. })
+        ));
+        let answer = registry
+            .next_llm(
+                store,
+                &created.id,
+                Some(""),
+                openai_request_digest(&first_request()).expect("parses"),
+                NOW,
+                render_openai,
+            )
+            .expect("serves the edit");
+        assert_eq!(
+            answer["choices"][0]["message"]["content"],
+            json!("It is sunny in Paris.")
+        );
+        assert_eq!(answer["choices"][0]["finish_reason"], json!("stop"));
+        assert!(
+            answer["id"].as_str().unwrap().starts_with("chatcmpl-traza"),
+            "an edited answer does not reuse the recorded answer's id: {answer}"
+        );
+        assert_eq!(answer["usage"]["total_tokens"], json!(0));
+        assert_eq!(answer["model"], json!("gpt-4o-2024-08-06"));
+
+        // After the edit the agent is on a new branch: whatever it asks, the
+        // next recorded step is served, and the match is only recorded.
+        let served = registry
+            .next_llm(
+                store,
+                &created.id,
+                Some(""),
+                Some("f".repeat(64)),
+                NOW,
+                keep_step,
+            )
+            .expect("loose after the edit");
+        assert_eq!(served.step, 2);
+        let status = registry
+            .status(store, &created.id, Some(""), NOW)
+            .expect("live");
+        assert_eq!(status["fork_id"], json!(fork.id));
+        assert_eq!(
+            status["fork"]["edits"],
+            json!([{"step": 0, "kind": "response", "served": true}])
+        );
+        let matched: Vec<bool> = status["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|call| call["matched"].as_bool().unwrap())
+            .collect();
+        assert_eq!(matched, [false, true, false]);
+        assert_eq!(status["diverged"]["step"], json!(0));
+    }
+
+    #[test]
+    fn a_live_point_answers_replay_live_and_holds_nothing_past_it() {
+        let fixture = TempStore::open("fork-live", crate::Config::default());
+        let store = fixture.store();
+        openllmetry_run(store);
+        // A third model call recorded with content capture off: unreplayable,
+        // but past the live point nobody needs it.
+        store
+            .ingest_batch(vec![span(
+                "t1",
+                "d-blind",
+                400,
+                json!({"session.id": "run-1", "gen_ai.operation.name": "chat",
+                       "gen_ai.request.model": "gpt-4o"}),
+            )])
+            .expect("ingests");
+        let registry = Registry::default();
+        assert!(matches!(
+            registry.create(store, Some(""), "run-1", Mode::Strict, 1 << 20, NOW),
+            Err(ReplayError::Unreplayable(_))
+        ));
+        let spec = fork_spec(json!([]), json!(0));
+        let created = registry
+            .create_fork(store, Some(""), "run-1", Mode::Strict, &spec, 1 << 20, NOW)
+            .expect("the steps past the live point are not held");
+        assert_eq!(created.llm_steps, 1);
+        assert_eq!(created.fork.as_ref().map(|fork| fork.step), Some(1));
+        registry
+            .next_llm(
+                store,
+                &created.id,
+                Some(""),
+                openai_request_digest(&first_request()).expect("parses"),
+                NOW,
+                keep_step,
+            )
+            .expect("step 0 is replayed");
+        for _ in 0..2 {
+            match registry.next_llm(store, &created.id, Some(""), None, NOW + 7, keep_step) {
+                Err(ReplayError::Live {
+                    live_after,
+                    served,
+                    fork_id,
+                }) => {
+                    assert_eq!((live_after, served), (0, 1));
+                    assert_eq!(fork_id, created.fork.as_ref().map(|fork| fork.id.clone()));
+                }
+                other => panic!("expected the live point, got {other:?}"),
+            }
+        }
+        // The tool step after the live point is not held either.
+        assert!(matches!(
+            registry.next_tool(store, &created.id, Some(""), Some("get_weather"), NOW),
+            Err(ReplayError::Live { .. })
+        ));
+        let status = registry
+            .status(store, &created.id, Some(""), NOW + 9)
+            .expect("live");
+        // Judged at the call's arrival plus the time it spent getting there.
+        let live_at = status["fork"]["live_at_ns"].as_u64().expect("went live");
+        assert!(
+            (NOW + 7..NOW + 7 + 60_000_000_000).contains(&live_at),
+            "{live_at}"
+        );
+        assert_eq!(status["fork"]["live_calls"], json!(3));
+        assert_eq!(
+            status["exhausted_calls"],
+            json!(0),
+            "the live point is not exhaustion"
+        );
+        assert_eq!(status["remaining"], json!(0));
+    }
+
+    #[test]
+    fn a_tool_result_edit_is_served_by_tools_next_and_ends_strict_matching() {
+        let fixture = TempStore::open("fork-tool", crate::Config::default());
+        let store = fixture.store();
+        openllmetry_run(store);
+        let registry = Registry::default();
+        let spec = fork_spec(json!([{"step": 1, "tool_result": "sunny, 25C"}]), json!(2));
+        let created = registry
+            .create_fork(store, Some(""), "run-1", Mode::Strict, &spec, 1 << 20, NOW)
+            .expect("creates");
+        assert_eq!(created.fork.as_ref().map(|fork| fork.step), Some(1));
+        let tool = registry
+            .next_tool(store, &created.id, Some(""), Some("get_weather"), NOW)
+            .expect("serves the edit");
+        assert_eq!(
+            tool.to_json(),
+            json!({"step": 1, "tool": "get_weather", "arguments": {"city": "Paris"},
+                   "result": "sunny, 25C", "edited": true})
+        );
+        registry
+            .next_llm(
+                store,
+                &created.id,
+                Some(""),
+                openai_request_digest(&first_request()).expect("parses"),
+                NOW,
+                keep_step,
+            )
+            .expect("step 0 is before the edit, and matches");
+        // The agent now sends the edited tool result back: not the recorded
+        // request, and served all the same.
+        let mut edited = second_request();
+        edited["messages"][3]["content"] = json!("sunny, 25C");
+        let served = registry
+            .next_llm(
+                store,
+                &created.id,
+                Some(""),
+                openai_request_digest(&edited).expect("parses"),
+                NOW,
+                keep_step,
+            )
+            .expect("strict matching ends at the first edit");
+        assert_eq!(served.step, 2);
+        let status = registry
+            .status(store, &created.id, Some(""), NOW)
+            .expect("live");
+        assert_eq!(
+            status["fork"]["edits"],
+            json!([{"step": 1, "kind": "tool_result", "served": true}])
+        );
+        assert_eq!(status["diverged"], Value::Null);
+    }
+
+    #[test]
+    fn a_fork_the_run_cannot_take_is_invalid_before_and_after_the_read() {
+        let fixture = TempStore::open("fork-invalid", crate::Config::default());
+        let store = fixture.store();
+        openllmetry_run(store);
+        let registry = Registry::default();
+        let refused = |edits: Value, live: Value| match registry.create_fork(
+            store,
+            Some(""),
+            "run-1",
+            Mode::Strict,
+            &fork_spec(edits, live),
+            1 << 20,
+            NOW,
+        ) {
+            Err(ReplayError::Invalid(message)) => message,
+            other => panic!("expected an invalid fork, got {other:?}"),
+        };
+        assert!(refused(json!([{"step": 1, "response": "hi"}]), Value::Null)
+            .contains("step 1 is a tool call"));
+        assert!(
+            refused(json!([{"step": 0, "tool_result": "x"}]), Value::Null)
+                .contains("step 0 is a model call")
+        );
+        assert!(
+            refused(json!([{"step": 0, "response": {"count": 2}}]), Value::Null)
+                .contains("the edit at step 0")
+        );
+        assert!(refused(
+            json!([{"step": 0, "response": [{"role": "assistant"}]}]),
+            Value::Null
+        )
+        .contains("answer text or a tool call"));
+        assert!(refused(json!([]), json!(3)).contains("live_after 3 is past"));
+        assert_eq!(registry.len(NOW), 0, "nothing was registered");
+    }
+
+    #[test]
+    fn a_divergence_is_explained_where_the_request_first_differs() {
+        let fixture = TempStore::open("fork-explain", crate::Config::default());
+        let store = fixture.store();
+        openllmetry_run(store);
+        let registry = Registry::default();
+        let created = registry
+            .create(store, Some(""), "run-1", Mode::Strict, 1 << 20, NOW)
+            .expect("creates");
+        let mut wrong = first_request();
+        wrong["messages"][1]["content"] = json!("Weather in Rome?");
+        let got = openai_request_digest(&wrong).expect("parses");
+        assert!(registry
+            .next_llm(store, &created.id, Some(""), got, NOW, keep_step)
+            .is_err());
+        let difference = registry
+            .explain_divergence(
+                store,
+                &created.id,
+                Some(""),
+                0,
+                &wrong,
+                Provider::OpenAi,
+                NOW,
+            )
+            .expect("explained");
+        assert_eq!(
+            difference,
+            json!({"message": 1, "role": "user", "field": "content", "at_char": 11,
+                   "recorded": "Weather in Paris?", "got": "Weather in Rome?",
+                   "recorded_messages": 2, "got_messages": 2})
+        );
+        let status = registry
+            .status(store, &created.id, Some(""), NOW)
+            .expect("live");
+        assert_eq!(status["diverged"]["difference"], difference);
+
+        // A foreign tenant learns nothing.
+        assert!(registry
+            .explain_divergence(
+                store,
+                &created.id,
+                Some("acme"),
+                0,
+                &wrong,
+                Provider::OpenAi,
+                NOW
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn a_difference_names_missing_extra_and_long_fields() {
+        let message = |role: &str, content: &str| Normalised {
+            role: Some(json!(role)),
+            content: Some(json!(content)),
+            ..Normalised::default()
+        };
+        let recorded = vec![message("system", "Be brief."), message("user", "hi")];
+        let shorter = describe_difference(&recorded, &recorded[..1]).expect("differs");
+        assert_eq!(shorter["field"], json!("missing"));
+        assert_eq!(shorter["recorded"], json!("hi"));
+        assert_eq!(shorter["got"], Value::Null);
+        let mut longer = recorded.clone();
+        longer.push(message("user", "and more"));
+        let extra = describe_difference(&recorded, &longer).expect("differs");
+        assert_eq!(
+            (extra["field"].clone(), extra["message"].clone()),
+            (json!("extra"), json!(2))
+        );
+        assert!(describe_difference(&recorded, &recorded).is_none());
+
+        // A long field is quoted from just before the difference, marked.
+        let long = "x".repeat(300);
+        let changed = format!("{}y{}", &long[..200], &long[201..]);
+        let quoted = describe_difference(&[message("user", &long)], &[message("user", &changed)])
+            .expect("differs");
+        assert_eq!(quoted["at_char"], json!(200));
+        let recorded_quote = quoted["recorded"].as_str().unwrap();
+        assert!(recorded_quote.starts_with('…') && recorded_quote.ends_with('…'));
+        assert_eq!(recorded_quote.chars().count(), DIFFERENCE_CHARS + 2);
+        // JSON-shaped text compares as JSON, exactly as strict matching does.
+        let spaced = message("tool", "{\"a\": 1}");
+        let compact = message("tool", "{\"a\":1}");
+        assert!(describe_difference(&[spaced], &[compact]).is_none());
+    }
+
+    #[test]
+    fn a_difference_stays_within_its_charge_whatever_the_request_holds() {
+        let message = |role: &str, content: &str| Normalised {
+            role: Some(json!(role)),
+            content: Some(json!(content)),
+            ..Normalised::default()
+        };
+        // A megabyte role — the request's to choose — on every side a
+        // difference can quote it from: an extra message, a missing one, a
+        // differing one, and a differing role.
+        let huge = "ʀ".repeat(1 << 20);
+        let long = "é".repeat(4096);
+        let cases = [
+            describe_difference(
+                &[message("user", "hi")],
+                &[message("user", "hi"), message(&huge, &long)],
+            ),
+            describe_difference(&[message(&huge, &long)], &[]),
+            describe_difference(&[message(&huge, &long)], &[message(&huge, "ho")]),
+            describe_difference(&[message("user", "hi")], &[message(&huge, "hi")]),
+        ];
+        for difference in cases {
+            let difference = difference.expect("differs");
+            let role = difference["role"].as_str().expect("a role");
+            assert!(
+                role.chars().count() <= DIFFERENCE_ROLE_CHARS + 1,
+                "a role of {} characters was kept",
+                role.chars().count()
+            );
+            let held = crate::tail::value_bytes(&difference);
+            assert!(
+                held <= DIFFERENCE_BYTES,
+                "a difference holding {held} bytes is charged {DIFFERENCE_BYTES}: {difference}"
+            );
+        }
+    }
+
+    #[test]
+    fn explaining_divergences_reads_the_store_a_bounded_number_of_times() {
+        let fixture = TempStore::open("fork-explain-cap", crate::Config::default());
+        let store = fixture.store();
+        openllmetry_run(store);
+        let registry = Registry::default();
+        let id = registry
+            .create(store, Some(""), "run-1", Mode::Strict, 1 << 20, NOW)
+            .expect("creates")
+            .id;
+        let asked = |city: usize| {
+            let mut wrong = first_request();
+            wrong["messages"][1]["content"] = json!(format!("Weather in city {city}?"));
+            wrong
+        };
+        let explain = |request: &Value| {
+            let got = openai_request_digest(request).expect("parses");
+            assert!(registry
+                .next_llm(store, &id, Some(""), got, NOW, keep_step)
+                .is_err());
+            registry.explain_divergence(store, &id, Some(""), 0, request, Provider::OpenAi, NOW)
+        };
+        // A harness whose every retry differs (a timestamp in its prompt):
+        // each new request costs a read, up to the cap.
+        for city in 0..MAX_EXPLANATIONS {
+            let difference = explain(&asked(city)).expect("explained within the cap");
+            assert_eq!(difference["field"], json!("content"));
+        }
+        assert!(
+            explain(&asked(MAX_EXPLANATIONS)).is_none(),
+            "past the cap a divergence is refused without re-reading the recording"
+        );
+        // The first divergence's own explanation was kept, and is answered
+        // without a read even past the cap.
+        let first = explain(&asked(0)).expect("kept");
+        assert_eq!(first["got"], json!("Weather in city 0?"));
+        let status = registry.status(store, &id, Some(""), NOW).expect("live");
+        assert_eq!(status["diverged"]["difference"], first);
+    }
+
+    #[test]
+    fn a_rewind_of_a_run_past_the_span_cap_replays_its_beginning() {
+        let fixture = TempStore::open("fork-long-rewind", crate::Config::default());
+        let store = fixture.store();
+        // Three spans: llm 0, tool 1, llm 2; the cap reads only the first two.
+        openllmetry_run(store);
+        let registry = Registry::new(Limits {
+            max_spans: 2,
+            ..Limits::default()
+        });
+        // Live after step 1: everything the fork serves is inside what was
+        // read, so the run's length beyond it does not matter.
+        let created = registry
+            .create_fork(
+                store,
+                Some(""),
+                "run-1",
+                Mode::Strict,
+                &fork_spec(Value::Null, json!(1)),
+                1 << 20,
+                NOW,
+            )
+            .expect("a rewind inside the read prefix is replayable");
+        assert_eq!(created.llm_steps, 1);
+        assert!(
+            created.steps_truncated,
+            "the step count is the prefix read, and says so"
+        );
+        assert_eq!(created.to_json()["steps_truncated"], json!(true));
+        let asked = openai_request_digest(&first_request()).expect("parses");
+        registry
+            .next_llm(store, &created.id, Some(""), asked, NOW, keep_step)
+            .expect("step 0 is served, matched strictly");
+        assert!(matches!(
+            registry.next_llm(store, &created.id, Some(""), None, NOW, keep_step),
+            Err(ReplayError::Live { .. })
+        ));
+        // A live point past the prefix, and a plain replay, still need the
+        // whole run: both are refused for its length, not as a bad step.
+        for spec in [fork_spec(Value::Null, json!(2)), ForkSpec::default()] {
+            match registry.create_fork(store, Some(""), "run-1", Mode::Strict, &spec, 1 << 20, NOW)
+            {
+                Err(ReplayError::Unreplayable(message)) => {
+                    assert!(message.contains("more than 2 spans"), "{message}")
+                }
+                other => panic!("expected the span-cap refusal, got {other:?}"),
+            }
+        }
+        // A run that fits says nothing about truncation.
+        let whole = Registry::default()
+            .create(store, Some(""), "run-1", Mode::Strict, 1 << 20, NOW)
+            .expect("creates");
+        assert!(!whole.steps_truncated);
+        assert!(whole.to_json().get("steps_truncated").is_none());
+    }
+
+    #[test]
+    fn calls_past_the_recording_are_counted() {
+        let fixture = TempStore::open("replay-extra", crate::Config::default());
+        let store = fixture.store();
+        openllmetry_run(store);
+        let registry = Registry::default();
+        let id = registry
+            .create(store, Some(""), "run-1", Mode::Loose, 1 << 20, NOW)
+            .expect("creates")
+            .id;
+        for _ in 0..2 {
+            registry
+                .next_llm(store, &id, Some(""), None, NOW, keep_step)
+                .expect("serves");
+        }
+        for _ in 0..3 {
+            assert!(matches!(
+                registry.next_llm(store, &id, Some(""), None, NOW, keep_step),
+                Err(ReplayError::Exhausted { served: 2 })
+            ));
+        }
+        let status = registry.status(store, &id, Some(""), NOW).expect("live");
+        assert_eq!(status["exhausted_calls"], json!(3));
+        assert!(status.get("fork").is_none(), "a plain replay is no fork");
     }
 }
