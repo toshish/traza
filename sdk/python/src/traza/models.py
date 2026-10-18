@@ -445,6 +445,9 @@ class Replay:
     run: Optional[str] = None
     mode: Optional[str] = None
     steps: Optional[int] = None
+    #: ``True`` when ``steps`` counts only the run's beginning: a fork of a
+    #: run past the server's span cap that goes live within it.
+    steps_truncated: bool = False
     llm_steps: Optional[int] = None
     expires_at_ns: Optional[int] = None
     unreadable_tool_steps: List[int] = field(default_factory=list)

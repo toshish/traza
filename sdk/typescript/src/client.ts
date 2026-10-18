@@ -664,6 +664,8 @@ export class Replay implements ReplayDocument {
   readonly run: string;
   readonly mode: "strict" | "loose";
   readonly steps: number;
+  /** Present (true) when `steps` counts only the run's beginning. */
+  readonly steps_truncated?: boolean;
   readonly llm_steps: number;
   readonly expires_at_ns: bigint;
   readonly unreadable_tool_steps: number[];
@@ -683,6 +685,7 @@ export class Replay implements ReplayDocument {
     this.expires_at_ns = document.expires_at_ns;
     this.unreadable_tool_steps = document.unreadable_tool_steps;
     this.base_urls = document.base_urls;
+    if (document.steps_truncated !== undefined) this.steps_truncated = document.steps_truncated;
     if (document.fork_id !== undefined) this.fork_id = document.fork_id;
     if (document.fork !== undefined) this.fork = document.fork;
   }

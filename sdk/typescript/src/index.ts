@@ -30,8 +30,16 @@ export type {
   RequestOptions,
 } from "./client.js";
 export { AuthError, Conflict, FuseTripped, Gone, NotFound, QuotaExceeded, TrazaError } from "./errors.js";
-export { FORK_ID, FORK_PARENT, FORK_STEP, Fork } from "./fork.js";
-export type { ForkOptions, ForkSpanProcessor, LiveProvider, TaggableSpan } from "./fork.js";
+export { FORK_CONTEXT_KEY, FORK_ID, FORK_PARENT, FORK_STEP, Fork } from "./fork.js";
+export type {
+  ForkOptions,
+  ForkSpanProcessor,
+  LiveProvider,
+  OtelContext,
+  OtelContextApi,
+  SpanProcessorOptions,
+  TaggableSpan,
+} from "./fork.js";
 export { describeReplay, replayTest, TapeMismatch } from "./testing.js";
 export type { ReplayTestOptions } from "./testing.js";
 export type { TrazaErrorOptions } from "./errors.js";

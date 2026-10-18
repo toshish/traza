@@ -13,6 +13,25 @@ import { Client, Fork, TapeMismatch, describeReplay, replayTest, stringifyJson }
 import { startServer } from "./server.js";
 import { response, startStub } from "./stub.js";
 
+/** An OpenTelemetry context as `@opentelemetry/api` shapes one: immutable, keyed by symbol. */
+class Context {
+  constructor(values = new Map()) {
+    this.values = values;
+  }
+  getValue(key) {
+    return this.values.get(key);
+  }
+  setValue(key, value) {
+    return new Context(new Map(this.values).set(key, value));
+  }
+  deleteValue(key) {
+    const values = new Map(this.values);
+    values.delete(key);
+    return new Context(values);
+  }
+}
+const ROOT = new Context();
+
 const T0 = 1_767_225_600_000_000_000n;
 const MS = 1_000_000n;
 const SYSTEM = "You are a weather assistant.";
@@ -229,20 +248,40 @@ describe("a fork", () => {
     assert.deepEqual(Fork.spec({ atStep: 1, toolResult: null }), { edits: [{ step: 1, tool_result: null }], liveAfter: 1 });
   });
 
-  it("tags spans while open, and is found again in the run's forks", async () => {
+  it("tags the spans started in its context, and is found again in the run's forks", async () => {
     const fork = await client.fork("weather-7", { atStep: 1, toolResult: "sunny", live: false, runId: "weather-7-sunny" });
     const processor = fork.spanProcessor();
-    const tagged = { attributes: {}, setAttribute(key, value) { this.attributes[key] = value; } };
-    processor.onStart(tagged);
+    const newSpan = () => ({ attributes: {}, setAttribute(key, value) { this.attributes[key] = value; } });
+    // Another request the same Node server is handling meanwhile: its span
+    // starts in a context that carries no fork, and keeps its own run.
+    const unrelated = newSpan();
+    processor.onStart(unrelated, ROOT);
+    processor.onStart(unrelated);
+    assert.deepEqual(unrelated.attributes, {}, "a span outside the fork's context is not moved into its run");
+    // Another fork's context is not this one's either.
+    const other = newSpan();
+    processor.onStart(other, ROOT.setValue(Symbol.for("traza.fork"), {}));
+    assert.deepEqual(other.attributes, {});
+    // The agent's spans, started under `fork.context(...)` (or `fork.run`).
+    const tagged = newSpan();
+    processor.onStart(tagged, fork.context(ROOT).setValue(Symbol.for("some.other.key"), 1));
     assert.deepEqual(tagged.attributes, {
       "traza.fork.parent": "weather-7",
       "traza.fork.step": 1,
       "traza.fork.id": fork.id,
       "session.id": "weather-7-sunny",
     });
+    const viaRun = newSpan();
+    const api = { current: ROOT, active() { return this.current; }, with(ctx, fn) { const saved = this.current; this.current = ctx; try { return fn(); } finally { this.current = saved; } } };
+    assert.equal(fork.run(api, () => { processor.onStart(viaRun, api.active()); return 7; }), 7);
+    assert.equal(viaRun.attributes["traza.fork.id"], fork.id);
+    // Opting in to every span, for a process that runs nothing else.
+    const everything = newSpan();
+    fork.spanProcessor({ allSpans: true }).onStart(everything, ROOT);
+    assert.equal(everything.attributes["traza.fork.id"], fork.id);
     fork.close();
-    const late = { attributes: {}, setAttribute(key, value) { this.attributes[key] = value; } };
-    processor.onStart(late);
+    const late = newSpan();
+    processor.onStart(late, fork.context(ROOT));
     assert.deepEqual(late.attributes, {}, "a closed fork tags nothing");
 
     await client.request("POST", "/v1/spans", {

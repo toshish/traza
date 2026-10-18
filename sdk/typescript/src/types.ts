@@ -197,6 +197,8 @@ export interface ReplayDocument {
   run: string;
   mode: "strict" | "loose";
   steps: number;
+  /** Present (true) when `steps` counts only the run's beginning: a fork of a run past the span cap that goes live within it. */
+  steps_truncated?: boolean;
   llm_steps: number;
   expires_at_ns: Nanos;
   unreadable_tool_steps: number[];

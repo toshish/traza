@@ -10,6 +10,7 @@ the way a provider SDK speaks.
 
 from __future__ import annotations
 
+import contextvars
 import io
 import json
 import os
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 import urllib.error
 import urllib.request
@@ -32,10 +34,18 @@ from _stub import Stub, response  # noqa: E402
 
 import traza  # noqa: E402
 from traza import Client  # noqa: E402
-from traza.cli import main as cli_main  # noqa: E402
+from traza.cli import build_parser, main as cli_main  # noqa: E402
 from traza.forking import Fork, ForkSpanProcessor, active_fork  # noqa: E402
 from traza.models import Divergence, ReplayStatus  # noqa: E402
-from traza.testing import GoldenResult, TapeMismatch, TapeTest, describe, junit_xml, replay_test  # noqa: E402
+from traza.testing import (  # noqa: E402
+    GoldenResult,
+    TapeMismatch,
+    TapeTest,
+    describe,
+    junit_xml,
+    replay_key,
+    replay_test,
+)
 
 T0 = 1_767_225_600_000_000_000
 MS = 1_000_000
@@ -116,6 +126,9 @@ AGENT = textwrap.dedent(
     """
     import json, os, sys, urllib.request
     base, key = os.environ["OPENAI_BASE_URL"], os.environ["OPENAI_API_KEY"]
+    if os.environ.get("AGENT_KEY_FILE"):
+        with open(os.environ["AGENT_KEY_FILE"], "a") as record:
+            record.write(key + "\\n")
     task = sys.argv[1]
     def chat(messages):
         body = json.dumps({"model": "gpt-4o", "messages": messages}).encode()
@@ -252,6 +265,54 @@ class ForkGoesLive(unittest.TestCase):
         self.assertFalse(fork.is_live)
 
 
+class ForksSideBySide(unittest.TestCase):
+    """The process environment is one fork's at a time; overlapping forks
+    take set_env=False, and none mistakes another's switch for the provider."""
+
+    def setUp(self):
+        saved = {key: os.environ.get(key) for key in ("OPENAI_BASE_URL", "OPENAI_API_KEY")}
+
+        def restore():
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(restore)
+
+    def test_a_second_fork_cannot_take_the_environment_and_never_goes_live_to_a_switch(self):
+        with Stub(provider_answer) as provider:
+            os.environ["OPENAI_BASE_URL"] = provider.url + "/v1"
+            os.environ["OPENAI_API_KEY"] = "sk-real-provider-key"
+            with Fork(CLIENT, "weather-7", 1, tool_result="sunny") as outer:
+                self.assertTrue(os.environ["OPENAI_BASE_URL"].startswith("http://127.0.0.1:"))
+                nested = Fork(CLIENT, "weather-7", 1, tool_result="rain")
+                with self.assertRaises(RuntimeError) as refused:
+                    nested.start()
+                self.assertIn("set_env=False", str(refused.exception))
+                self.assertIsNone(nested.replay, "refused before a replay was created")
+                self.assertTrue(os.environ["OPENAI_API_KEY"].startswith("traza-fork-"), "outer's env untouched")
+                # Built while outer owns the environment, it still finds the
+                # real provider, not outer's switch and secret.
+                inner = Fork(CLIENT, "weather-7", 1, tool_result="rain", set_env=False)
+                self.assertEqual(inner.live_openai_base_url, provider.url + "/v1")
+                self.assertEqual(inner.live_openai_api_key, "sk-real-provider-key")
+                with inner:
+                    chat(inner.openai_base_url, inner.api_key, {"model": "gpt-4o", "messages": messages()})
+                    self.assertEqual(inner.tool_result("get_weather").result, "rain")
+                    status, live = chat(inner.openai_base_url, inner.api_key,
+                                        {"model": "gpt-4o", "messages": messages(tool_result="rain")})
+                    self.assertEqual(live["choices"][0]["message"]["content"], "Live: it is sunny in Paris.")
+                self.assertEqual(len(provider.requests), 1, "inner went live to the provider itself")
+                self.assertEqual(provider.requests[0].headers["authorization"], "Bearer sk-real-provider-key")
+            self.assertEqual(os.environ["OPENAI_BASE_URL"], provider.url + "/v1", "environment restored")
+            self.assertEqual(os.environ["OPENAI_API_KEY"], "sk-real-provider-key")
+            # With the block over, the environment is free again.
+            with Fork(CLIENT, "weather-7", 1, tool_result="sunny"):
+                pass
+
+
 class FakeSpan:
     def __init__(self):
         self.attributes = {}
@@ -274,6 +335,32 @@ class ForkTagsSpans(unittest.TestCase):
             "session.id": "weather-7-what-if",
         })
         self.assertEqual(fork.env()["TRAZA_FORK_RUN"], "weather-7-what-if")
+
+    def test_a_thread_outside_the_fork_context_is_tagged_only_when_asked(self):
+        processor = ForkSpanProcessor()
+
+        def started_on_a_thread(context=None):
+            span = FakeSpan()
+            target = processor.on_start if context is None else (lambda s: context.run(processor.on_start, s))
+            worker = threading.Thread(target=target, args=(span,))
+            worker.start()
+            worker.join()
+            return span
+
+        with Fork(CLIENT, "weather-7", 1, tag_spans=False, set_env=False) as fork:
+            # A web server's other worker thread, say: not the fork's.
+            stray = started_on_a_thread()
+            # A thread the agent started in a copy of the block's context.
+            carried = started_on_a_thread(contextvars.copy_context())
+        self.assertEqual(stray.attributes, {}, "another thread's span is not moved into the fork's run")
+        self.assertEqual(carried.attributes["traza.fork.id"], fork.id)
+
+        with Fork(CLIENT, "weather-7", 1, tag_spans=False, set_env=False, tag_threads=True) as every:
+            anywhere = started_on_a_thread()
+            with self.assertRaises(RuntimeError):
+                Fork(CLIENT, "weather-7", 1, set_env=False, tag_threads=True).start()
+        self.assertEqual(anywhere.attributes["traza.fork.id"], every.id)
+        self.assertEqual(started_on_a_thread().attributes, {}, "nothing is tagged once it ends")
 
     def test_with_the_opentelemetry_sdk_the_processor_is_installed_and_tags(self):
         try:
@@ -442,6 +529,70 @@ class GoldenRunsAndTheCommand(unittest.TestCase):
         failure = ET.fromstring(out).find("testsuite/testcase/failure")
         self.assertEqual(failure.get("type"), "incomplete")
 
+    def test_a_partial_golden_listing_fails_unless_accepted(self):
+        self.client.mark_golden("golden-by-note")
+        self.assertEqual(build_parser().parse_args(["test"]).limit, 1000, "the server's maximum by default")
+        code, out, err = run_cli("test", "--url", self.server.url, "--limit", "1", "--", *self.agent, "{input}")
+        self.assertEqual(code, 1, err)
+        self.assertIn("incomplete", err)
+        self.assertIn("raise --limit", err)
+        self.assertEqual(ET.fromstring(out).get("tests"), "1", "the runs listed are still tested")
+        code, _, err = run_cli("test", "--url", self.server.url, "--limit", "1", "--allow-partial",
+                               "--", *self.agent, "{input}")
+        self.assertEqual(code, 0, err)
+
+    def test_traza_forks_says_why_a_listing_is_incomplete(self):
+        for index, trace in enumerate(("acf92f3577b34da6a3ce929d0e0e4732", "adf92f3577b34da6a3ce929d0e0e4733")):
+            self.client.request("POST", "/v1/spans", body=weather_run(
+                f"golden-by-tag-fork-{index}", trace, at_ms=10_000 * (index + 1),
+                extra={"traza.fork.parent": "golden-by-tag", "traza.fork.step": 1}))
+        code, _, err = run_cli("forks", "golden-by-tag", "--url", self.server.url, "--limit", "1")
+        self.assertEqual(code, 0)
+        self.assertIn("more forks exist than --limit 1", err)
+        self.assertNotIn("smaller", err)
+
+    def test_the_agent_gets_a_replay_key_never_an_operator_token(self):
+        operator, reader, writer = "op-token", "acme-ro-token", "acme-rw-token"
+        auth = Server(env={"TRAZA_TOKENS": f"admin:{operator},ro@acme:{reader},rw@acme:{writer}"})
+        self.addCleanup(auth.stop)
+        Client(auth.url, token=writer).request(
+            "POST", "/v1/spans", body=weather_run("acme-golden", "aef92f3577b34da6a3ce929d0e0e4734",
+                                                  extra={"traza.golden": True}))
+        saved = {key: os.environ.get(key) for key in ("TRAZA_TOKEN", "TRAZA_REPLAY_KEY", "AGENT_KEY_FILE")}
+
+        def restore():
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(restore)
+        keys = Path(SCRATCH, "agent-keys.txt")
+        os.environ["AGENT_KEY_FILE"] = str(keys)
+        os.environ.pop("TRAZA_REPLAY_KEY", None)
+        os.environ["TRAZA_TOKEN"] = operator
+        # The operator token lists every tenant's goldens, but is not handed
+        # to an agent as its provider key.
+        code, _, err = run_cli("test", "--url", auth.url, "--", *self.agent, "{input}")
+        self.assertEqual(code, 2, err)
+        self.assertIn("TRAZA_REPLAY_KEY", err)
+        self.assertFalse(keys.exists(), "no agent ran")
+        with self.assertRaises(ValueError):
+            replay_key(Client(auth.url, token=operator), {})
+        # A dedicated read-only key of the run's tenant is what the agent gets.
+        os.environ["TRAZA_REPLAY_KEY"] = reader
+        code, _, err = run_cli("test", "--url", auth.url, "--", *self.agent, "{input}")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(keys.read_text().split(), [reader])
+        # A bound token may be handed over as it is.
+        os.environ.pop("TRAZA_REPLAY_KEY")
+        os.environ["TRAZA_TOKEN"] = reader
+        self.assertIsNone(replay_key(Client(auth.url, token=reader), {}))
+        code, _, err = run_cli("test", "--url", auth.url, "--", *self.agent, "{input}")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(keys.read_text().split(), [reader, reader])
+
     def test_an_empty_suite_is_not_a_pass_unless_asked(self):
         empty = Server()
         try:
@@ -504,6 +655,15 @@ class PytestPlugin(unittest.TestCase):
             def test_stops_early():
                 chat("What's the weather in Paris?")
 
+            @pytest.mark.traza_tape("weather-7")
+            def test_skips_itself():
+                pytest.skip("not today")
+
+            @pytest.mark.traza_tape("weather-7")
+            @pytest.mark.xfail(reason="known to ask about Oslo")
+            def test_expected_to_fail():
+                chat("What's the weather in Oslo?")
+
             def test_unmarked_tests_are_untouched():
                 assert "TRAZA_REPLAY_ID" not in os.environ
             '''
@@ -527,6 +687,10 @@ class PytestPlugin(unittest.TestCase):
         self.assertIn("got:      \"What's the weather in Oslo?\"", diverged.text)
         stopped = cases["test_stops_early"].find("failure")
         self.assertIn("stopped after 1 of the 2 model calls", stopped.text)
+        # A skip, and an expected failure that failed, stay what they were.
+        for name in ("test_skips_itself", "test_expected_to_fail"):
+            self.assertIsNone(cases[name].find("failure"), output)
+            self.assertIsNotNone(cases[name].find("skipped"), output)
 
 
 if __name__ == "__main__":

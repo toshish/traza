@@ -24,7 +24,13 @@ The ``traza_tape`` fixture hands the test the :class:`traza.testing.TapeTest`
 a subprocess agent). The server is ``--traza-url`` (default ``TRAZA_URL``,
 else ``http://127.0.0.1:8080``); the credential is ``TRAZA_TOKEN`` and the
 tenant ``--traza-tenant`` or ``TRAZA_TENANT``. A token is never a command-line
-option: it would land in process listings and CI logs.
+option: it would land in process listings and CI logs. The agent's provider
+API key is ``TRAZA_REPLAY_KEY`` when set (a ``ro`` credential of the run's
+tenant), else ``TRAZA_TOKEN`` — refused when that is an unbound (operator)
+credential (:func:`traza.testing.replay_key`).
+
+A marked test that skips itself, or is ``xfail`` and fails as expected, is
+reported as it was: the tape is judged only for a test that ran to an end.
 """
 
 from __future__ import annotations
@@ -35,11 +41,12 @@ from typing import Any, Iterator, Optional
 import pytest
 
 from .client import Client
-from .testing import TapeTest
+from .testing import TapeTest, replay_key
 
 __all__ = ["traza_tape"]
 
 _KEY = "_traza_tape"
+_REPLAY_KEY = "_traza_replay_key"
 
 
 def pytest_addoption(parser: Any) -> None:
@@ -71,7 +78,17 @@ def _traza_tape_marker(request: Any) -> Iterator[None]:
     if not marker.args or not isinstance(marker.args[0], str) or not marker.args[0]:
         raise pytest.UsageError('traza_tape needs the run to replay: @pytest.mark.traza_tape("<run id>")')
     mode = marker.kwargs.get("mode", "strict")
-    tape = TapeTest(_client(request.config), marker.args[0], mode=mode)
+    client = _client(request.config)
+    # Asked once per session: the credential does not change between tests.
+    if not hasattr(request.config, _REPLAY_KEY):
+        try:
+            setattr(request.config, _REPLAY_KEY, (replay_key(client), None))
+        except ValueError as refused:
+            setattr(request.config, _REPLAY_KEY, (None, str(refused)))
+    key, refusal = getattr(request.config, _REPLAY_KEY)
+    if refusal is not None:
+        raise pytest.UsageError(f"traza_tape: {refusal}")
+    tape = TapeTest(client, marker.args[0], mode=mode, api_key=key)
     setattr(request.node, _KEY, tape)
     with tape:
         yield
@@ -96,6 +113,11 @@ def pytest_runtest_makereport(item: Any, call: Any) -> Iterator[None]:
     if tape is None or tape.replay is None:
         return
     report = outcome.get_result()
+    # A test that skipped itself, or an expected failure (failed as xfail
+    # reports it, or passed unexpectedly), stopped wherever it stopped: the
+    # replay's remaining steps say nothing about it.
+    if report.skipped or hasattr(report, "wasxfail"):
+        return
     # Read now, while the test's replay is still live: the fixture's
     # teardown has not run yet.
     try:

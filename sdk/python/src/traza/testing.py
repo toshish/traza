@@ -42,6 +42,7 @@ __all__ = [
     "TapeTest",
     "GoldenResult",
     "describe",
+    "replay_key",
     "replay_test",
     "first_user_input",
     "run_golden",
@@ -51,6 +52,38 @@ __all__ = [
 #: Bytes of an agent command's stdout and stderr a golden result keeps: the
 #: tail, where a failure's last words are.
 OUTPUT_TAIL_BYTES = 64 * 1024
+
+#: The environment variable holding the key an agent under test is handed as
+#: its provider API key, in place of the runner's own ``TRAZA_TOKEN``.
+REPLAY_KEY_ENV = "TRAZA_REPLAY_KEY"
+
+
+def replay_key(client: Client, environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """The key an agent under test sends as ``OPENAI_API_KEY`` /
+    ``ANTHROPIC_API_KEY`` — ``None`` meaning the client's own token.
+
+    ``TRAZA_REPLAY_KEY`` when set: a dedicated ``ro`` credential bound to the
+    run's tenant is the right thing to hand an agent, since any library that
+    reads ``OPENAI_API_KEY`` but ignores ``OPENAI_BASE_URL`` sends it to the
+    real provider. Otherwise the client's token is used — unless it is an
+    unbound (operator) credential, which can read every tenant: that is
+    refused with ``ValueError``, naming the remedy. To hand it over anyway,
+    say so: ``TRAZA_REPLAY_KEY=$TRAZA_TOKEN``.
+    """
+    environ = os.environ if environ is None else environ
+    dedicated = environ.get(REPLAY_KEY_ENV)
+    if dedicated:
+        return dedicated
+    if not client.token:
+        return None
+    if client.whoami().operator:
+        raise ValueError(
+            "TRAZA_TOKEN is an unbound (operator) credential, and an agent under test would get it as "
+            "OPENAI_API_KEY / ANTHROPIC_API_KEY, where a library that ignores OPENAI_BASE_URL sends it to "
+            f"the provider. Set {REPLAY_KEY_ENV} to a ro credential bound to the runs' tenant (or to "
+            "$TRAZA_TOKEN to accept the exposure)"
+        )
+    return None
 
 
 class TapeMismatch(AssertionError):

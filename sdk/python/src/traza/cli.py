@@ -12,7 +12,9 @@
 The server is ``--url`` (default ``TRAZA_URL``, else ``http://127.0.0.1:8080``)
 and the tenant ``--tenant`` (default ``TRAZA_TENANT``). The credential is
 ``TRAZA_TOKEN`` only: a token on a command line lands in process listings and
-CI logs.
+CI logs. The agent ``traza test`` runs is handed ``TRAZA_REPLAY_KEY`` as its
+provider API key when set — a ``ro`` credential of the runs' tenant — else
+``TRAZA_TOKEN``, which is refused when it is an unbound (operator) credential.
 
 Exit status: ``0`` when every test passed (or the command succeeded), ``1``
 when a test failed, ``2`` for a usage error or a server that could not be
@@ -31,7 +33,14 @@ from typing import Any, List, Optional, Sequence
 from . import __version__
 from .client import Client
 from .errors import TrazaError
-from .testing import GoldenResult, junit_xml, run_golden
+from .testing import GoldenResult, junit_xml, replay_key, run_golden
+
+#: Golden runs ``traza test`` lists by default: the server's maximum, so a
+#: suite is never quietly cut to the server's default page.
+GOLDEN_LIMIT = 1000
+
+#: Forks one ``GET /v1/forks`` lists when the caller names no limit.
+FORK_LIMIT = 20
 
 
 def _client(args: argparse.Namespace) -> Client:
@@ -54,13 +63,26 @@ def _say(message: str) -> None:
 def _cmd_test(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     command = _command(args, parser)
     client = _client(args)
+    # Settled before any agent runs: an operator token is not handed out.
+    key = replay_key(client)
+    partial = False
     if args.run:
         targets = [(run, client.tenant) for run in args.run]
     else:
         goldens = client.goldens(limit=args.limit)
         targets = [(golden.run or "", golden.tenant) for golden in goldens.runs if golden.run]
         if goldens.truncated:
-            _say(f"traza test: more golden runs exist than the {len(targets)} listed; raise --limit")
+            partial = not args.allow_partial
+            if len(goldens.runs) >= min(args.limit, GOLDEN_LIMIT) and args.limit < GOLDEN_LIMIT:
+                why = f"more golden runs exist than --limit {args.limit}; raise --limit (at most {GOLDEN_LIMIT})"
+            elif len(goldens.runs) >= GOLDEN_LIMIT:
+                why = (f"more golden runs exist than one listing returns ({GOLDEN_LIMIT}); partition the "
+                       "suite with --tenant or --run")
+            else:
+                why = ("more golden markers exist than one listing examines; partition the suite with "
+                       "--tenant or --run")
+            _say(f"traza test: the golden listing is incomplete — {why}"
+                 + ("" if partial else "; testing the runs listed (--allow-partial)"))
     if not targets:
         if args.allow_empty:
             _say("traza test: no golden runs to test")
@@ -73,7 +95,8 @@ def _cmd_test(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             return 1
     results: List[GoldenResult] = []
     for run, tenant in targets:
-        result = run_golden(client, run, command, tenant=tenant, mode=args.mode, timeout=args.timeout)
+        result = run_golden(client, run, command, tenant=tenant, mode=args.mode, timeout=args.timeout,
+                            api_key=key)
         results.append(result)
         verdict = "PASS" if result.passed else ("ERROR" if result.kind == "error" else "FAIL")
         where = f" [{tenant}]" if tenant else ""
@@ -89,7 +112,9 @@ def _cmd_test(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         sys.stdout.write(report)
     failed = sum(1 for result in results if not result.passed)
     _say(f"traza test: {len(results) - failed} passed, {failed} failed")
-    return 1 if failed else 0
+    if partial:
+        _say("traza test: failing the suite because it is incomplete; pass --allow-partial to accept that")
+    return 1 if failed or partial else 0
 
 
 def _cmd_golden(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -131,7 +156,14 @@ def _cmd_forks(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int
         _say(f"traza forks: {forks.merged_into_parent} tagged spans joined the parent run itself "
              "(a fork without its own session)")
     if forks.truncated:
-        _say("traza forks: the listing is incomplete; ask for a smaller --limit")
+        limit = args.limit or FORK_LIMIT
+        if any(fork.skipped == "deadline" for fork in forks.forks):
+            why = "the query budget ran out before every fork was compared; ask for a smaller --limit"
+        elif len(forks.forks) >= limit:
+            why = f"more forks exist than --limit {limit}; raise --limit (at most 50)"
+        else:
+            why = "more tagged spans exist than one listing examines, so the newest forks may be missing"
+        _say(f"traza forks: the listing is incomplete — {why}")
     return 0
 
 
@@ -180,8 +212,11 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--mode", choices=["strict", "loose"], default="strict")
     test.add_argument("--timeout", type=float, default=300.0, help="seconds per run (default 300)")
     test.add_argument("--junit", help="write the JUnit XML report here instead of stdout")
-    test.add_argument("--limit", type=int, default=None, help="golden runs to list at most")
+    test.add_argument("--limit", type=int, default=GOLDEN_LIMIT,
+                      help=f"golden runs to list at most (default {GOLDEN_LIMIT}, the server's maximum)")
     test.add_argument("--allow-empty", action="store_true", help="exit 0 when there is nothing to test")
+    test.add_argument("--allow-partial", action="store_true",
+                      help="test the golden runs listed when the listing is incomplete, instead of failing")
 
     golden = commands.add_parser("golden", parents=[common], help="list, add or remove golden runs")
     golden.add_argument("action", choices=["list", "add", "remove"])

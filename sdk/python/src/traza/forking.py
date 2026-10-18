@@ -19,6 +19,14 @@ URL and key the environment named when the fork was made). The agent sees
 one provider throughout. An SDK client constructed *before* the block keeps
 the URL it was built with: build it inside, or pass :meth:`Fork.openai_kwargs`.
 
+The environment is the whole process's, so only one fork at a time may own
+it: starting a second ``set_env`` fork while one is active is refused. Forks
+that run side by side — nested, or one per thread for parallel what-ifs —
+take ``set_env=False`` and hand each agent its own :meth:`Fork.openai_kwargs`
+(or :meth:`Fork.env`, for a subprocess). A fork never mistakes another
+fork's switch for the real provider: the live provider is read from the
+environment as it stood before any fork changed it.
+
 Traza itself never calls a model. The switch is the agent's own traffic, in
 the agent's own process; it listens on ``127.0.0.1`` only, and answers only
 requests that present the per-fork secret it put in ``OPENAI_API_KEY`` /
@@ -28,9 +36,13 @@ it forwards with.
 Spans started inside the block carry the fork's tags (``traza.fork.parent``,
 ``traza.fork.step``, ``traza.fork.id``) and the fork's own session id, when
 the OpenTelemetry SDK is installed and configured before the fork is entered:
-a span processor is added to the global tracer provider once, and stamps
-whatever fork is active (see :class:`ForkSpanProcessor`). That is what lets
-``GET /v1/forks`` find the branch again and diff it against its parent.
+a span processor is added to the global tracer provider once, and stamps the
+fork active in the span's context (see :class:`ForkSpanProcessor`). That is
+what lets ``GET /v1/forks`` find the branch again and diff it against its
+parent. Threads do not inherit context variables, so a span started on a
+worker thread is tagged only when that thread runs in a copy of the block's
+context (``contextvars.copy_context().run``) — or, for a process that runs
+nothing but the forked agent, with ``tag_threads=True``.
 
 Standard library only; OpenTelemetry is used when present, never required.
 """
@@ -107,29 +119,59 @@ _HOP_BY_HOP = frozenset(
 _UNSET: Any = object()
 
 _ACTIVE: "contextvars.ContextVar[Optional[Fork]]" = contextvars.ContextVar("traza_fork", default=None)
-_PROCESS_FORKS: List["Fork"] = []
 _LOCK = threading.Lock()
 _TAGGED_PROVIDERS: List[Any] = []
+#: The fork whose block has pointed the process environment at its switch.
+_ENV_OWNER: Optional["Fork"] = None
+#: The fork tagging spans from contexts that carry none (``tag_threads``).
+_THREAD_TAGGER: Optional["Fork"] = None
+#: The URLs of the switches listening in this process.
+_SWITCHES: Dict[str, "Fork"] = {}
+
+_SECRET_PREFIX = "traza-fork-"
 
 
 def active_fork() -> Optional["Fork"]:
-    """The fork whose ``with`` block the caller is in: this context's, else
-    the most recently entered one in the process (threads started inside a
-    block do not inherit context variables, but their spans belong to it)."""
+    """The fork whose ``with`` block the caller is in — this context's —
+    else the one fork started with ``tag_threads=True``, if any. A thread
+    started inside a block does not inherit its context variables, so its
+    spans are not the fork's unless it runs in a copy of the block's context
+    or that fork tags every thread."""
     fork = _ACTIVE.get()
     if fork is not None:
         return fork
     with _LOCK:
-        return _PROCESS_FORKS[-1] if _PROCESS_FORKS else None
+        return _THREAD_TAGGER
+
+
+def _real_env(key: str) -> Optional[str]:
+    """``os.environ[key]`` as it stood before any fork changed it: the value
+    the environment-owning fork saved, when one is active — and never a
+    fork's own switch URL or secret."""
+    with _LOCK:
+        owner = _ENV_OWNER
+        if owner is not None and key in owner._saved_env:
+            value = owner._saved_env[key]
+        else:
+            value = os.environ.get(key)
+        switches = list(_SWITCHES)
+    if not value:
+        return None
+    if value.startswith(_SECRET_PREFIX) or any(value.startswith(url) for url in switches):
+        return None
+    return value
 
 
 class ForkSpanProcessor:
-    """An OpenTelemetry span processor that stamps the active fork's
-    attributes on every span as it starts.
+    """An OpenTelemetry span processor that stamps the fork active where a
+    span starts (:func:`active_fork`) on that span.
 
     Duck-typed against ``opentelemetry.sdk.trace.SpanProcessor`` so that this
     package needs no dependency. Added once to the global tracer provider by
-    :func:`install_span_tags`; outside a fork it does nothing. Attributes are
+    :func:`install_span_tags`; outside a fork's context it does nothing, so a
+    span another thread starts meanwhile — a web server's other request, say
+    — keeps its own run unless the fork was made with ``tag_threads=True``.
+    Attributes are
     set at start, so an instrumentation that sets ``session.id`` itself later
     in the span's life overrides the fork's session — give such an agent
     :attr:`Fork.run_id` as its session instead.
@@ -197,9 +239,18 @@ class Fork:
       calls go. Default: ``OPENAI_BASE_URL`` (else OpenAI's API) and
       ``OPENAI_API_KEY``, and the Anthropic equivalents, as the environment
       names them when the fork is made.
+      That environment is read as it stood before any fork changed it,
+      so it is never another fork's switch.
     - ``set_env=False`` — leave the process environment alone; use
       :meth:`env` or :meth:`openai_kwargs` to point the agent at the switch.
+      Required of every fork but one when forks overlap: the environment is
+      the process's, and a second ``set_env`` fork is refused while one is
+      active.
     - ``tag_spans=False`` — do not add the span processor.
+    - ``tag_threads=True`` — also tag spans started in contexts that carry
+      no fork (threads the agent starts). Only for a process that runs
+      nothing but the forked agent: every other thread's spans would join
+      the fork's run too. At most one such fork at a time.
     """
 
     def __init__(
@@ -220,6 +271,7 @@ class Fork:
         live_anthropic_api_key: Optional[str] = None,
         set_env: bool = True,
         tag_spans: bool = True,
+        tag_threads: bool = False,
     ) -> None:
         if not isinstance(run, str) or not run:
             raise ValueError("expected a non-empty run id")
@@ -249,15 +301,15 @@ class Fork:
         self.tag_session = tag_session
         self.set_env = set_env
         self.tag_spans = tag_spans
-        env = os.environ
+        self.tag_threads = tag_threads
         self.live_openai_base_url = (
-            live_openai_base_url or env.get("OPENAI_BASE_URL") or DEFAULT_OPENAI_BASE_URL
+            live_openai_base_url or _real_env("OPENAI_BASE_URL") or DEFAULT_OPENAI_BASE_URL
         ).rstrip("/")
-        self.live_openai_api_key = live_openai_api_key or env.get("OPENAI_API_KEY") or None
+        self.live_openai_api_key = live_openai_api_key or _real_env("OPENAI_API_KEY")
         self.live_anthropic_base_url = (
-            live_anthropic_base_url or env.get("ANTHROPIC_BASE_URL") or DEFAULT_ANTHROPIC_BASE_URL
+            live_anthropic_base_url or _real_env("ANTHROPIC_BASE_URL") or DEFAULT_ANTHROPIC_BASE_URL
         ).rstrip("/")
-        self.live_anthropic_api_key = live_anthropic_api_key or env.get("ANTHROPIC_API_KEY") or None
+        self.live_anthropic_api_key = live_anthropic_api_key or _real_env("ANTHROPIC_API_KEY")
         #: The replay serving the fork's beginning, once entered.
         self.replay: Optional[Replay] = None
         #: The fork id (``fk_…``), once entered.
@@ -295,21 +347,50 @@ class Fork:
 
     def start(self) -> "Fork":
         """Creates the replay, starts the switch, points the environment at
-        it and starts tagging spans. ``__enter__`` calls it."""
+        it and starts tagging spans. ``__enter__`` calls it.
+
+        Refused with ``RuntimeError``, before anything is created, when this
+        fork would set the environment while another fork's block owns it,
+        or tag every thread while another fork does."""
+        global _ENV_OWNER, _THREAD_TAGGER
         if self.replay is not None:
             raise RuntimeError("this fork has already started")
-        self.replay = self.client.replay(self.parent, mode=self.mode, edits=self.edits(), live_after=self.live_after())
-        self.id = self.replay.fork_id
-        self.step = self.replay.fork.step if self.replay.fork is not None else None
-        if self.live:
-            self._switch = _Switch(self)
-        if self.set_env:
-            for key, value in self.env().items():
-                self._saved_env[key] = os.environ.get(key)
-                os.environ[key] = value
-        self._token = _ACTIVE.set(self)
         with _LOCK:
-            _PROCESS_FORKS.append(self)
+            if self.set_env and _ENV_OWNER is not None:
+                raise RuntimeError(
+                    f"fork {_ENV_OWNER.id} already points this process's OPENAI_BASE_URL and "
+                    "ANTHROPIC_BASE_URL at its switch; forks that overlap take set_env=False and give "
+                    "each agent fork.openai_kwargs() or fork.env()"
+                )
+            if self.tag_threads and _THREAD_TAGGER is not None:
+                raise RuntimeError(
+                    f"fork {_THREAD_TAGGER.id} already tags every thread's spans; at most one fork may "
+                    "use tag_threads=True at a time"
+                )
+            # Claimed before the replay is created, so two forks starting
+            # together cannot both pass the check.
+            if self.set_env:
+                _ENV_OWNER = self
+            if self.tag_threads:
+                _THREAD_TAGGER = self
+        try:
+            self.replay = self.client.replay(
+                self.parent, mode=self.mode, edits=self.edits(), live_after=self.live_after()
+            )
+            self.id = self.replay.fork_id
+            self.step = self.replay.fork.step if self.replay.fork is not None else None
+            if self.live:
+                self._switch = _Switch(self)
+                with _LOCK:
+                    _SWITCHES[self._switch.url] = self
+            if self.set_env:
+                for key, value in self.env().items():
+                    self._saved_env[key] = os.environ.get(key)
+                    os.environ[key] = value
+        except BaseException:
+            self.stop()
+            raise
+        self._token = _ACTIVE.set(self)
         if self.tag_spans:
             self.tagging = install_span_tags()
         return self
@@ -318,9 +399,7 @@ class Fork:
         """Undoes :meth:`start`: stops tagging, restores the environment,
         stops the switch, and keeps the replay's last status in
         :attr:`final_status`. ``__exit__`` calls it."""
-        with _LOCK:
-            if self in _PROCESS_FORKS:
-                _PROCESS_FORKS.remove(self)
+        global _ENV_OWNER, _THREAD_TAGGER
         if self._token is not None:
             try:
                 _ACTIVE.reset(self._token)
@@ -328,12 +407,19 @@ class Fork:
                 # Exited in another context than it was entered in.
                 _ACTIVE.set(None)
             self._token = None
-        for key, value in self._saved_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-        self._saved_env = {}
+        with _LOCK:
+            if _THREAD_TAGGER is self:
+                _THREAD_TAGGER = None
+            if _ENV_OWNER is self:
+                for key, value in self._saved_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                _ENV_OWNER = None
+            self._saved_env = {}
+            if self._switch is not None:
+                _SWITCHES.pop(self._switch.url, None)
         if self._switch is not None:
             self._switch.close()
             self._switch = None
@@ -482,7 +568,7 @@ class _Switch:
 
     def __init__(self, fork: Fork) -> None:
         self.fork = fork
-        self.secret = "traza-fork-" + secrets.token_urlsafe(32)
+        self.secret = _SECRET_PREFIX + secrets.token_urlsafe(32)
         server = ThreadingHTTPServer(("127.0.0.1", 0), _SwitchHandler)
         server.daemon_threads = True
         server.switch = self  # type: ignore[attr-defined]

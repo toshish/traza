@@ -24,8 +24,16 @@
  * Spans: {@link Fork.spanProcessor} returns an OpenTelemetry span processor
  * (duck-typed, so this package needs no dependency) that stamps the fork's
  * tags — `traza.fork.parent`, `traza.fork.step`, `traza.fork.id` — and its
- * session id on every span started while the fork is open. That is what
- * lets `GET /v1/forks` find the branch again.
+ * session id on the spans started in the fork's OpenTelemetry context. That
+ * is what lets `GET /v1/forks` find the branch again. Run the agent in that
+ * context, so a server handling other requests meanwhile keeps their spans
+ * in their own runs:
+ *
+ * ```ts
+ * import { context } from "@opentelemetry/api";
+ * provider.addSpanProcessor(fork.spanProcessor());
+ * await fork.run(context, () => runAgent(openai));
+ * ```
  *
  * @module
  */
@@ -40,6 +48,13 @@ export const FORK_PARENT = "traza.fork.parent";
 export const FORK_STEP = "traza.fork.step";
 /** The span attribute carrying the fork's id. */
 export const FORK_ID = "traza.fork.id";
+
+/**
+ * The OpenTelemetry context key a fork is carried under. `Symbol.for`, which
+ * is what `createContextKey("traza.fork")` in `@opentelemetry/api` returns,
+ * so a harness may set it with either.
+ */
+export const FORK_CONTEXT_KEY: symbol = Symbol.for("traza.fork");
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
@@ -79,6 +94,28 @@ export interface ForkOptions extends CallOptions {
 /** The parts of an OpenTelemetry span the fork's processor touches. */
 export interface TaggableSpan {
   setAttribute(key: string, value: string | number): unknown;
+}
+
+/** The parts of an OpenTelemetry `Context` a fork reads and writes. */
+export interface OtelContext {
+  getValue(key: symbol): unknown;
+  setValue(key: symbol, value: unknown): OtelContext;
+}
+
+/** The parts of the OpenTelemetry context API (`context` from `@opentelemetry/api`) {@link Fork.run} uses. */
+export interface OtelContextApi<C extends OtelContext = OtelContext> {
+  active(): C;
+  with<T>(context: C, fn: () => T): T;
+}
+
+/** Options for {@link Fork.spanProcessor}. */
+export interface SpanProcessorOptions {
+  /**
+   * Tag every span started while the fork is open, whatever its context
+   * (default false). Only for a process that runs nothing but the forked
+   * agent: any other work's spans would join the fork's run too.
+   */
+  allSpans?: boolean;
 }
 
 /** A duck-typed OpenTelemetry `SpanProcessor`. */
@@ -227,14 +264,36 @@ export class Fork {
   }
 
   /**
-   * An OpenTelemetry span processor that stamps {@link spanAttributes} on
-   * every span started while the fork is open. Register it with your tracer
-   * provider; it stops tagging at {@link close}.
+   * `parent` with this fork in it: spans started under the result (and
+   * under every context derived from it) are the fork's. See {@link run}.
    */
-  spanProcessor(): ForkSpanProcessor {
+  context<C extends OtelContext>(parent: C): C {
+    return parent.setValue(FORK_CONTEXT_KEY, this) as C;
+  }
+
+  /**
+   * Runs `fn` in the active OpenTelemetry context with this fork in it, so
+   * {@link spanProcessor} tags the spans it starts — and only those. Pass
+   * `context` from `@opentelemetry/api`.
+   */
+  run<T, C extends OtelContext>(api: OtelContextApi<C>, fn: () => T): T {
+    return api.with(this.context(api.active()), fn);
+  }
+
+  /**
+   * An OpenTelemetry span processor that stamps {@link spanAttributes} on
+   * the spans started in this fork's context ({@link run}, {@link context})
+   * while it is open. Register it with your tracer provider; it stops
+   * tagging at {@link close}. A span started anywhere else — another
+   * request the same server is handling — keeps its own run, unless
+   * `allSpans: true` asks for every span.
+   */
+  spanProcessor(options: SpanProcessorOptions = {}): ForkSpanProcessor {
+    const allSpans = options.allSpans ?? false;
     return {
-      onStart: (span) => {
+      onStart: (span, parentContext) => {
         if (this.#closed) return;
+        if (!allSpans && carriedFork(parentContext) !== this) return;
         for (const [key, value] of Object.entries(this.spanAttributes())) span.setAttribute(key, value);
       },
       onEnd: () => {},
@@ -319,6 +378,12 @@ export class Fork {
       body: request.body,
     });
   }
+}
+
+/** The fork an OpenTelemetry context carries, if it is one. */
+function carriedFork(context: unknown): unknown {
+  const getValue = (context as { getValue?: unknown } | null | undefined)?.getValue;
+  return typeof getValue === "function" ? getValue.call(context, FORK_CONTEXT_KEY) : undefined;
 }
 
 function isLiveSignal(text: string): boolean {
