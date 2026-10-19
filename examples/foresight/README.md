@@ -28,8 +28,10 @@ and deletes everything on exit. `python3` is the agent and reads replies;
 | escalation | llm → `lookup_customer` → llm → `escalate_ticket` → llm | 40 | 24 (4 abandoned) |
 | double refund | llm → `search_orders` → llm → `issue_refund` ×2 → llm | 30 | 15 |
 
-plus a `researcher` agent and six support runs still in flight. The demo
-asserts that the server's cohort counts equal this table.
+plus a `researcher` agent, a `ci-fix` coding agent (Claude Code fixing a
+failing CI job), and nine runs still in flight, six of them the support
+agent's. The demo asserts that the server's `support-agent` counts equal
+this table.
 
 ## The agent
 

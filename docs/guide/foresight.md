@@ -36,9 +36,21 @@ history it stands on. The wire is in the
 | double refund | llm → `search_orders` → llm → `issue_refund` ×2 → llm | 30 | 15 |
 
 — a `researcher` agent that picks one of four sources (9, 7, 3 and 1
-successes in 10), and six `support-agent` runs still in flight. Every
-response below is real output from a server over that corpus, trimmed where
-marked.
+successes in 10), a `ci-fix` coding agent, and nine runs still in flight,
+six of them `support-agent`'s. Every response below is real output from a
+server over that corpus, trimmed where marked.
+
+`ci-fix` is Claude Code running headless in a CI job on `claude-sonnet-5-5`,
+asked to make a failing test pass, with Claude Code's tool names and usage:
+prompts of tens of thousands of tokens, read mostly from the cache and
+metered at list price. After the test's first failing run it reads the code,
+fixes it and runs the test again (45 of 50 succeed) or hands the job back
+with a PR comment (20 of 30); it delegates to a `test-investigator` sub-agent
+on `claude-haiku-5-5` first (38 of 45); or it re-runs the failing test four
+times in a row (3 of 40, 7 abandoned) — its fatal fork, `tool:Bash×3-5`. Of
+its three runs in flight, one is in that loop (`likely_failure`), one is
+fixing (`on_track`), and one runs `rm -rf tests/e2e` straight after the first
+failure, where no earlier run ran a command (`novel`).
 
 ```sh
 seed --data-dir ./data --behaviours
@@ -64,7 +76,7 @@ if any claim fails.
 
 A run's **steps** — its LLM, tool and agent spans
 ([step kinds](../llm-semantics.md#steps-and-runs)), in start order — become
-**tokens** `kind:name`: `llm:gpt-4o`, `tool:search_orders`,
+**tokens** `kind:name`: `llm:gpt-6.1-sol`, `tool:search_orders`,
 `agent:researcher`. That is the step's signature without its input hash, so
 two calls of one tool are the same behaviour whatever their arguments.
 Consecutive repeats of one token fold into a single token by bucket:
@@ -102,7 +114,7 @@ curl 'http://127.0.0.1:8080/v1/fate/cohorts'
 ```
 
 ```json
-{"bounds":{"cohorts_dropped":0,"node_cap":false,"runs_dropped":0,"runs_partial":0,"runs_tracked":226,"signature_cap":false,"spans_read":1342,"spans_skipped":0,"window_narrowed":false},"built_at_ns":1792298013667246000,"cohorts":[{"abandoned":9,"agent":"support-agent","base_rate":0.5444,"failure":73,"runs":180,"success":98,"tenant":"","unknown":6},{"abandoned":4,"agent":"support-agent","base_rate":0.6,"failure":12,"runs":40,"success":24,"task":"dd8fe599d8750716","tenant":"","unknown":0},{"abandoned":0,"agent":"researcher","base_rate":0.5,"failure":20,"runs":40,"success":20,"tenant":"","unknown":0}],"truncated":false,"window":{"since_ns":1789706013667246000,"until_ns":1792298013667246000}}
+{"bounds":{"cohorts_dropped":0,"node_cap":false,"runs_dropped":0,"runs_partial":0,"runs_tracked":394,"signature_cap":false,"spans_read":2856,"spans_skipped":0,"window_narrowed":false},"built_at_ns":1792370034748436000,"cohorts":[{"abandoned":9,"agent":"support-agent","base_rate":0.5444,"failure":73,"runs":180,"success":98,"tenant":"","unknown":6},{"abandoned":4,"agent":"support-agent","base_rate":0.6,"failure":12,"runs":40,"success":24,"task":"dd8fe599d8750716","tenant":"","unknown":0},{"abandoned":7,"agent":"ci-fix","base_rate":0.6424,"failure":52,"runs":165,"success":106,"tenant":"","unknown":3},{"abandoned":0,"agent":"researcher","base_rate":0.5,"failure":20,"runs":40,"success":20,"tenant":"","unknown":0}],"truncated":false,"window":{"since_ns":1789778034748436000,"until_ns":1792370034748436000}}
 ```
 
 **Outcomes** come from the same rule every other run surface uses
@@ -111,7 +123,7 @@ curl 'http://127.0.0.1:8080/v1/fate/cohorts'
 `failure` or `abandoned`. A run with no declaration whose last span ended in
 the last 15 minutes is still active, and a declared outcome Traza does not
 recognise cannot be told; both are **`unknown`, excluded from every rate, and
-counted** (the six live runs above). The base rate is
+counted** (the nine live runs above). The base rate is
 `success / runs` over completed runs.
 
 ## The Fate Map
@@ -159,7 +171,10 @@ the difference at **p < 0.05**. The last condition is what keeps three
 unlucky runs from being called a fork: the researcher's `query_db` branch
 succeeded 3 of 10 times against 17 of 30 for its siblings — 27 points worse —
 and is *not* flagged (p = 0.27); its `ask_human` branch, 1 of 10 against 19
-of 30, is (p = 0.008). The `fork` object carries the comparison either way:
+of 30, is (p = 0.008). The gap rule works the other way round: `ci-fix`'s
+hand-back succeeded 20 of 30 times against 45 of 50 for fixing the code —
+significant (p = 0.016), but 23 points worse, so not flagged. The `fork`
+object carries the comparison either way:
 `siblings_visits`, `siblings_success_rate`, `gap`, `p_value`. Rates and the
 gap are rounded to four places there; the 25-point rule is applied to the
 exact gap, so a branch 24.995 points worse (7 of 61 against 31 of 85) shows
@@ -170,8 +185,8 @@ significant first, each with its path from the root; `hotspots` the
 highest-entropy nodes, with their most common next tokens:
 
 ```json
-"fatal_forks":[{"fork":{"gap":0.6154,"p_value":2.2114329254814858e-14,"siblings_success_rate":0.7154,"siblings_visits":130},"path":["llm:gpt-4o","tool:search_orders×3-5"],"success_rate":0.1,"visits":50},{"fork":{"gap":0.4,"p_value":5.073367025895768e-05,"siblings_success_rate":0.9,"siblings_visits":60},"path":["llm:gpt-4o","tool:search_orders","llm:gpt-4o","tool:issue_refund×2"],"success_rate":0.5,"visits":30}],
-"hotspots":[{"entropy":1.4955,"next":["tool:search_orders","tool:search_orders×3-5","tool:lookup_customer"],"path":["llm:gpt-4o"],"visits":180}]
+"fatal_forks":[{"fork":{"gap":0.6154,"p_value":2.2114329254814858e-14,"siblings_success_rate":0.7154,"siblings_visits":130},"path":["llm:gpt-6.1-sol","tool:search_orders×3-5"],"success_rate":0.1,"visits":50},{"fork":{"gap":0.4,"p_value":5.073367025895768e-05,"siblings_success_rate":0.9,"siblings_visits":60},"path":["llm:gpt-6.1-sol","tool:search_orders","llm:gpt-6.1-sol","tool:issue_refund×2"],"success_rate":0.5,"visits":30}],
+"hotspots":[{"entropy":1.4955,"next":["tool:search_orders","tool:search_orders×3-5","tool:lookup_customer"],"path":["llm:gpt-6.1-sol"],"visits":180}]
 ```
 
 ### How good is this map? `calibration`
@@ -218,7 +233,7 @@ curl 'http://127.0.0.1:8080/v1/fate/runs/live-doomed-0'
 ```
 
 ```json
-{"agent":"support-agent","base_rate":0.5444,"ci95":[0.0435,0.2136],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792303815044948000,"matched_depth":2,"min_support":30,"next":[{"ci95":[0.0435,0.2136],"success_rate":0.1,"token":"llm:gpt-4o","visits":50}],"node":{"abandoned":5,"ci95":[0.0435,0.2136],"cost_usd_avg":0.004,"depth":2,"failure":40,"lift":0.1837,"p_fail_given_here":0.8,"pooled":["tool:search_orders×3-5"],"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50},"outcome":"unknown","p_success":0.1,"partial":false,"path":["llm:gpt-4o","tool:search_orders×3-5"],"run":"live-doomed-0","steps":5,"support":50,"tenant":"","verdict":"likely_failure"}
+{"agent":"support-agent","base_rate":0.5444,"ci95":[0.0435,0.2136],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792370034773920000,"matched_depth":2,"min_support":30,"next":[{"ci95":[0.0435,0.2136],"success_rate":0.1,"token":"llm:gpt-6.1-sol","visits":50}],"node":{"abandoned":5,"ci95":[0.0435,0.2136],"cost_usd_avg":0.004,"depth":2,"failure":40,"lift":0.1837,"p_fail_given_here":0.8,"pooled":["tool:search_orders×3-5"],"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50},"outcome":"unknown","p_success":0.1,"partial":false,"path":["llm:gpt-6.1-sol","tool:search_orders×3-5"],"run":"live-doomed-0","steps":5,"support":50,"tenant":"","verdict":"likely_failure"}
 ```
 
 The run's path is read from its stored spans exactly as a build reads runs,
@@ -236,7 +251,7 @@ longer one, pooled (`node.pooled`, and `last_open: true`). The corpus's
 healthy run has issued one refund:
 
 ```json
-{"agent":"support-agent","base_rate":0.5444,"ci95":[0.6695,0.842],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 69 of 90 times (76.7%, 95% CI 66.9–84.2%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792303815044948000,"matched_depth":4,"min_support":30,"next":[{"ci95":[0.7985,0.9534],"success_rate":0.9,"token":"llm:gpt-4o","visits":60},{"ci95":[0.3315,0.6685],"repeat":true,"success_rate":0.5,"token":"tool:issue_refund","visits":30}],"node":{"abandoned":0,"ci95":[0.6695,0.842],"cost_usd_avg":0.006,"depth":4,"failure":21,"lift":1.4082,"p_fail_given_here":0.2333,"pooled":["tool:issue_refund","tool:issue_refund×2"],"success":69,"success_rate":0.7667,"token":"tool:issue_refund","visits":90},"outcome":"unknown","p_success":0.7667,"partial":false,"path":["llm:gpt-4o","tool:search_orders","llm:gpt-4o","tool:issue_refund"],"recommended_next":"llm:gpt-4o","run":"live-healthy-0","steps":4,"support":90,"tenant":"","verdict":"on_track"}
+{"agent":"support-agent","base_rate":0.5444,"ci95":[0.6695,0.842],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 69 of 90 times (76.7%, 95% CI 66.9–84.2%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792370034773920000,"matched_depth":4,"min_support":30,"next":[{"ci95":[0.7985,0.9534],"success_rate":0.9,"token":"llm:gpt-6.1-sol","visits":60},{"ci95":[0.3315,0.6685],"repeat":true,"success_rate":0.5,"token":"tool:issue_refund","visits":30}],"node":{"abandoned":0,"ci95":[0.6695,0.842],"cost_usd_avg":0.006,"depth":4,"failure":21,"lift":1.4082,"p_fail_given_here":0.2333,"pooled":["tool:issue_refund","tool:issue_refund×2"],"success":69,"success_rate":0.7667,"token":"tool:issue_refund","visits":90},"outcome":"unknown","p_success":0.7667,"partial":false,"path":["llm:gpt-6.1-sol","tool:search_orders","llm:gpt-6.1-sol","tool:issue_refund"],"recommended_next":"llm:gpt-6.1-sol","run":"live-healthy-0","steps":4,"support":90,"tenant":"","verdict":"on_track"}
 ```
 
 69 of 90: the 54 of 60 that stopped at one refund and the 15 of 30 that
@@ -306,7 +321,7 @@ curl -X POST http://127.0.0.1:8080/v1/fuses/check -d '{"run": "live-doomed-0"}'
 ```
 
 ```json
-{"evidence":[],"foresight":{"base_rate":0.5444,"ci95":[0.0435,0.2136],"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","map_built_at_ns":1792303815044948000,"matched_depth":2,"p_success":0.1,"raised":true,"successes":5,"support":50,"verdict":"likely_failure"},"grant":null,"limits":{"min_success_odds":0.7},"policy":"support","reasons":["foresight: runs that took this path succeeded 5 of 50 times (≤21.4%)"],"run":"live-doomed-0","source":"rebuilt","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":0.002,"duration_ns":4326000000,"error_streak":0,"errors":3,"llm_calls":1,"steps":5,"tokens":690,"tool_calls":4,"top_repeat":null},"verdict":"stop"}
+{"evidence":[],"foresight":{"base_rate":0.5444,"ci95":[0.0435,0.2136],"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","map_built_at_ns":1792370034773920000,"matched_depth":2,"p_success":0.1,"raised":true,"successes":5,"support":50,"verdict":"likely_failure"},"grant":null,"limits":{"min_success_odds":0.7},"nudges":[],"policy":"support","reasons":["foresight: runs that took this path succeeded 5 of 50 times (≤21.4%)"],"run":"live-doomed-0","source":"rebuilt","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":0.002,"duration_ns":3831000000,"error_streak":0,"errors":3,"llm_calls":1,"steps":5,"tokens":690,"tool_calls":4,"top_repeat":null},"verdict":"stop"}
 ```
 
 The upper bound, not the estimate, is compared, so a fuse acts only when the
@@ -322,7 +337,7 @@ bound 84.2%) answers `continue` under `min_success_odds: 0.7`; the same check
 naming a second `issue_refund` answers `stop`:
 
 ```json
-{"evidence":[],"foresight":{"base_rate":0.5444,"ci95":[0.3315,0.6685],"explanation":"if it calls tool:issue_refund next: runs that took this path succeeded 15 of 30 times (50.0%, 95% CI 33.2–66.8%); the agent's overall success rate is 54%","map_built_at_ns":1792303815044948000,"matched_depth":4,"next_tool":"issue_refund","p_success":0.5,"raised":true,"successes":15,"support":30,"verdict":"on_track"},"grant":null,"limits":{"min_success_odds":0.7},"policy":"support","reasons":["foresight: runs that took this path and then called tool:issue_refund succeeded 15 of 30 times (≤66.8%)"],"run":"live-healthy-0","source":"live","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":0.004,"duration_ns":4266000000,"error_streak":0,"errors":0,"llm_calls":2,"steps":4,"tokens":1460,"tool_calls":2,"top_repeat":{"count":2,"example":{"span_id":"000000000000df03","trace_id":"cbf29ce48422232500000000000000df"},"fingerprint":"llm:gpt-4o"}},"verdict":"stop"}
+{"evidence":[],"foresight":{"base_rate":0.5444,"ci95":[0.3315,0.6685],"explanation":"if it calls tool:issue_refund next: runs that took this path succeeded 15 of 30 times (50.0%, 95% CI 33.2–66.8%); the agent's overall success rate is 54%","map_built_at_ns":1792370034773920000,"matched_depth":4,"next_tool":"issue_refund","p_success":0.5,"raised":true,"successes":15,"support":30,"verdict":"on_track"},"grant":null,"limits":{"min_success_odds":0.7},"nudges":[],"policy":"support","reasons":["foresight: runs that took this path and then called tool:issue_refund succeeded 15 of 30 times (≤66.8%)"],"run":"live-healthy-0","source":"live","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":0.004,"duration_ns":3690000000,"error_streak":0,"errors":0,"llm_calls":2,"steps":4,"tokens":1460,"tool_calls":2,"top_repeat":{"count":2,"example":{"span_id":"0000000000018703","trace_id":"cbf29ce4842223250000000000000187"},"fingerprint":"llm:gpt-6.1-sol","window_steps":50}},"verdict":"stop"}
 ```
 
 (The foresight `verdict` is `on_track` — 66.8% is above the agent's 54% —
@@ -433,7 +448,9 @@ Stated plainly:
   look, and `example_runs` give you a pair to diff.
 - **Paths ignore inputs.** Two runs that called the same tools in the same
   order are the same path, whatever their arguments or prompts. A behaviour
-  that differs only in content is invisible to the map.
+  that differs only in content is invisible to the map: the corpus's `rm -rf
+  tests/e2e` is `novel` only because of where it ran, and in place of a test
+  run it would be one more `tool:Bash`.
 - **Outcomes are inferred.** Without a declared `session.outcome`, a run's
   outcome is the status of the span that ended last — a run that failed but
   ended on a successful span reads as a success. Declare outcomes where you

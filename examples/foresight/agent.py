@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 
 SERVICE = "support-agent"
-MODEL = "gpt-4o"
+MODEL = "gpt-6.1-sol"
 
 # The branches, as the corpus's support-agent takes them (src/seed.rs):
 # (kind, name, status). An empty search is recorded as an error, as the

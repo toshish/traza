@@ -116,11 +116,11 @@ fn a_path_read_in_part_is_judged_on_what_was_read_never_called_novel() {
     // Read in part: the open search group is dropped, the path folds.
     let partial = reading(
         "support-agent",
-        &[("llm:gpt-4o", 1), ("tool:search_orders", 1)],
+        &[("llm:gpt-6.1-sol", 1), ("tool:search_orders", 1)],
         false,
         true,
     );
-    assert_eq!(partial.path(), ["llm:gpt-4o", FOLD_TOKEN]);
+    assert_eq!(partial.path(), ["llm:gpt-6.1-sol", FOLD_TOKEN]);
     let probe = partial.probe();
     let walked = walk(&build, &view, &probe.closed);
     assert_eq!(walked.matched.len(), 2);
@@ -132,7 +132,7 @@ fn a_path_read_in_part_is_judged_on_what_was_read_never_called_novel() {
     for live in [true, false] {
         let novel = reading(
             "support-agent",
-            &[("llm:gpt-4o", 1), ("tool:summon", 1)],
+            &[("llm:gpt-6.1-sol", 1), ("tool:summon", 1)],
             true,
             live,
         );
@@ -202,7 +202,7 @@ fn an_agent_with_a_long_name_finds_its_cohort_from_every_reader() {
         spans.extend(synthetic_run(
             &format!("done-{index}"),
             &agent,
-            &["llm:gpt-4o", "tool:lookup"],
+            &["llm:gpt-6.1-sol", "tool:lookup"],
             now - 3 * 3_600_000_000_000 - index * 60_000_000_000,
             index % 4 == 0,
         ));
@@ -210,7 +210,7 @@ fn an_agent_with_a_long_name_finds_its_cohort_from_every_reader() {
     spans.extend(synthetic_run(
         "going",
         &agent,
-        &["llm:gpt-4o", "tool:lookup"],
+        &["llm:gpt-6.1-sol", "tool:lookup"],
         now - 30_000_000_000,
         false,
     ));
@@ -323,7 +323,7 @@ fn the_map_learns_every_branch_with_exact_counts() {
     );
     assert_eq!(map.base_rate, Some(stats::round4(98.0 / 180.0)));
     assert!(!map.truncated, "{:?}", map.bounds);
-    let llm = child(&map.root, "llm:gpt-4o");
+    let llm = child(&map.root, "llm:gpt-6.1-sol");
     assert_eq!(llm.visits, 180);
     // The hotspot: three ways on, 90 / 50 / 40.
     assert!(llm.hotspot);
@@ -347,7 +347,7 @@ fn the_map_learns_every_branch_with_exact_counts() {
     assert_eq!(looped.success_rate, Some(0.1));
     assert!(!search.fatal_fork && !escalate.fatal_fork);
     // Deeper: a refund issued twice is a fork of its own.
-    let refunds = child(child(search, "llm:gpt-4o"), "tool:issue_refund×2");
+    let refunds = child(child(search, "llm:gpt-6.1-sol"), "tool:issue_refund×2");
     assert_eq!((refunds.visits, refunds.success), (30, 15));
     assert!(refunds.fatal_fork);
     // The summary lists both, most significant first.
@@ -364,7 +364,7 @@ fn the_map_learns_every_branch_with_exact_counts() {
     );
     assert_eq!(
         map.hotspots.first().map(|hotspot| hotspot.path.clone()),
-        Some(vec!["llm:gpt-4o".to_owned()])
+        Some(vec!["llm:gpt-6.1-sol".to_owned()])
     );
     // Example runs: the newest of each outcome through the node.
     let outcomes: Vec<Outcome> = looped
@@ -381,8 +381,8 @@ fn the_map_learns_every_branch_with_exact_counts() {
         .iter()
         .all(|example| example.run.starts_with("search_loop-")));
     // Ended runs end at the final llm call of their branch.
-    let ends = child(child(search, "llm:gpt-4o"), "tool:issue_refund");
-    assert_eq!(child(ends, "llm:gpt-4o").ended, 60);
+    let ends = child(child(search, "llm:gpt-6.1-sol"), "tool:issue_refund");
+    assert_eq!(child(ends, "llm:gpt-6.1-sol").ended, 60);
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn a_small_bad_branch_is_not_a_fatal_fork_without_significance() {
     assert_eq!(map.agent, "researcher");
     let llm = child(
         child(&map.root, "agent:researcher"),
-        "llm:claude-sonnet-4-5",
+        "llm:claude-sonnet-5-5",
     );
     assert!(llm.hotspot);
     assert!((llm.entropy - 2.0).abs() < 1e-9);
@@ -475,7 +475,7 @@ fn foresight_gives_every_verdict_its_case() {
     for run in ["live-doomed-0", "live-doomed-1", "live-doomed-2"] {
         let doomed = foresee(run);
         assert_eq!(doomed.verdict, ForesightVerdict::LikelyFailure, "{run}");
-        assert_eq!(doomed.path, ["llm:gpt-4o", "tool:search_orders×3-5"]);
+        assert_eq!(doomed.path, ["llm:gpt-6.1-sol", "tool:search_orders×3-5"]);
         assert_eq!((doomed.support, doomed.matched_depth), (50, 2));
         assert_eq!(doomed.ci95, Some(wilson_pair(5, 50)));
         assert!(!doomed.excluded_self, "a live run is in no map");
@@ -491,7 +491,7 @@ fn foresight_gives_every_verdict_its_case() {
         // the fork. But the doomed node itself says what runs did next.
         assert_eq!(
             doomed.next.first().map(|next| next.token.as_str()),
-            Some("llm:gpt-4o")
+            Some("llm:gpt-6.1-sol")
         );
     }
     let healthy = foresee("live-healthy-0");
@@ -513,7 +513,10 @@ fn foresight_gives_every_verdict_its_case() {
         .collect();
     assert_eq!(
         next,
-        [("llm:gpt-4o", 60, false), ("tool:issue_refund", 30, true)]
+        [
+            ("llm:gpt-6.1-sol", 60, false),
+            ("tool:issue_refund", 30, true)
+        ]
     );
     let novel = foresee("live-novel-0");
     assert_eq!(novel.verdict, ForesightVerdict::Novel);
@@ -562,6 +565,113 @@ fn foresight_gives_every_verdict_its_case() {
 }
 
 #[test]
+fn the_coding_agents_map_flags_its_rerun_loop_and_reads_its_live_runs() {
+    let (fixture, now) = seeded("coder", crate::Config::default(), true);
+    let store = fixture.store();
+    let map = store
+        .fate_map("", &MapRequest::new("ci-fix"), now)
+        .expect("builds")
+        .expect("the cohort exists");
+    // 50 + 40 + 45 + 30 completed runs; the three live runs are unknown.
+    assert_eq!(
+        (
+            map.runs,
+            map.success,
+            map.failure,
+            map.abandoned,
+            map.unknown
+        ),
+        (165, 106, 52, 7, 3)
+    );
+    assert_eq!(map.base_rate, Some(stats::round4(106.0 / 165.0)));
+    // The first move after the prompt: run the failing test once (80),
+    // re-run it again and again (40), or delegate (45).
+    let sonnet = child(&map.root, "llm:claude-sonnet-5-5");
+    assert!(sonnet.hotspot);
+    let once = child(sonnet, "tool:Bash");
+    let looped = child(sonnet, "tool:Bash×3-5");
+    let delegated = child(sonnet, "tool:Agent");
+    assert_eq!((once.visits, once.success), (80, 65));
+    assert_eq!(
+        (looped.visits, looped.success, looped.abandoned),
+        (40, 3, 7)
+    );
+    assert_eq!((delegated.visits, delegated.success), (45, 38));
+    // The fatal fork: 3 of 40 against 103 of 125 for its siblings.
+    assert!(looped.fatal_fork);
+    let fork = looped.fork.as_ref().expect("compared");
+    assert_eq!(fork.siblings_visits, 125);
+    assert!(fork.p_value < 1e-9, "{}", fork.p_value);
+    assert_eq!(looped.ci95, wilson_pair(3, 40));
+    assert!(!once.fatal_fork && !delegated.fatal_fork);
+    // Handing the job back does worse than fixing it — significantly, but
+    // by less than 25 points (20 of 30 against 45 of 50) — so it is not a
+    // fatal fork.
+    let after = child(once, "llm:claude-sonnet-5-5");
+    let back = child(after, "tool:mcp__github__add_issue_comment");
+    assert_eq!((back.visits, back.success), (30, 20));
+    let fork = back.fork.as_ref().expect("compared");
+    assert!(fork.gap < FORK_GAP && fork.p_value < FORK_ALPHA, "{fork:?}");
+    assert!(!back.fatal_fork);
+    assert_eq!(child(after, "tool:Read").success, 45);
+    // The sub-agent is a step of its own, and its calls run on Haiku.
+    let investigator = child(delegated, "agent:test-investigator");
+    assert_eq!(child(investigator, "llm:claude-haiku-5-5").visits, 45);
+    let summarized: Vec<&str> = map
+        .fatal_forks
+        .iter()
+        .filter_map(|fork| fork.path.last().map(String::as_str))
+        .collect();
+    assert_eq!(summarized, ["tool:Bash×3-5"]);
+    // Whole-run cost, as metered on the runs' model calls.
+    let metered: f64 = corpus(now, "", false)
+        .iter()
+        .filter(|span| span.service == "ci-fix")
+        .filter_map(|span| span.attributes.get("llm.cost_usd")?.as_f64())
+        .sum();
+    assert!(
+        (map.root.cost_usd_sum - metered).abs() < 1e-3,
+        "{} vs {metered}",
+        map.root.cost_usd_sum
+    );
+
+    let foresee = |run: &str| {
+        store
+            .foresee("", run, DEFAULT_VERDICT_SUPPORT, now)
+            .expect("reads")
+            .expect("the run exists")
+    };
+    let doomed = foresee("live-ci-doomed-0");
+    assert_eq!(doomed.verdict, ForesightVerdict::LikelyFailure);
+    assert_eq!(doomed.path, ["llm:claude-sonnet-5-5", "tool:Bash×3-5"]);
+    assert_eq!((doomed.support, doomed.matched_depth), (40, 2));
+    assert_eq!(doomed.ci95, Some(wilson_pair(3, 40)));
+    let healthy = foresee("live-ci-healthy-0");
+    assert_eq!(healthy.verdict, ForesightVerdict::OnTrack);
+    assert_eq!(
+        (
+            healthy.support,
+            healthy.node.as_ref().map(|node| node.success)
+        ),
+        (50, Some(45))
+    );
+    // Deleting the failing tests is a Bash call, as every test run is; what
+    // makes it new is where: no earlier run ran a command after seeing the
+    // failure, without reading the code or handing it back.
+    let novel = foresee("live-ci-novel-0");
+    assert_eq!(novel.verdict, ForesightVerdict::Novel);
+    let divergence = novel.divergence.as_ref().expect("diverged");
+    assert_eq!(
+        (divergence.depth, divergence.took.as_str()),
+        (3, "tool:Bash")
+    );
+    assert_eq!(
+        divergence.common_next,
+        ["tool:Read", "tool:mcp__github__add_issue_comment"]
+    );
+}
+
+#[test]
 fn a_completed_run_is_left_out_of_its_own_odds() {
     let (fixture, now) = seeded("leave-one-out", crate::Config::default(), false);
     let store = fixture.store();
@@ -583,7 +693,7 @@ fn a_completed_run_is_left_out_of_its_own_odds() {
                 "a",
                 now - 3 * 3_600_000_000_000,
                 json!({"session.id": "lonely", "gen_ai.operation.name": "chat",
-                       "gen_ai.request.model": "gpt-4o"}),
+                       "gen_ai.request.model": "gpt-6.1-sol"}),
             );
             span.service = "support-agent".into();
             span
@@ -620,7 +730,7 @@ fn a_completed_run_is_left_out_of_its_own_odds() {
 fn the_node_bound_keeps_the_shallowest_busiest_branches_and_says_so() {
     let config = crate::Config {
         fate: FateConfig {
-            max_nodes: 4,
+            max_nodes: 6,
             ..FateConfig::default()
         },
         ..crate::Config::default()
@@ -632,11 +742,12 @@ fn the_node_bound_keeps_the_shallowest_busiest_branches_and_says_so() {
         .expect("builds")
         .expect("exists");
     assert!(map.truncated && map.bounds.node_cap && map.nodes_capped);
-    // Four nodes across the build, level by level: both agents' first
-    // steps, then the two busiest second steps (support-agent's 90 and 50;
-    // its 40 escalations and the researcher's 40 are cut) — nothing deeper.
+    // Six nodes across the build, level by level: the three agents' first
+    // steps, then the three busiest second steps (support-agent's 90 and 50
+    // and ci-fix's 80; ci-fix's 45 and 40, support-agent's 40 escalations
+    // and the researcher's 40 are cut) — nothing deeper.
     assert_eq!(map.nodes_total, 4);
-    let llm = child(&map.root, "llm:gpt-4o");
+    let llm = child(&map.root, "llm:gpt-6.1-sol");
     assert_eq!(llm.children.len(), 2);
     assert_eq!(llm.cut, 40);
     assert!(llm.children.iter().all(|child| child.children.is_empty()));
@@ -647,6 +758,16 @@ fn the_node_bound_keeps_the_shallowest_busiest_branches_and_says_so() {
         .expect("exists");
     assert_eq!(research.nodes_total, 2);
     assert!(research.nodes_capped);
+    let coder = store
+        .fate_map("", &MapRequest::new("ci-fix"), now)
+        .expect("builds")
+        .expect("exists");
+    assert_eq!(coder.nodes_total, 3);
+    assert_eq!(
+        child(&coder.root, "llm:claude-sonnet-5-5").cut,
+        85,
+        "the delegations and the loops"
+    );
     // A path into the cut is not called novel: the map cannot say.
     let healthy = store
         .foresee("", "live-healthy-0", 30, now)
@@ -668,13 +789,13 @@ fn the_node_bound_keeps_the_shallowest_busiest_branches_and_says_so() {
 
 #[test]
 fn the_node_bound_is_shared_shallowest_first_so_no_cohort_is_starved() {
-    // support-agent's whole tree is 13 nodes and the researcher's 10. With
-    // a budget of 13, spent cohort by cohort the larger would take it all
-    // and leave the researcher a bare root; spent level by level across
-    // cohorts, each keeps its first levels.
+    // support-agent's whole tree is 13 nodes, ci-fix's 23 and the
+    // researcher's 10. With a budget of 20, spent cohort by cohort the
+    // larger two would take it all and leave the researcher a bare root;
+    // spent level by level across cohorts, each keeps its first levels.
     let config = crate::Config {
         fate: FateConfig {
-            max_nodes: 13,
+            max_nodes: 20,
             ..FateConfig::default()
         },
         ..crate::Config::default()
@@ -688,7 +809,7 @@ fn the_node_bound_is_shared_shallowest_first_so_no_cohort_is_starved() {
     assert!(research.nodes_total > 1, "{:?}", research.bounds);
     let sonnet = child(
         child(&research.root, "agent:researcher"),
-        "llm:claude-sonnet-4-5",
+        "llm:claude-sonnet-5-5",
     );
     for tool in [
         "tool:web_search",
@@ -702,14 +823,21 @@ fn the_node_bound_is_shared_shallowest_first_so_no_cohort_is_starved() {
         .fate_map("", &MapRequest::new("support-agent"), now)
         .expect("builds")
         .expect("exists");
-    // Three levels each: 1 + 3 + 3 for support-agent, 1 + 1 + 4 for the
-    // researcher — thirteen.
-    assert_eq!(support.nodes_total + research.nodes_total, 13 + 2);
+    let coder = store
+        .fate_map("", &MapRequest::new("ci-fix"), now)
+        .expect("builds")
+        .expect("exists");
+    // Three levels each: 1 + 3 + 3 for support-agent and for ci-fix, 1 + 1
+    // + 4 for the researcher — twenty.
+    assert_eq!(
+        support.nodes_total + coder.nodes_total + research.nodes_total,
+        20 + 3
+    );
     assert!(support.bounds.node_cap);
     // Each says the bound cut its own tree, and the researcher's still
     // reads its runs: web_search's path is matched for three tokens and
     // only the fourth is hidden by the bound, never called new.
-    assert!(support.nodes_capped && research.nodes_capped);
+    assert!(support.nodes_capped && coder.nodes_capped && research.nodes_capped);
     let web = store
         .foresee("", "web_search-0", 3, now)
         .expect("reads")
@@ -725,12 +853,13 @@ fn the_node_bound_is_shared_shallowest_first_so_no_cohort_is_starved() {
 
 #[test]
 fn an_open_step_whose_longer_repeats_were_cut_is_not_pooled_short() {
-    // Fourteen nodes: everything to depth 3 (thirteen), then the busiest
-    // depth-4 child — one refund, 60 runs. The 30 runs that refunded twice
-    // went down a branch the bound kept from being built.
+    // Twenty-one nodes: everything to depth 3 (twenty, across the three
+    // agents), then the busiest depth-4 child — one refund, 60 runs. The 30
+    // runs that refunded twice went down a branch the bound kept from being
+    // built.
     let config = crate::Config {
         fate: FateConfig {
-            max_nodes: 14,
+            max_nodes: 21,
             ..FateConfig::default()
         },
         ..crate::Config::default()
@@ -742,8 +871,8 @@ fn an_open_step_whose_longer_repeats_were_cut_is_not_pooled_short() {
         .expect("builds")
         .expect("exists");
     let refunds = child(
-        child(child(&map.root, "llm:gpt-4o"), "tool:search_orders"),
-        "llm:gpt-4o",
+        child(child(&map.root, "llm:gpt-6.1-sol"), "tool:search_orders"),
+        "llm:gpt-6.1-sol",
     );
     assert_eq!(refunds.children.len(), 1);
     assert_eq!(refunds.cut, 30);
@@ -786,7 +915,7 @@ fn the_run_bound_keeps_each_cohorts_newest_runs() {
     assert_eq!(map.runs, 20);
     assert!(map.truncated);
     assert!(map.bounds.runs_dropped > 0);
-    // 220 runs is more than the fold tracks (four times 20), so the window
+    // 385 runs is more than the fold tracks (four times 20), so the window
     // narrowed to its newest part rather than keeping whichever runs the
     // fold met first.
     assert!(map.bounds.window_narrowed, "{:?}", map.bounds);
@@ -794,7 +923,7 @@ fn the_run_bound_keeps_each_cohorts_newest_runs() {
     assert!(map.bounds.runs_tracked <= 80);
     // The newest runs are the refund_happy ones (generated newest first),
     // and the map holds exactly the twenty newest.
-    let refunds = child(&map.root, "llm:gpt-4o");
+    let refunds = child(&map.root, "llm:gpt-6.1-sol");
     assert_eq!(refunds.children.len(), 1);
     let examples: Vec<&str> = child(refunds, "tool:search_orders")
         .example_runs
@@ -1082,7 +1211,7 @@ fn rendering_prunes_by_support_depth_and_node_count_and_says_so() {
         )
         .expect("builds")
         .expect("exists");
-    let llm = child(&shallow.root, "llm:gpt-4o");
+    let llm = child(&shallow.root, "llm:gpt-6.1-sol");
     assert!(llm.children.is_empty());
     assert_eq!((llm.omitted_children, llm.omitted_visits), (3, 180));
     let picky = store
@@ -1096,7 +1225,7 @@ fn rendering_prunes_by_support_depth_and_node_count_and_says_so() {
         )
         .expect("builds")
         .expect("exists");
-    let tokens: Vec<&str> = child(&picky.root, "llm:gpt-4o")
+    let tokens: Vec<&str> = child(&picky.root, "llm:gpt-6.1-sol")
         .children
         .iter()
         .map(|child| child.token.as_str())
@@ -1637,7 +1766,7 @@ fn a_live_runs_last_step_is_still_open_so_longer_repeats_are_pooled() {
         .ingest_batch(synthetic_run(
             "live-searching",
             "support-agent",
-            &["llm:gpt-4o", "tool:search_orders"],
+            &["llm:gpt-6.1-sol", "tool:search_orders"],
             now - 20_000_000_000,
             false,
         ))
@@ -1968,7 +2097,7 @@ fn calibration_and_summaries_do_work_linear_in_the_tree() {
     let now = now();
     let runs = 2_000;
     let paths: Vec<Vec<String>> = (0..runs)
-        .map(|index| vec![format!("tool:t{index}"), "llm:gpt-4o".to_owned()])
+        .map(|index| vec![format!("tool:t{index}"), "llm:gpt-6.1-sol".to_owned()])
         .collect();
     store
         .ingest_batch(completed_runs("wide", "wide-agent", &paths, now, |i| {

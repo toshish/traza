@@ -78,82 +78,135 @@ struct Vendor {
     service: &'static str,
     prompt_per_1k: f64,
     completion_per_1k: f64,
+    /// Per-1K costs of prompt tokens read from the cache, and written to it.
+    cache_read_per_1k: f64,
+    cache_write_per_1k: f64,
 }
 
+impl Vendor {
+    /// The cost of one call, cache reads and writes priced apart from the
+    /// rest of the prompt, as Anthropic counts them.
+    fn cost(&self, prompt: u64, completion: u64, cache_read: u64, cache_write: u64) -> f64 {
+        (prompt as f64 * self.prompt_per_1k
+            + completion as f64 * self.completion_per_1k
+            + cache_read as f64 * self.cache_read_per_1k
+            + cache_write as f64 * self.cache_write_per_1k)
+            / 1000.0
+    }
+}
+
+/// List prices as the vendors publish them (2026-10-18). Bedrock, Vertex AI
+/// and Azure are metered at the model maker's own list price, not their
+/// platform's.
 const VENDORS: &[Vendor] = &[
     Vendor {
         provider: "openai",
-        model: "gpt-4o",
+        model: "gpt-6.1-sol",
         service: "support-agent",
-        prompt_per_1k: 0.0025,
+        prompt_per_1k: 0.002,
         completion_per_1k: 0.010,
+        cache_read_per_1k: 0.0001,
+        cache_write_per_1k: 0.0025,
     },
     Vendor {
         provider: "openai",
-        model: "gpt-4o-mini",
+        model: "gpt-6-luna",
         service: "support-agent",
-        prompt_per_1k: 0.00015,
-        completion_per_1k: 0.0006,
+        prompt_per_1k: 0.0001,
+        completion_per_1k: 0.0005,
+        cache_read_per_1k: 0.000_01,
+        cache_write_per_1k: 0.000_125,
     },
     Vendor {
         provider: "anthropic",
-        model: "claude-sonnet-4-5",
+        model: "claude-sonnet-5-5",
         service: "research-agent",
-        prompt_per_1k: 0.003,
-        completion_per_1k: 0.015,
+        prompt_per_1k: 0.002,
+        completion_per_1k: 0.010,
+        cache_read_per_1k: 0.0001,
+        cache_write_per_1k: 0.0025,
     },
     Vendor {
         provider: "aws.bedrock",
-        model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        model: "anthropic.claude-haiku-5-5",
         service: "batch-worker",
-        prompt_per_1k: 0.003,
-        completion_per_1k: 0.015,
+        prompt_per_1k: 0.0001,
+        completion_per_1k: 0.0005,
+        cache_read_per_1k: 0.000_01,
+        cache_write_per_1k: 0.000_125,
     },
     Vendor {
         provider: "gcp.vertex_ai",
-        model: "gemini-2.0-flash",
+        model: "gemini-3.8-flash",
         service: "research-agent",
-        prompt_per_1k: 0.00010,
-        completion_per_1k: 0.0004,
+        // Google's introductory price, until 2026-12-31. It bills cache
+        // storage by the hour rather than per token written.
+        prompt_per_1k: 0.000_75,
+        completion_per_1k: 0.003_75,
+        cache_read_per_1k: 0.000_075,
+        cache_write_per_1k: 0.0,
     },
     Vendor {
         provider: "azure.ai.openai",
-        model: "gpt-4o",
+        model: "gpt-6.1-sol",
         service: "checkout-copilot",
-        prompt_per_1k: 0.0025,
+        prompt_per_1k: 0.002,
         completion_per_1k: 0.010,
+        cache_read_per_1k: 0.0001,
+        cache_write_per_1k: 0.0025,
     },
     Vendor {
         provider: "ollama",
-        model: "llama3.1:8b",
+        model: "qwen3.6",
         service: "edge-agent",
         prompt_per_1k: 0.0,
         completion_per_1k: 0.0,
+        cache_read_per_1k: 0.0,
+        cache_write_per_1k: 0.0,
     },
     Vendor {
         provider: "cohere",
-        model: "command-r-plus",
+        model: "command-a-plus-05-2026",
         service: "batch-worker",
+        // Synthetic: Cohere's price for this model is not verified here.
         prompt_per_1k: 0.0025,
         completion_per_1k: 0.010,
+        cache_read_per_1k: 0.0,
+        cache_write_per_1k: 0.0,
     },
 ];
 
-const TOOLS: &[(&str, &str)] = &[
-    ("web_search", "{\"query\":\"traza tracing datastore\"}"),
+/// Agent tools: name, the call's arguments, and what it returned.
+const TOOLS: &[(&str, &str, &str)] = &[
     (
-        "get_weather",
-        "{\"location\":\"Paris\",\"unit\":\"celsius\"}",
+        "web_search",
+        "{\"query\":\"OpenTelemetry GenAI semantic conventions agent spans\"}",
+        "[{\"title\":\"Semantic conventions for generative AI agent spans\",\"url\":\"https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/\"}]",
     ),
-    ("sql_query", "{\"sql\":\"select count(*) from orders\"}"),
     (
-        "send_email",
-        "{\"to\":\"ops@example.com\",\"subject\":\"digest\"}",
+        "mcp__github__create_pull_request",
+        "{\"owner\":\"acme\",\"repo\":\"shop\",\"title\":\"Floor the checkout total at zero\",\"head\":\"fix/checkout-total\",\"base\":\"main\"}",
+        "{\"number\":4183,\"html_url\":\"https://github.com/acme/shop/pull/4183\"}",
     ),
-    ("read_file", "{\"path\":\"/srv/reports/q4.pdf\"}"),
     (
-        "create_ticket",
-        "{\"title\":\"Refund request\",\"priority\":\"high\"}",
+        "Read",
+        "{\"file_path\":\"/srv/shop/src/checkout/total.ts\"}",
+        "5\t  return cart.subtotal - discount;",
+    ),
+    (
+        "Bash",
+        "{\"command\":\"npm test -- tests/e2e/checkout.spec.ts\"}",
+        "Tests  1 failed | 5 passed (6)",
+    ),
+    (
+        "mcp__playwright__browser_navigate",
+        "{\"url\":\"https://staging.shop.example/checkout\"}",
+        "Navigated to https://staging.shop.example/checkout (title: Checkout)",
+    ),
+    (
+        "Edit",
+        "{\"file_path\":\"/srv/shop/src/checkout/total.ts\",\"old_string\":\"return cart.subtotal - discount;\",\"new_string\":\"return Math.max(cart.subtotal - discount, 0);\"}",
+        "The file has been updated.",
     ),
 ];
 
@@ -355,8 +408,7 @@ impl Gen {
         completion_tokens: u64,
     ) -> Map<String, Value> {
         let mut attributes = Map::new();
-        let cost = (prompt_tokens as f64 / 1000.0) * vendor.prompt_per_1k
-            + (completion_tokens as f64 / 1000.0) * vendor.completion_per_1k;
+        let cost = vendor.cost(prompt_tokens, completion_tokens, 0, 0);
         match dialect {
             Dialect::Current => {
                 attributes.insert("gen_ai.provider.name".into(), json!(vendor.provider));
@@ -391,10 +443,13 @@ impl Gen {
         if cost > 0.0 {
             attributes.insert("llm.cost_usd".into(), json!(round_cents(cost)));
         }
-        attributes.insert(
-            "gen_ai.request.temperature".into(),
-            json!(*self.rng.pick(&[0.0_f64, 0.2, 0.7, 1.0])),
-        );
+        // Claude models since 4.7 refuse a temperature other than their
+        // default, so a Claude call sends none. It is drawn either way, so
+        // no later draw depends on which vendor took the call.
+        let temperature = *self.rng.pick(&[0.0_f64, 0.2, 0.7, 1.0]);
+        if !vendor.model.contains("claude") {
+            attributes.insert("gen_ai.request.temperature".into(), json!(temperature));
+        }
         attributes.insert("gen_ai.request.max_tokens".into(), json!(2048));
         attributes
     }
@@ -412,7 +467,7 @@ impl Gen {
         let trace = self.id("trace-agent");
         let root = self.id("span");
         let start = self.advance_rand(30, 400, SEC);
-        let (tool_name, tool_args) = *self.rng.pick(TOOLS);
+        let (tool_name, tool_args, tool_result) = *self.rng.pick(TOOLS);
 
         // Workflow root.
         let mut attributes = Map::new();
@@ -455,8 +510,8 @@ impl Gen {
         attributes.insert(
             "gen_ai.input.messages".into(),
             messages_json(json!([
-                {"role": "system", "parts": [{"type": "text", "content": "You are a support agent. Use tools when needed."}]},
-                {"role": "user", "parts": [{"type": "text", "content": "Can you look this up for me?"}]}
+                {"role": "system", "parts": [{"type": "text", "content": "You are an engineering agent. Use tools when needed."}]},
+                {"role": "user", "parts": [{"type": "text", "content": "Can you look into this for me?"}]}
             ])),
         );
         attributes.insert(
@@ -500,9 +555,9 @@ impl Gen {
         attributes.insert(
             "traceloop.entity.output".into(),
             json!(if tool_failed {
-                "{\"error\":\"upstream timeout after 5000ms\"}"
+                "{\"error\":\"upstream timeout after 5000ms\"}".to_owned()
             } else {
-                "{\"result\":\"rainy, 14C\"}"
+                json!({ "result": tool_result }).to_string()
             }),
         );
         if tool_failed {
@@ -534,18 +589,23 @@ impl Gen {
         attributes.insert(
             "gen_ai.input.messages".into(),
             messages_json(json!([
-                {"role": "user", "parts": [{"type": "text", "content": "Can you look this up for me?"}]},
+                {"role": "user", "parts": [{"type": "text", "content": "Can you look into this for me?"}]},
                 {"role": "tool", "parts": [{
                     "type": "tool_call_response",
                     "id": format!("call_{index:04}"),
-                    "result": if tool_failed { "error: upstream timeout" } else { "rainy, 14C" }
+                    "result": if tool_failed { "error: upstream timeout" } else { tool_result }
                 }]}
             ])),
         );
+        let answer_text = if tool_failed {
+            format!("`{tool_name}` timed out before it answered, so nothing was done.")
+        } else {
+            format!("Here is what `{tool_name}` returned: {tool_result}")
+        };
         attributes.insert(
             "gen_ai.output.messages".into(),
             messages_json(json!([
-                {"role": "assistant", "parts": [{"type": "text", "content": "It is currently rainy and 14C."}], "finish_reason": "stop"}
+                {"role": "assistant", "parts": [{"type": "text", "content": answer_text}], "finish_reason": "stop"}
             ])),
         );
         let span = make_span(
@@ -1519,14 +1579,25 @@ impl Gen {
         // Anthropic's cache counters, in the dotted spelling current
         // OpenLLMetry emits. The underscore forms an older exporter sends are
         // recognized too (see `crate::semconv`); the corpus models what a
-        // current pipeline actually sends.
+        // current pipeline actually sends. The metered cost counts them.
+        let cache_write = self.rng.range(0, 3000);
+        let cache_read = self.rng.range(0, 12000);
         attributes.insert(
             "gen_ai.usage.cache_creation.input_tokens".into(),
-            json!(self.rng.range(0, 3000)),
+            json!(cache_write),
         );
         attributes.insert(
             "gen_ai.usage.cache_read.input_tokens".into(),
-            json!(self.rng.range(0, 12000)),
+            json!(cache_read),
+        );
+        attributes.insert(
+            "llm.cost_usd".into(),
+            json!(round_cents(vendor.cost(
+                prompt_tokens,
+                completion_tokens,
+                cache_read,
+                cache_write
+            ))),
         );
         attributes.insert("gen_ai.response.stop_reason".into(), json!("end_turn"));
         attributes.insert("gen_ai.response.finish_reason".into(), json!("end_turn"));
@@ -1961,9 +2032,12 @@ pub struct BehaviourOptions {
     /// Prepended to every run id, so several corpora can share a store.
     pub prefix: String,
     /// Whether to add the live demonstration runs (`live-doomed-*`,
-    /// `live-healthy-0`, `live-novel-0`, `live-early-0`), still running.
+    /// `live-healthy-0`, `live-novel-0`, `live-early-0`, and the coding
+    /// agent's `live-ci-doomed-0`, `live-ci-healthy-0`, `live-ci-novel-0`),
+    /// still running.
     pub live: bool,
-    /// PRNG seed for step durations. Outcomes are exact, never random.
+    /// PRNG seed for step durations and the coding agent's token counts.
+    /// Outcomes are exact, never random.
     pub seed: u64,
 }
 
@@ -2002,7 +2076,9 @@ pub struct BehaviourCorpus {
     pub runs: Vec<BehaviourRun>,
 }
 
-/// One step of a branch: kind, name, consecutive repeats.
+/// One step of a branch: kind, name, consecutive repeats. A tool step of
+/// the coding agent names its call the way Claude Code's permission rules
+/// do: `Bash(npm test)` is the `Bash` tool, run on `npm test`.
 type BranchStep = (&'static str, &'static str, usize);
 
 /// A behaviour branch: who runs it, what it does, and how it ends.
@@ -2016,13 +2092,39 @@ struct Branch {
     goal: Option<&'static str>,
 }
 
-const GPT: BranchStep = ("llm", "gpt-4o", 1);
-const SONNET: BranchStep = ("llm", "claude-sonnet-4-5", 1);
+const GPT: BranchStep = ("llm", "gpt-6.1-sol", 1);
+const SONNET: BranchStep = ("llm", "claude-sonnet-5-5", 1);
+const HAIKU: BranchStep = ("llm", "claude-haiku-5-5", 1);
+
+/// The coding agent: Claude Code, run headless in a CI job to make the
+/// job's failing test pass.
+const CODER: &str = "ci-fix";
+
+/// The coding agent's calls. Every test run is the job's failing test.
+const TEST: BranchStep = ("tool", "Bash(npm test -- tests/e2e/checkout.spec.ts)", 1);
+const READ: BranchStep = ("tool", "Read(src/checkout/total.ts)", 1);
+const EDIT: BranchStep = ("tool", "Edit(src/checkout/total.ts)", 1);
+const GREP: BranchStep = ("tool", "Grep(applyDiscount)", 1);
+const DELEGATE: BranchStep = ("tool", "Agent(test-investigator)", 1);
+const INVESTIGATE: BranchStep = ("agent", "test-investigator", 1);
+const HAND_BACK: BranchStep = ("tool", "mcp__github__add_issue_comment", 1);
+
+/// List prices of the coding agent's models, USD per million tokens: input,
+/// output, cache read and five-minute cache write, as Anthropic lists them
+/// (2026-10-18). Haiku's higher rates for prompts over 100K tokens never
+/// apply: its prompts here stay far below that.
+const CODER_PRICES: &[(&str, [f64; 4])] = &[
+    ("claude-sonnet-5-5", [2.0, 10.0, 0.10, 2.50]),
+    ("claude-haiku-5-5", [0.10, 0.50, 0.01, 0.125]),
+];
 
 /// The branches, with their exact outcome counts. Support agents mostly
 /// refund cleanly, sometimes escalate, and fail hard when they get stuck
 /// re-running the same search; the researcher's fate depends on which
-/// source it reaches for first.
+/// source it reaches for first. The coding agent fixes and verifies, hands
+/// the investigation to a sub-agent on a smaller model, or hands the job
+/// back to a maintainer — and fails hard when it re-runs the failing test
+/// as though it were flaky, a newer push cancelling some of those runs.
 const BRANCHES: &[Branch] = &[
     Branch {
         agent: "support-agent",
@@ -2114,14 +2216,101 @@ const BRANCHES: &[Branch] = &[
         abandoned: 0,
         goal: None,
     },
+    Branch {
+        agent: CODER,
+        name: "fix_and_verify",
+        steps: &[
+            SONNET, TEST, SONNET, READ, SONNET, EDIT, SONNET, TEST, SONNET,
+        ],
+        runs: 50,
+        success: 45,
+        abandoned: 0,
+        goal: None,
+    },
+    Branch {
+        agent: CODER,
+        name: "rerun_loop",
+        steps: &[
+            SONNET,
+            ("tool", "Bash(npm test -- tests/e2e/checkout.spec.ts)", 4),
+            SONNET,
+        ],
+        runs: 40,
+        success: 3,
+        abandoned: 7,
+        goal: None,
+    },
+    Branch {
+        agent: CODER,
+        name: "delegate",
+        steps: &[
+            SONNET,
+            DELEGATE,
+            INVESTIGATE,
+            HAIKU,
+            GREP,
+            HAIKU,
+            SONNET,
+            EDIT,
+            SONNET,
+            TEST,
+            SONNET,
+        ],
+        runs: 45,
+        success: 38,
+        abandoned: 0,
+        goal: None,
+    },
+    Branch {
+        agent: CODER,
+        name: "hand_back",
+        steps: &[SONNET, TEST, SONNET, HAND_BACK, SONNET],
+        runs: 30,
+        success: 20,
+        abandoned: 0,
+        goal: None,
+    },
 ];
 
-/// The live demonstration runs of `support-agent`: id and steps so far.
-const LIVE: &[(&str, &[BranchStep])] = &[
-    ("live-doomed-0", &[GPT, ("tool", "search_orders", 4)]),
-    ("live-doomed-1", &[GPT, ("tool", "search_orders", 3)]),
-    ("live-doomed-2", &[GPT, ("tool", "search_orders", 5)]),
+/// The live demonstration runs: agent, id and steps so far. The support
+/// agent's come last, so theirs are the latest spans to arrive and the
+/// first six of a live view, which lists the most recently changed first.
+const LIVE: &[(&str, &str, &[BranchStep])] = &[
     (
+        CODER,
+        "live-ci-doomed-0",
+        &[
+            SONNET,
+            ("tool", "Bash(npm test -- tests/e2e/checkout.spec.ts)", 3),
+        ],
+    ),
+    (
+        CODER,
+        "live-ci-healthy-0",
+        &[SONNET, TEST, SONNET, READ, SONNET, EDIT],
+    ),
+    (
+        CODER,
+        "live-ci-novel-0",
+        &[SONNET, TEST, SONNET, ("tool", "Bash(rm -rf tests/e2e)", 1)],
+    ),
+    (
+        "support-agent",
+        "live-doomed-0",
+        &[GPT, ("tool", "search_orders", 4)],
+    ),
+    (
+        "support-agent",
+        "live-doomed-1",
+        &[GPT, ("tool", "search_orders", 3)],
+    ),
+    (
+        "support-agent",
+        "live-doomed-2",
+        &[GPT, ("tool", "search_orders", 5)],
+    ),
+    (
+        "support-agent",
         "live-healthy-0",
         &[
             GPT,
@@ -2130,8 +2319,12 @@ const LIVE: &[(&str, &[BranchStep])] = &[
             ("tool", "issue_refund", 1),
         ],
     ),
-    ("live-novel-0", &[GPT, ("tool", "delete_database", 1)]),
-    ("live-early-0", &[GPT]),
+    (
+        "support-agent",
+        "live-novel-0",
+        &[GPT, ("tool", "delete_database", 1)],
+    ),
+    ("support-agent", "live-early-0", &[GPT]),
 ];
 
 /// Whether item `index` of `total` is among `chosen` spread evenly across
@@ -2144,7 +2337,7 @@ fn spread(index: usize, total: usize, chosen: usize) -> bool {
 /// A corpus of agent runs whose behaviour branches have known, different
 /// success rates — the shape the Fate Map ([`crate::fate`]) learns from.
 ///
-/// Two cohorts. `support-agent` runs (service `support-agent`, under a
+/// Three cohorts. `support-agent` runs (service `support-agent`, under a
 /// workflow root that is not a step) take one of four branches: a clean
 /// refund (54 of 60 succeed), a search re-run four times in a row (5 of 50
 /// succeed and 5 are abandoned — the fatal fork), an escalation (24 of 40,
@@ -2152,8 +2345,16 @@ fn spread(index: usize, total: usize, chosen: usize) -> bool {
 /// refund issued twice (15 of 30). `researcher` runs (an `invoke_agent`
 /// root naming `gen_ai.agent.name: researcher`, service `research-svc`)
 /// pick one of four sources, with 9, 7, 3 and 1 successes in 10 — a
-/// hotspot. Failed runs end on an error status; abandoned runs declare
-/// `session.outcome: abandoned`.
+/// hotspot. `ci-fix` runs are Claude Code in a CI job (service `ci-fix`,
+/// under a `claude_code.interaction` root that is not a step), with Claude
+/// Code's tool names and its usage — a prompt read mostly from the cache,
+/// metered at the models' list prices. After the failing test's first run
+/// they read the code, fix it and run the test again (45 of 50), or hand the
+/// job back with a PR comment (20 of 30: 23 points worse than fixing, short
+/// of a fatal fork); they delegate to a `test-investigator` sub-agent on
+/// `claude-haiku-5-5` first (38 of 45); or they re-run the failing test four
+/// times in a row (3 of 40, 7 abandoned — the fatal fork). Failed runs end
+/// on an error status; abandoned runs declare `session.outcome: abandoned`.
 ///
 /// Deterministic: the same options give the same spans, byte for byte, and
 /// every outcome count is exact (times `scale`).
@@ -2206,11 +2407,11 @@ pub fn behaviour_corpus(options: &BehaviourOptions) -> BehaviourCorpus {
         }
     }
     if options.live {
-        for (offset, (name, steps)) in LIVE.iter().enumerate() {
+        for (offset, &(agent, name, steps)) in LIVE.iter().enumerate() {
             let run = format!("{}{name}", options.prefix);
             let plan = RunPlan {
                 run: &run,
-                agent: "support-agent",
+                agent,
                 steps,
                 start: options
                     .now_ns
@@ -2221,7 +2422,7 @@ pub fn behaviour_corpus(options: &BehaviourOptions) -> BehaviourCorpus {
             push_behaviour_run(&mut out, &mut rng, options, namespace, serial, &plan);
             out.runs.push(BehaviourRun {
                 run,
-                agent: "support-agent",
+                agent,
                 branch: "live",
                 outcome: "live",
             });
@@ -2242,7 +2443,10 @@ struct RunPlan<'a> {
 }
 
 /// Appends one run's spans: its steps in order, then its root — which a
-/// live run has not ended yet, and so has not exported.
+/// live run has not ended yet, and so has not exported. An `agent` step
+/// starts a sub-agent under the tool call before it, as Claude Code's
+/// `Agent` tool does: its own span, holding the steps that follow until the
+/// run's first model takes its turn again, while the call waits on it.
 fn push_behaviour_run(
     out: &mut BehaviourCorpus,
     rng: &mut Rng,
@@ -2254,6 +2458,7 @@ fn push_behaviour_run(
     let trace = format!("{namespace:016x}{serial:016x}");
     let root_id = format!("{:016x}", serial << 8);
     let researcher = plan.agent == "researcher";
+    let coding = plan.agent == CODER;
     let service = if researcher {
         "research-svc"
     } else {
@@ -2271,41 +2476,95 @@ fn push_behaviour_run(
         .flat_map(|(kind, name, repeats)| std::iter::repeat((*kind, *name)).take(*repeats))
         .collect();
     let total = flat.len();
-    let mut steps = Vec::with_capacity(total);
-    for (position, (kind, name)) in flat.into_iter().enumerate() {
-        let duration = rng.range(300, 1_200) * MS;
+    let main_model = flat.first().map(|(_, name)| *name);
+    let mut steps: Vec<Span> = Vec::with_capacity(total);
+    // The sub-agent at work: its name, and the indexes of the call that
+    // started it and of its own span.
+    let mut delegated: Option<(&str, usize, usize)> = None;
+    // Model calls so far: the run's own, then its sub-agent's.
+    let mut turns = [0_u64; 2];
+    let mut edited = false;
+    for (position, &(kind, step)) in flat.iter().enumerate() {
+        if kind == "llm" && Some(step) == main_model {
+            if let Some((_, call, agent)) = delegated.take() {
+                end_delegation(&mut steps, call, agent);
+            }
+        }
+        let (name, target) = split_call(step);
+        let duration = if coding {
+            coding_duration(rng, kind, name)
+        } else {
+            rng.range(300, 1_200) * MS
+        };
         let last = position + 1 == total;
         let mut attributes = Map::new();
         attributes.insert("session.id".into(), json!(plan.run));
-        let (span_name, status) = if kind == "llm" {
-            attributes.insert("gen_ai.operation.name".into(), json!("chat"));
-            attributes.insert("gen_ai.request.model".into(), json!(name));
-            attributes.insert(
-                "gen_ai.usage.input_tokens".into(),
-                json!(600 + 40 * position as u64),
-            );
-            attributes.insert("gen_ai.usage.output_tokens".into(), json!(90));
-            attributes.insert("llm.cost_usd".into(), json!(0.002));
-            let failed = last && plan.outcome == "failure";
-            (format!("chat {name}"), if failed { "error" } else { "ok" })
-        } else {
-            attributes.insert("gen_ai.operation.name".into(), json!("execute_tool"));
-            attributes.insert("gen_ai.tool.name".into(), json!(name));
-            attributes.insert(
-                "gen_ai.tool.call.arguments".into(),
-                json!(format!("{{\"attempt\": {position}}}")),
-            );
-            // A search re-run in a row is a search that came back empty.
-            let empty = looping && name == "search_orders" && !last;
-            (
-                format!("execute_tool {name}"),
-                if empty { "error" } else { "ok" },
-            )
+        let parent = match (delegated, kind) {
+            (Some((agent, _, span)), _) => {
+                attributes.insert("gen_ai.agent.name".into(), json!(agent));
+                steps[span].span_id.clone()
+            }
+            (None, "agent") => steps
+                .last()
+                .map_or_else(|| root_id.clone(), |call| call.span_id.clone()),
+            (None, _) => root_id.clone(),
+        };
+        let (span_name, status) = match kind {
+            "llm" => {
+                attributes.insert("gen_ai.operation.name".into(), json!("chat"));
+                attributes.insert("gen_ai.request.model".into(), json!(name));
+                if coding {
+                    let turn = &mut turns[usize::from(delegated.is_some())];
+                    coding_usage(rng, &mut attributes, name, *turn, delegated.is_some());
+                    *turn += 1;
+                } else {
+                    attributes.insert(
+                        "gen_ai.usage.input_tokens".into(),
+                        json!(600 + 40 * position as u64),
+                    );
+                    attributes.insert("gen_ai.usage.output_tokens".into(), json!(90));
+                    attributes.insert("llm.cost_usd".into(), json!(0.002));
+                }
+                let failed = last && plan.outcome == "failure";
+                (format!("chat {name}"), if failed { "error" } else { "ok" })
+            }
+            "agent" => {
+                attributes.insert("gen_ai.operation.name".into(), json!("invoke_agent"));
+                attributes.insert("gen_ai.agent.name".into(), json!(name));
+                (format!("invoke_agent {name}"), "ok")
+            }
+            _ => {
+                attributes.insert("gen_ai.operation.name".into(), json!("execute_tool"));
+                attributes.insert("gen_ai.tool.name".into(), json!(name));
+                let failed = if coding {
+                    let (arguments, result, failed) = coding_call(name, target, edited);
+                    attributes.insert(
+                        "gen_ai.tool.call.arguments".into(),
+                        json!(arguments.to_string()),
+                    );
+                    if !result.is_empty() {
+                        attributes.insert("gen_ai.tool.call.result".into(), json!(result));
+                    }
+                    edited |= name == "Edit";
+                    failed
+                } else {
+                    attributes.insert(
+                        "gen_ai.tool.call.arguments".into(),
+                        json!(format!("{{\"attempt\": {position}}}")),
+                    );
+                    // A search re-run in a row is a search that came back empty.
+                    looping && name == "search_orders" && !last
+                };
+                (
+                    format!("execute_tool {name}"),
+                    if failed { "error" } else { "ok" },
+                )
+            }
         };
         let mut span = make_span(
             &trace,
             &format!("{:016x}", (serial << 8) + position as u64 + 1),
-            Some(&root_id),
+            Some(&parent),
             &span_name,
             service,
             clock,
@@ -2314,8 +2573,23 @@ fn push_behaviour_run(
             attributes,
         );
         span.tenant = options.tenant.clone();
+        if kind == "agent" {
+            delegated = Some((name, steps.len().saturating_sub(1), steps.len()));
+        }
         steps.push(span);
-        clock += duration + 50 * MS;
+        // A call that starts a sub-agent, and the sub-agent's span, hold the
+        // steps that follow: the next one starts inside them.
+        let opens = flat
+            .get(position + 1)
+            .is_some_and(|(next, _)| *next == "agent");
+        clock += if opens || kind == "agent" {
+            5 * MS
+        } else {
+            duration + 50 * MS
+        };
+    }
+    if let Some((_, call, agent)) = delegated {
+        end_delegation(&mut steps, call, agent);
     }
     if !live {
         let mut attributes = Map::new();
@@ -2324,6 +2598,10 @@ fn push_behaviour_run(
             attributes.insert("gen_ai.operation.name".into(), json!("invoke_agent"));
             attributes.insert("gen_ai.agent.name".into(), json!("researcher"));
             "invoke_agent researcher"
+        } else if coding {
+            // The Claude Code release the runs report.
+            attributes.insert("service.version".into(), json!("2.1.303"));
+            "claude_code.interaction"
         } else {
             attributes.insert("traceloop.span.kind".into(), json!("workflow"));
             attributes.insert("traceloop.entity.name".into(), json!("handle_ticket"));
@@ -2354,6 +2632,131 @@ fn push_behaviour_run(
         out.spans.push(root);
     }
     out.spans.extend(steps);
+}
+
+/// Ends a delegation: the sub-agent's span closes just after its last step,
+/// and the call that waited on it just after that.
+fn end_delegation(steps: &mut [Span], call: usize, agent: usize) {
+    let done = steps[agent + 1..]
+        .iter()
+        .map(|step| step.end_time_ns)
+        .max()
+        .unwrap_or(steps[agent].end_time_ns);
+    steps[agent].end_time_ns = done + MS;
+    steps[call].end_time_ns = steps[call].end_time_ns.max(done + 2 * MS);
+}
+
+/// A step's tool and what it was called on: `Bash(npm test)` is `Bash` on
+/// `npm test`; a name without parentheses names the tool alone.
+fn split_call(step: &str) -> (&str, &str) {
+    match step.split_once('(') {
+        Some((tool, rest)) => (tool, rest.strip_suffix(')').unwrap_or(rest)),
+        None => (step, ""),
+    }
+}
+
+/// How long one of the coding agent's steps takes: seconds for a model call
+/// (fewer on Haiku) and for a test run, a moment for anything else.
+fn coding_duration(rng: &mut Rng, kind: &str, name: &str) -> u64 {
+    match (kind, name) {
+        ("llm", "claude-haiku-5-5") => rng.range(600, 1_800) * MS,
+        ("llm", _) => rng.range(1_500, 4_000) * MS,
+        (_, "Bash") => rng.range(2_000, 5_000) * MS,
+        _ => rng.range(40, 400) * MS,
+    }
+}
+
+/// One of the coding agent's model calls: its usage, and its cost metered
+/// at the model's list price. Claude Code marks its prompt for caching, so
+/// nearly all of it is read from the cache — the system prompt, the tools
+/// and the conversation so far, which grows every turn — and the turn's new
+/// content is written to it. A sub-agent starts a smaller context.
+fn coding_usage(
+    rng: &mut Rng,
+    attributes: &mut Map<String, Value>,
+    model: &str,
+    turn: u64,
+    sub_agent: bool,
+) {
+    let (context, growth, output) = if sub_agent {
+        (7_500, 1_600, rng.range(80, 900))
+    } else {
+        (17_000, 2_400, rng.range(150, 2_400))
+    };
+    let input = rng.range(4, 60);
+    let cache_read = context + growth * turn + rng.range(0, 800);
+    let cache_write = rng.range(400, 3_000);
+    let [per_input, per_output, per_read, per_write] = CODER_PRICES
+        .iter()
+        .find(|(name, _)| *name == model)
+        .map_or([0.0; 4], |(_, price)| *price);
+    let cost = (input as f64 * per_input
+        + output as f64 * per_output
+        + cache_read as f64 * per_read
+        + cache_write as f64 * per_write)
+        / 1_000_000.0;
+    attributes.insert("gen_ai.provider.name".into(), json!("anthropic"));
+    attributes.insert("gen_ai.usage.input_tokens".into(), json!(input));
+    attributes.insert("gen_ai.usage.output_tokens".into(), json!(output));
+    attributes.insert(
+        "gen_ai.usage.cache_read.input_tokens".into(),
+        json!(cache_read),
+    );
+    attributes.insert(
+        "gen_ai.usage.cache_creation.input_tokens".into(),
+        json!(cache_write),
+    );
+    attributes.insert("llm.cost_usd".into(), json!(round_cents(cost)));
+}
+
+/// What one of the coding agent's tool calls was given, what it returned,
+/// and whether it failed: the job's test fails until the run has edited the
+/// code, and every other call succeeds.
+fn coding_call(tool: &str, target: &str, edited: bool) -> (Value, &'static str, bool) {
+    let file = |path: &str| format!("/home/runner/work/shop/shop/{path}");
+    match tool {
+        "Bash" if target.starts_with("npm test") => (
+            json!({"command": target, "description": "Run the failing checkout test"}),
+            if edited {
+                "Test Files  1 passed (1)\n     Tests  6 passed (6)"
+            } else {
+                "FAIL tests/e2e/checkout.spec.ts > a full discount makes the order free\nAssertionError: expected -12.5 to be 0\n\nTest Files  1 failed (1)\n     Tests  1 failed | 5 passed (6)"
+            },
+            !edited,
+        ),
+        "Bash" => (json!({"command": target}), "", false),
+        "Read" => (
+            json!({"file_path": file(target)}),
+            "1\timport { applyDiscount } from \"./discounts\";\n2\t\n3\texport function total(cart: Cart, code: string): number {\n4\t  const discount = applyDiscount(cart, code);\n5\t  return cart.subtotal - discount;\n6\t}",
+            false,
+        ),
+        "Edit" => (
+            json!({"file_path": file(target),
+                   "old_string": "return cart.subtotal - discount;",
+                   "new_string": "return Math.max(cart.subtotal - discount, 0);"}),
+            "The file has been updated.",
+            false,
+        ),
+        "Grep" => (
+            json!({"pattern": target, "path": "src", "output_mode": "content"}),
+            "src/checkout/discounts.ts:12:export function applyDiscount(cart: Cart, code: string): number {\nsrc/checkout/total.ts:1:import { applyDiscount } from \"./discounts\";\nsrc/checkout/total.ts:4:  const discount = applyDiscount(cart, code);",
+            false,
+        ),
+        "Agent" => (
+            json!({"subagent_type": target,
+                   "description": "Find why the checkout test fails",
+                   "prompt": "tests/e2e/checkout.spec.ts fails in CI. Find the cause and report it; do not edit files."}),
+            "total() subtracts the discount with no floor, so a discount larger than the subtotal makes the total negative (src/checkout/total.ts:5).",
+            false,
+        ),
+        "mcp__github__add_issue_comment" => (
+            json!({"owner": "acme", "repo": "shop", "issue_number": 4182,
+                   "body": "The checkout e2e test still fails: total() returns -12.5 where the test expects 0 for a full discount. Fixing it means deciding how a discount above the subtotal is priced, which is a product call, so I am handing it back. No code was changed."}),
+            "{\"id\":2417730912,\"html_url\":\"https://github.com/acme/shop/pull/4182#issuecomment-2417730912\"}",
+            false,
+        ),
+        _ => (json!({}), "", false),
+    }
 }
 
 /// Builds a span. A free function, not a method, so a caller can compute
@@ -2460,6 +2863,45 @@ mod tests {
     }
 
     #[test]
+    fn claude_calls_send_no_temperature_and_cached_tokens_are_metered() {
+        let generated = corpus(&SeedOptions::default());
+        let model = |span: &Span| {
+            ["gen_ai.request.model", "llm.model"]
+                .iter()
+                .find_map(|key| span.attributes.get(*key)?.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let (mut claude, mut tempered, mut cached) = (0, 0, 0);
+        for span in &generated.spans {
+            let tempered_here = span.attributes.contains_key("gen_ai.request.temperature");
+            if model(span).contains("claude") {
+                assert!(!tempered_here, "{} sent a temperature", model(span));
+                claude += 1;
+            }
+            tempered += usize::from(tempered_here);
+            let Some(read) = span
+                .attributes
+                .get("gen_ai.usage.cache_read.input_tokens")
+                .and_then(Value::as_u64)
+            else {
+                continue;
+            };
+            let count = |key: &str| span.attributes[key].as_u64().expect(key) as f64;
+            // claude-sonnet-5-5's list price per 1K tokens, the cache apart.
+            let expected = (count("gen_ai.usage.input_tokens") * 0.002
+                + count("gen_ai.usage.output_tokens") * 0.010
+                + read as f64 * 0.0001
+                + count("gen_ai.usage.cache_creation.input_tokens") * 0.0025)
+                / 1000.0;
+            let metered = span.attributes["llm.cost_usd"].as_f64().expect("metered");
+            assert!((metered - expected).abs() < 1e-6, "{metered} vs {expected}");
+            cached += 1;
+        }
+        assert!(claude > 0 && tempered > 0 && cached > 0);
+    }
+
+    #[test]
     fn the_behaviour_corpus_is_exact_and_deterministic() {
         let options = BehaviourOptions {
             live: true,
@@ -2508,32 +2950,136 @@ mod tests {
             ),
             (24, 4, 12)
         );
-        assert_eq!(count("live", "live"), 6);
-        // Completed runs end two hours before "now"; live ones within it.
+        assert_eq!(
+            (
+                count("fix_and_verify", "success"),
+                count("rerun_loop", "success"),
+                count("rerun_loop", "abandoned"),
+                count("rerun_loop", "failure"),
+                count("delegate", "success"),
+                count("hand_back", "success")
+            ),
+            (45, 3, 7, 30, 38, 20)
+        );
+        assert_eq!(count("live", "live"), 9);
+        // Completed runs end two hours before "now"; live ones within its
+        // last minute.
+        let live = |span: &&Span| {
+            span.attributes["session.id"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("live-")
+        };
         let latest_completed = first
             .spans
             .iter()
-            .filter(|span| {
-                !span.attributes["session.id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .starts_with("live-")
-            })
+            .filter(|span| !live(span))
             .map(|span| span.end_time_ns)
             .max()
             .unwrap_or_default();
         assert!(latest_completed < options.now_ns - 3_600 * SEC);
+        assert!(first
+            .spans
+            .iter()
+            .filter(live)
+            .all(|span| span.end_time_ns <= options.now_ns
+                && span.end_time_ns > options.now_ns - 60 * SEC));
         let scaled = behaviour_corpus(&BehaviourOptions {
             scale: 2,
             ..BehaviourOptions::default()
         });
-        assert_eq!(scaled.runs.len(), 2 * 220);
+        assert_eq!(scaled.runs.len(), 2 * 385);
         let tenanted = behaviour_corpus(&BehaviourOptions {
             tenant: "acme".to_owned(),
             ..BehaviourOptions::default()
         });
         assert!(tenanted.spans.iter().all(|span| span.tenant == "acme"));
         assert_ne!(tenanted.spans[0].trace_id, first.spans[0].trace_id);
+    }
+
+    #[test]
+    fn the_coding_agent_meters_its_calls_and_nests_its_sub_agent() {
+        let generated = behaviour_corpus(&BehaviourOptions::default());
+        // Every model call is metered at its model's list price, the cache
+        // reads and writes included, over a prompt of thousands of tokens.
+        let mut calls = 0;
+        for span in generated
+            .spans
+            .iter()
+            .filter(|span| span.service == "ci-fix" && span.name.starts_with("chat "))
+        {
+            let tokens = |key: &str| span.attributes[key].as_u64().expect(key) as f64;
+            let [input, output, read, write] = match span.attributes["gen_ai.request.model"]
+                .as_str()
+                .unwrap_or_default()
+            {
+                "claude-sonnet-5-5" => [2.0, 10.0, 0.10, 2.50],
+                "claude-haiku-5-5" => [0.10, 0.50, 0.01, 0.125],
+                other => panic!("an unpriced model {other}"),
+            };
+            let expected = (tokens("gen_ai.usage.input_tokens") * input
+                + tokens("gen_ai.usage.output_tokens") * output
+                + tokens("gen_ai.usage.cache_read.input_tokens") * read
+                + tokens("gen_ai.usage.cache_creation.input_tokens") * write)
+                / 1_000_000.0;
+            let metered = span.attributes["llm.cost_usd"].as_f64().expect("metered");
+            assert!((metered - expected).abs() < 1e-6, "{metered} vs {expected}");
+            assert!(tokens("gen_ai.usage.cache_read.input_tokens") >= 7_500.0);
+            assert_eq!(span.attributes["gen_ai.provider.name"], "anthropic");
+            calls += 1;
+        }
+        assert!(calls > 0);
+        let run = |id: &str| -> Vec<&Span> {
+            generated
+                .spans
+                .iter()
+                .filter(|span| span.attributes["session.id"] == id)
+                .collect()
+        };
+        // The test fails until the code is edited, and a loop never edits.
+        let tests = |id: &str| -> Vec<String> {
+            run(id)
+                .into_iter()
+                .filter(|span| span.attributes.get("gen_ai.tool.name") == Some(&json!("Bash")))
+                .map(|span| span.status.clone())
+                .collect()
+        };
+        assert_eq!(tests("fix_and_verify-0"), ["error", "ok"]);
+        assert_eq!(tests("rerun_loop-0"), ["error"; 4]);
+        // The sub-agent's span hangs off the Agent call, and holds its own
+        // steps — on Haiku — inside the time the call waited.
+        let delegated = run("delegate-0");
+        let find = |name: &str| {
+            *delegated
+                .iter()
+                .find(|span| span.name == name)
+                .unwrap_or_else(|| panic!("no {name}"))
+        };
+        let call = find("execute_tool Agent");
+        let agent = find("invoke_agent test-investigator");
+        assert_eq!(agent.parent_span_id.as_deref(), Some(call.span_id.as_str()));
+        let inner: Vec<&Span> = delegated
+            .iter()
+            .copied()
+            .filter(|span| span.parent_span_id.as_deref() == Some(agent.span_id.as_str()))
+            .collect();
+        let names: Vec<&str> = inner.iter().map(|span| span.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "chat claude-haiku-5-5",
+                "execute_tool Grep",
+                "chat claude-haiku-5-5"
+            ]
+        );
+        for span in &inner {
+            assert_eq!(span.attributes["gen_ai.agent.name"], "test-investigator");
+            assert!(span.start_time_ns > agent.start_time_ns);
+            assert!(span.end_time_ns < agent.end_time_ns);
+        }
+        assert!(agent.end_time_ns < call.end_time_ns);
+        let next = find("execute_tool Edit");
+        assert!(next.start_time_ns > call.end_time_ns);
     }
 
     #[test]

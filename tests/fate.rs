@@ -3,10 +3,11 @@
 //! Every assertion here is against the behaviour corpus
 //! ([`traza::seed::behaviour_corpus`]), whose ground truth is exact: four
 //! `support-agent` branches with 54/60, 5/50, 24/40 and 15/30 successes,
-//! four `researcher` branches with 9, 7, 3 and 1 in 10, and six live runs
-//! still in flight. So the counts, intervals, forks and verdicts asserted
-//! below are the arithmetic of that corpus, not snapshots of whatever the
-//! code printed.
+//! four `researcher` branches with 9, 7, 3 and 1 in 10, four `ci-fix`
+//! branches with 45/50, 3/40, 38/45 and 20/30, and nine live runs still in
+//! flight. So the counts, intervals, forks and verdicts asserted below are
+//! the arithmetic of that corpus, not snapshots of whatever the code
+//! printed.
 
 mod common;
 
@@ -102,11 +103,18 @@ fn the_map_learns_every_branch_and_names_the_fork_that_kills_runs() {
         .expect("cohorts")
         .iter()
         .any(|cohort| cohort["agent"] == "researcher" && cohort["runs"] == 40));
+    assert!(listing["cohorts"]
+        .as_array()
+        .expect("cohorts")
+        .iter()
+        .any(|cohort| cohort["agent"] == "ci-fix"
+            && (&cohort["runs"], &cohort["success"], &cohort["unknown"])
+                == (&json!(165), &json!(106), &json!(3))));
     assert_eq!(listing["truncated"], false);
 
     let map = ok(&server, "/v1/fate/map?agent=support-agent");
     assert_eq!((&map["runs"], &map["unknown"]), (&json!(180), &json!(6)));
-    let llm = child(&map["root"], "llm:gpt-4o");
+    let llm = child(&map["root"], "llm:gpt-6.1-sol");
     assert_eq!(llm["visits"], 180);
     assert_eq!(llm["hotspot"], true, "three ways on, 90/50/40: {llm}");
     let looped = child(llm, "tool:search_orders×3-5");
@@ -131,9 +139,9 @@ fn the_map_learns_every_branch_and_names_the_fork_that_kills_runs() {
     assert_eq!(outcomes, ["success", "failure", "abandoned"]);
     assert_eq!(
         map["fatal_forks"][0]["path"],
-        json!(["llm:gpt-4o", "tool:search_orders×3-5"])
+        json!(["llm:gpt-6.1-sol", "tool:search_orders×3-5"])
     );
-    assert_eq!(map["hotspots"][0]["path"], json!(["llm:gpt-4o"]));
+    assert_eq!(map["hotspots"][0]["path"], json!(["llm:gpt-6.1-sol"]));
     // The map scores itself, each run only on what it had done by the
     // moment it is scored: the branch shows partly at depth 2 (a first
     // search cannot tell a loop from a single one) and fully at depth 3.
@@ -155,17 +163,30 @@ fn the_map_learns_every_branch_and_names_the_fork_that_kills_runs() {
     let research = ok(&server, "/v1/fate/map?agent=researcher");
     let sonnet = child(
         child(&research["root"], "agent:researcher"),
-        "llm:claude-sonnet-4-5",
+        "llm:claude-sonnet-5-5",
     );
     assert_eq!(child(sonnet, "tool:query_db")["fatal_fork"], false);
     assert_eq!(child(sonnet, "tool:ask_human")["fatal_fork"], true);
+
+    // The coding agent's one fatal fork: re-running the failing test.
+    let coder = ok(&server, "/v1/fate/map?agent=ci-fix");
+    assert_eq!(
+        coder["fatal_forks"].as_array().map(Vec::len),
+        Some(1),
+        "{}",
+        coder["fatal_forks"]
+    );
+    assert_eq!(
+        coder["fatal_forks"][0]["path"],
+        json!(["llm:claude-sonnet-5-5", "tool:Bash×3-5"])
+    );
 
     // Pruning is reported, never silent.
     let picky = ok(
         &server,
         "/v1/fate/map?agent=support-agent&min_support=45&depth=2",
     );
-    let llm = child(&picky["root"], "llm:gpt-4o");
+    let llm = child(&picky["root"], "llm:gpt-6.1-sol");
     assert_eq!(
         llm["children"].as_array().map(Vec::len),
         Some(2),
@@ -201,7 +222,7 @@ fn foresight_reads_a_live_run_against_its_agents_history() {
     assert_eq!(doomed["agent"], "support-agent");
     assert_eq!(
         doomed["path"],
-        json!(["llm:gpt-4o", "tool:search_orders×3-5"])
+        json!(["llm:gpt-6.1-sol", "tool:search_orders×3-5"])
     );
     assert_eq!(
         (&doomed["support"], &doomed["matched_depth"]),

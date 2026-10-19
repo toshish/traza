@@ -172,8 +172,9 @@ def cohorts(path):
         print("    %-28s %5d %8d %8d %10d %8d %10s" % (name, c["runs"], c["success"], c["failure"],
                                                       c["abandoned"], c["unknown"], pct(c["base_rate"])))
     print()
+    running = sum(c["unknown"] for c in doc["cohorts"] if not c.get("task"))
     print("    runs counts completed runs; the %d still running have no outcome yet and sit in"
-          " no rate" % LIVE_SUPPORT_RUNS)
+          " no rate" % running)
     print("    support-agent matches the corpus's ground truth: %d runs, %d succeeded, %d abandoned"
           " (asserted)" % (runs, successes, abandoned))
 
