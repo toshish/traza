@@ -64,7 +64,7 @@ curl -s localhost:8080/v1/tapes/weather-7
       "index": 0,
       "kind": "llm",
       "name": "openai.chat",
-      "model": "gpt-4o-2024-08-06",
+      "model": "gpt-6.1-sol",
       "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
       "span_id": "llm-1",
       "parent_span_id": "wf",
@@ -82,7 +82,7 @@ curl -s localhost:8080/v1/tapes/weather-7
       ],
       "request_digest": "8b9a07d4aac0a133c789406dfccd9477618c1049ca0255f58b262fc72fca3d8b",
       "response_digest": "bc0a9a93dfc45c687262d0e46fceb83a1c7c92d362ccb045210310872c51d35f",
-      "fingerprint": "llm:gpt-4o-2024-08-06#8b9a07d4aac0a133",
+      "fingerprint": "llm:gpt-6.1-sol#8b9a07d4aac0a133",
       "tokens": {"input": 82, "output": 17, "cache_read": null, "cache_write": null, "context": 82}
     },
     {
@@ -214,7 +214,7 @@ and user messages — receives the recorded answer as an ordinary
   "id": "chatcmpl-trazaac879985abefs0",
   "object": "chat.completion",
   "created": 1791964800,
-  "model": "gpt-4o-2024-08-06",
+  "model": "gpt-6.1-sol",
   "choices": [{
     "index": 0,
     "message": {
@@ -281,7 +281,7 @@ for Anthropic, with tool calls as `tool_calls` argument deltas and
 `input_json_delta` respectively:
 
 ```text
-data: {"choices":[{"delta":{"content":"","refusal":null,"role":"assistant"},"finish_reason":null,"index":0,"logprobs":null}],"created":1791964800,"id":"chatcmpl-trazaac879985abefs2","model":"gpt-4o-2024-08-06","object":"chat.completion.chunk","system_fingerprint":null}
+data: {"choices":[{"delta":{"content":"","refusal":null,"role":"assistant"},"finish_reason":null,"index":0,"logprobs":null}],"created":1791964800,"id":"chatcmpl-trazaac879985abefs2","model":"gpt-6.1-sol","object":"chat.completion.chunk","system_fingerprint":null}
 
 data: {"choices":[{"delta":{"content":"It's raining in "},"finish_reason":null,"index":0,"logprobs":null}],…}
 
@@ -432,18 +432,18 @@ curl -s "localhost:8080/v1/diff?a=weather-7&b=weather-8"
         "duration_ns": 1000000000, "errors": 0, "outcome": "success", "truncated": false},
   "aligned": [
     {"op": "changed", "why": "input", "a": 0, "b": 0,
-     "fingerprint_a": "llm:gpt-4o-2024-08-06#8b9a07d4aac0a133",
-     "fingerprint_b": "llm:gpt-4o-2024-08-06#1ae84ec741143bc4"},
+     "fingerprint_a": "llm:gpt-6.1-sol#8b9a07d4aac0a133",
+     "fingerprint_b": "llm:gpt-6.1-sol#1ae84ec741143bc4"},
     {"op": "changed", "why": "input", "a": 1, "b": 1,
      "fingerprint_a": "tool:get_weather#6e1e312d537bc71b",
      "fingerprint_b": "tool:get_weather#ac8cc520a3295a36"},
     {"op": "changed", "why": "input", "a": 2, "b": 2,
-     "fingerprint_a": "llm:gpt-4o-2024-08-06#6db28425e9e18cdb",
-     "fingerprint_b": "llm:gpt-4o-2024-08-06#592c7b1d345f6104"}
+     "fingerprint_a": "llm:gpt-6.1-sol#6db28425e9e18cdb",
+     "fingerprint_b": "llm:gpt-6.1-sol#592c7b1d345f6104"}
   ],
   "first_divergence": {
     "a": 0, "b": 0, "kind": "input",
-    "explanation": "step 0 of a and step 0 of b (llm:gpt-4o-2024-08-06) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b"
+    "explanation": "step 0 of a and step 0 of b (llm:gpt-6.1-sol) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b"
   },
   "delta": {"cost_usd": 0.0, "tokens": 0, "duration_ns": 0, "errors": 0, "steps": 0},
   "truncated": false
@@ -462,9 +462,10 @@ step shifts nothing after it. Each aligned pair is then classified:
 | the model, or any `gen_ai.request.*` parameter, of a model call | `changed` | `config` |
 | a step only one run has | `insert` / `delete` | `structure` |
 
-A model swap changes the signature (`llm:gpt-4o` is not `llm:gpt-4o-mini`), so
-it is detected between the aligned steps: model calls that both name a model
-and sit in the same unaligned stretch are paired as one `config` change.
+A model swap changes the signature (`llm:gpt-6.1-sol` is not
+`llm:gpt-6-luna`), so it is detected between the aligned steps: model calls
+that both name a model and sit in the same unaligned stretch are paired as one
+`config` change.
 
 `cost_usd` is the run's metered cost, or its cost priced from `--pricing` —
 `0.0` here because these spans carry neither. Each side is compared up to its
@@ -513,7 +514,7 @@ curl -s "localhost:8080/v1/recall?q=weather+Paris"
     "last_end_ns": 1791964801000000000,
     "steps": 3,
     "cost_usd": 0.0,
-    "skeleton": ["llm:gpt-4o-2024-08-06", "tool:get_weather", "llm:gpt-4o-2024-08-06"],
+    "skeleton": ["llm:gpt-6.1-sol", "tool:get_weather", "llm:gpt-6.1-sol"],
     "skeleton_truncated": false,
     "truncated": false
   }],

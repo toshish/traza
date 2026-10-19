@@ -59,7 +59,7 @@ function weatherRun(session, trace, city, tenant) {
   const user = `What's the weather in ${city}?`;
   const args = JSON.stringify({ city });
   const result = JSON.stringify({ forecast: "rain", celsius: 12 });
-  const llm = { "gen_ai.system": "openai", "gen_ai.request.model": "gpt-4o", "gen_ai.response.model": "gpt-4o-2024-08-06" };
+  const llm = { "gen_ai.system": "openai", "gen_ai.request.model": "gpt-6.1-sol", "gen_ai.response.model": "gpt-6.1-sol" };
   const spans = [
     span(trace, "wf", null, "weather_agent.workflow", 0, 1000, {
       "traceloop.span.kind": "workflow",
@@ -149,7 +149,7 @@ function openaiRequest(city, second = false) {
     });
     messages.push({ role: "tool", tool_call_id: "call_w1", content: JSON.stringify({ forecast: "rain", celsius: 12 }) });
   }
-  return { model: "gpt-4o", messages };
+  return { model: "gpt-6.1-sol", messages };
 }
 
 /** JSON with every object's keys reversed and spaces added, numbers verbatim. */
@@ -187,7 +187,7 @@ describe("@trazadb/sdk against traza-server", () => {
     // server's text, or it would hash different bytes.
     const cost = span("6df92f3577b34da6a3ce929d0e0e4738", "cost", null, "openai.chat", 86_400_000, 86_400_100, {
       "gen_ai.system": "openai",
-      "gen_ai.request.model": "gpt-4o",
+      "gen_ai.request.model": "gpt-6.1-sol",
       "llm.cost_usd": 2.0,
     });
     await seed.request("POST", "/v1/spans", { body: [cost] });
@@ -588,7 +588,7 @@ describe("@trazadb/sdk against traza-server", () => {
       const found = await client.recall("weather Paris");
       assert.deepEqual(found.runs.map((r) => r.run), ["weather-7"]);
       assert.equal(found.runs[0].outcome, "success");
-      assert.deepEqual(found.runs[0].skeleton, ["llm:gpt-4o-2024-08-06", "tool:get_weather", "llm:gpt-4o-2024-08-06"]);
+      assert.deepEqual(found.runs[0].skeleton, ["llm:gpt-6.1-sol", "tool:get_weather", "llm:gpt-6.1-sol"]);
       assert.equal((await client.recall("weather", { limit: 1 })).runs.length, 1);
       assert.equal((await client.recall("weather Paris", { outcome: "failure" })).runs.length, 0);
     });

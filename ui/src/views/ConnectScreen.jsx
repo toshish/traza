@@ -103,7 +103,7 @@ export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer%20$TRAZA_TOKEN"` : ''}`}
   -d '[{"trace_id":"trace-1","span_id":"span-1","name":"hello",
         "service":"my-agent","status":"ok",
         "start_time_ns":${Date.now()}000000,"end_time_ns":${Date.now() + 12}000000,
-        "attributes":{"gen_ai.request.model":"gpt-4o",
+        "attributes":{"gen_ai.request.model":"gpt-6.1-sol",
                       "gen_ai.usage.prompt_tokens":412,
                       "gen_ai.usage.completion_tokens":88}}]'`} />
     </Card>

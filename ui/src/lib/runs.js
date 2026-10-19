@@ -173,7 +173,7 @@ export function replayPython(tape) {
   const first = steps.find((step) => step.kind === 'llm');
   const recorded = first && Array.isArray(first.request) && first.request.every((m) => m && typeof m === 'object' && 'role' in m);
   const messages = recorded ? pyLiteral(first.request) : '[{"role": "user", "content": "…"}]';
-  const model = (first && first.model) || 'gpt-4o';
+  const model = (first && first.model) || 'gpt-6.1-sol';
   return [
     'from openai import OpenAI',
     'client = OpenAI()  # reads OPENAI_BASE_URL and OPENAI_API_KEY',

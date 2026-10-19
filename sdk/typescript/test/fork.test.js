@@ -53,7 +53,7 @@ function span(trace, spanId, name, startMs, endMs, attributes) {
 }
 
 function weatherRun(session, trace, { atMs = 0, result = RAIN, extra = {} } = {}) {
-  const llm = { "gen_ai.system": "openai", "gen_ai.request.model": "gpt-4o", "gen_ai.response.model": "gpt-4o-2024-08-06" };
+  const llm = { "gen_ai.system": "openai", "gen_ai.request.model": "gpt-6.1-sol", "gen_ai.response.model": "gpt-6.1-sol" };
   const args = JSON.stringify({ city: "Paris" });
   const spans = [
     span(trace, "llm-1", "openai.chat", atMs, atMs + 400, {
@@ -140,7 +140,7 @@ function providerAnswer(request) {
           id: "chatcmpl-live",
           object: "chat.completion",
           created: 1,
-          model: "gpt-4o-live",
+          model: "gpt-6.1-sol-live",
           choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "Live: it is sunny in Paris." } }],
         };
   return response(200, JSON.stringify(body), { "Content-Type": "application/json" });
@@ -178,7 +178,7 @@ describe("a fork", () => {
       const openai = fork.openaiOptions();
       assert.ok(openai.baseURL.endsWith("/openai/v1"));
 
-      const first = await chat(openai, { model: "gpt-4o", messages: messages() });
+      const first = await chat(openai, { model: "gpt-6.1-sol", messages: messages() });
       assert.equal(first.status, 200);
       assert.equal(first.body.choices[0].message.tool_calls[0].id, "call_w1");
       const tool = await fork.toolResult("get_weather");
@@ -187,7 +187,7 @@ describe("a fork", () => {
       assert.equal(provider.requests.length, 0, "nothing has gone live yet");
 
       const edited = JSON.stringify(tool.result);
-      const live = await chat(openai, { model: "gpt-4o", messages: messages({ toolResult: edited }) });
+      const live = await chat(openai, { model: "gpt-6.1-sol", messages: messages({ toolResult: edited }) });
       assert.equal(live.status, 200);
       assert.equal(live.body.choices[0].message.content, "Live: it is sunny in Paris.");
       assert.equal(fork.isLive, true);
@@ -224,7 +224,7 @@ describe("a fork", () => {
       assert.equal(await fork.callTool("open_session", () => "opened"), "opened");
       assert.equal(fork.isLive, false, "a tool going live is not the model calls going live");
       // ...and step 0 still comes from the recording, strictly matched.
-      const first = await chat(openai, { model: "gpt-4o", messages: messages() });
+      const first = await chat(openai, { model: "gpt-6.1-sol", messages: messages() });
       assert.equal(first.status, 200);
       assert.equal(first.body.choices[0].message.tool_calls?.[0]?.id, "call_w1");
       assert.equal(provider.requests.length, 0, "no recorded model call reached the provider");
@@ -232,7 +232,7 @@ describe("a fork", () => {
       assert.equal(tool.edited, true, "the edit is still served after a tool went live");
       // Past the cut the model endpoint itself says so, and only then do
       // model calls go to the provider.
-      const live = await chat(openai, { model: "gpt-4o", messages: messages({ toolResult: JSON.stringify(tool.result) }) });
+      const live = await chat(openai, { model: "gpt-6.1-sol", messages: messages({ toolResult: JSON.stringify(tool.result) }) });
       assert.equal(live.body.choices[0].message.content, "Live: it is sunny in Paris.");
       assert.equal(fork.isLive, true);
       assert.equal(provider.requests.length, 1);
@@ -270,8 +270,8 @@ describe("a fork", () => {
   it("without live, serves the edit and lets the recording play on", async () => {
     const fork = await client.fork("weather-7", { atStep: 0, response: "Sunny.", live: false });
     const openai = fork.openaiOptions();
-    assert.equal((await chat(openai, { model: "gpt-4o", messages: messages() })).body.choices[0].message.content, "Sunny.");
-    const next = await chat(openai, { model: "gpt-4o", messages: messages({ toolResult: "anything" }) });
+    assert.equal((await chat(openai, { model: "gpt-6.1-sol", messages: messages() })).body.choices[0].message.content, "Sunny.");
+    const next = await chat(openai, { model: "gpt-6.1-sol", messages: messages({ toolResult: "anything" }) });
     assert.equal(next.body.choices[0].message.content, "It's raining in Paris, 12°C.");
     assert.equal(fork.isLive, false);
   });
@@ -337,8 +337,8 @@ describe("replayTest", () => {
   it("passes an agent that takes the recorded path", async () => {
     const status = await replayTest(client, "weather-7", async (replay) => {
       const openai = { baseURL: replay.openaiBaseUrl, apiKey: "traza", fetch };
-      await chat(openai, { model: "gpt-4o", messages: messages() });
-      await chat(openai, { model: "gpt-4o", messages: messages({ toolResult: RAIN }) });
+      await chat(openai, { model: "gpt-6.1-sol", messages: messages() });
+      await chat(openai, { model: "gpt-6.1-sol", messages: messages({ toolResult: RAIN }) });
     });
     assert.equal(status.served, 2);
     assert.equal(status.remaining, 0);
@@ -349,7 +349,7 @@ describe("replayTest", () => {
       replayTest(client, "weather-7", async (replay) => {
         const answer = await chat(
           { baseURL: replay.openaiBaseUrl, apiKey: "traza", fetch },
-          { model: "gpt-4o", messages: messages({ user: "What's the weather in Lyon?" }) },
+          { model: "gpt-6.1-sol", messages: messages({ user: "What's the weather in Lyon?" }) },
         );
         if (answer.status !== 200) throw new Error(`the model call failed: ${answer.status}`);
       }),
@@ -367,7 +367,7 @@ describe("replayTest", () => {
   it("fails an agent that stops early", async () => {
     await assert.rejects(
       replayTest(client, "weather-7", async (replay) => {
-        await chat({ baseURL: replay.openaiBaseUrl, apiKey: "traza", fetch }, { model: "gpt-4o", messages: messages() });
+        await chat({ baseURL: replay.openaiBaseUrl, apiKey: "traza", fetch }, { model: "gpt-6.1-sol", messages: messages() });
       }),
       /stopped after 1 of the 2 model calls/,
     );

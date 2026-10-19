@@ -73,7 +73,7 @@ def weather_run(session, trace, city, tenant=None):
     user = f"What's the weather in {city}?"
     args = json.dumps({"city": city})
     result = json.dumps({"forecast": "rain", "celsius": 12})
-    llm = {"gen_ai.system": "openai", "gen_ai.request.model": "gpt-4o", "gen_ai.response.model": "gpt-4o-2024-08-06"}
+    llm = {"gen_ai.system": "openai", "gen_ai.request.model": "gpt-6.1-sol", "gen_ai.response.model": "gpt-6.1-sol"}
     spans = [
         span(trace, "wf", None, "weather_agent.workflow", 0, 1000,
              {"traceloop.span.kind": "workflow", "traceloop.entity.name": "weather_agent"}),
@@ -140,7 +140,7 @@ def openai_request(city, second=False):
         }]})
         messages.append({"role": "tool", "tool_call_id": "call_w1",
                          "content": json.dumps({"forecast": "rain", "celsius": 12})})
-    return {"model": "gpt-4o", "messages": messages}
+    return {"model": "gpt-6.1-sol", "messages": messages}
 
 
 def dump_reversed(value):
@@ -445,7 +445,7 @@ class TapesAndReplays(unittest.TestCase):
         tape = Client(OPEN.url).tape("weather-7")
         self.assertEqual([step.kind for step in tape.steps], ["llm", "tool", "llm"])
         first = tape.steps[0]
-        self.assertEqual(first.model, "gpt-4o-2024-08-06")
+        self.assertEqual(first.model, "gpt-6.1-sol")
         self.assertEqual(first.request[1], {"role": "user", "content": "What's the weather in Paris?"})
         self.assertEqual(first.response[0]["tool_calls"][0]["name"], "get_weather")
         self.assertEqual((first.tokens.input, first.tokens.output, first.tokens.cache_read), (82, 17, None))
@@ -570,7 +570,7 @@ class DiffAndRecall(unittest.TestCase):
         self.assertEqual([run.run for run in found], ["weather-7"])
         run = found.runs[0]
         self.assertEqual((run.outcome, run.outcome_source), ("success", "derived"))
-        self.assertEqual(run.skeleton, ["llm:gpt-4o-2024-08-06", "tool:get_weather", "llm:gpt-4o-2024-08-06"])
+        self.assertEqual(run.skeleton, ["llm:gpt-6.1-sol", "tool:get_weather", "llm:gpt-6.1-sol"])
         self.assertGreaterEqual(run.score, 1)
         self.assertEqual(len(Client(OPEN.url).recall("weather", limit=1)), 1)
         self.assertEqual(len(Client(OPEN.url).recall("weather Paris", outcome="failure")), 0)

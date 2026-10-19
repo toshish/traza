@@ -61,10 +61,12 @@ def say(s):
 # (model, provider, $/1M input tokens, $/1M output tokens). The demo meters
 # llm.cost_usd on each span the way an instrumented client would: computed
 # from these rates at emission time, not derived by the server afterwards.
+# They are the vendors' list prices on 2026-10-18; gemini-3.8-flash's is an
+# introductory price that holds until 2026-12-31.
 MODELS = [
-    ("gpt-4o-mini", "openai", 0.15, 0.60),
-    ("claude-sonnet-4-5", "anthropic", 3.00, 15.00),
-    ("gemini-2.0-flash", "google", 0.10, 0.40),
+    ("gpt-6-luna", "openai", 0.10, 0.50),
+    ("claude-sonnet-5-5", "anthropic", 2.00, 10.00),
+    ("gemini-3.8-flash", "google", 0.75, 3.75),
 ]
 
 
@@ -574,7 +576,7 @@ class Coder:
                 "ok", {"tool.name": "fs.read", "file.path": rng.choice(FILES)}))
             cur += d + rng.uniform(0.01, 0.05)
 
-        model = MODELS[self.count % 2]  # alternates gpt-4o-mini / claude
+        model = MODELS[self.count % 2]  # alternates gpt-6-luna / claude
         d = rng.uniform(1.0, 2.4)
         tin, tout = rng.randrange(1500, 6000), rng.randrange(200, 900)
         self.sched.put(cur + d, span(

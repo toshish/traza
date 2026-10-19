@@ -350,7 +350,7 @@ demotes media to a JSON dump.
 
 All spans for one model (index-served attribute filter):
 
-    GET /v1/spans?attr.gen_ai.request.model=gpt-4o&limit=100
+    GET /v1/spans?attr.gen_ai.request.model=gpt-6.1-sol&limit=100
 
 Chat spans for one service:
 

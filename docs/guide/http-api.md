@@ -847,7 +847,7 @@ it does for spans.
 **Response `200`.**
 
 ```json
-{"sessions":[{"completion_tokens":88,"cost_usd":0.0031,"error_count":0,"first_start_ns":1700000001000000000,"last_end_ns":1700000001900000000,"llm_calls":1,"prompt_tokens":412,"session_attribute":"gen_ai.conversation.id","session_id":"chat-4711","span_count":1,"total_tokens":500,"trace_count":1,"turn_count":1,"turns_from":"traces"}]}
+{"sessions":[{"completion_tokens":88,"cost_usd":0.001704,"error_count":0,"first_start_ns":1700000001000000000,"last_end_ns":1700000001900000000,"llm_calls":1,"prompt_tokens":412,"session_attribute":"gen_ai.conversation.id","session_id":"chat-4711","span_count":1,"total_tokens":500,"trace_count":1,"turn_count":1,"turns_from":"traces"}]}
 ```
 
 | Field | Type | Description |
@@ -880,7 +880,7 @@ is two different sessions.
 `traces`:
 
 ```json
-{"completion_tokens":88,"cost_usd":0.0031,"error_count":0,"first_start_ns":1700000001000000000,"last_end_ns":1700000001900000000,"llm_calls":1,"prompt_tokens":412,"session_attribute":"gen_ai.conversation.id","session_id":"chat-4711","span_count":1,"total_tokens":500,"trace_count":1,"turn_count":1,"turns_from":"traces","traces":[{"cost_usd":0.0031,"error_count":0,"first_start_ns":1700000001000000000,"last_end_ns":1700000001900000000,"root_name":"openai.chat","span_count":1,"total_tokens":500,"trace_id":"trace-2"}]}
+{"completion_tokens":88,"cost_usd":0.001704,"error_count":0,"first_start_ns":1700000001000000000,"last_end_ns":1700000001900000000,"llm_calls":1,"prompt_tokens":412,"session_attribute":"gen_ai.conversation.id","session_id":"chat-4711","span_count":1,"total_tokens":500,"trace_count":1,"turn_count":1,"turns_from":"traces","traces":[{"cost_usd":0.001704,"error_count":0,"first_start_ns":1700000001000000000,"last_end_ns":1700000001900000000,"root_name":"openai.chat","span_count":1,"total_tokens":500,"trace_id":"trace-2"}]}
 ```
 
 Each entry of `traces` carries `trace_id`, `root_name` (the name of the
@@ -911,7 +911,7 @@ be wrong where equal text is merely honest.
 **Response `200`.**
 
 ```json
-{"rows":[{"completion_tokens":88,"cost_usd":0.0031,"error_count":0,"key":"gpt-4o","llm_calls":1,"llm_duration_ns":900000000,"prompt_tokens":412,"spans":1,"total_tokens":500}]}
+{"rows":[{"completion_tokens":88,"cost_usd":0.001704,"error_count":0,"key":"gpt-6.1-sol","llm_calls":1,"llm_duration_ns":900000000,"prompt_tokens":412,"spans":1,"total_tokens":500}]}
 ```
 
 | Field | Type | Description |
@@ -1084,7 +1084,7 @@ curl 'http://localhost:8080/v1/tapes/weather-7?max_steps=1'
 ```
 
 ```json
-{"run":"weather-7","spans_examined":4,"steps":[{"duration_ns":390000000,"fingerprint":"llm:gpt-4o-2024-08-06#8b9a07d4aac0a133","index":0,"kind":"llm","model":"gpt-4o-2024-08-06","name":"openai.chat","parent_span_id":"wf","request":[{"content":"You are a weather assistant.","role":"system"},{"content":"What's the weather in Paris?","role":"user"}],"request_digest":"8b9a07d4aac0a133c789406dfccd9477618c1049ca0255f58b262fc72fca3d8b","response":[{"finish_reason":"tool_calls","role":"assistant","tool_calls":[{"arguments":{"city":"Paris"},"id":"call_w1","name":"get_weather"}]}],"response_digest":"bc0a9a93dfc45c687262d0e46fceb83a1c7c92d362ccb045210310872c51d35f","service":"weather-agent","span_id":"llm-1","start_ns":1791964800010000000,"status":"ok","tokens":{"cache_read":null,"cache_write":null,"context":82,"input":82,"output":17},"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],"tenant":null,"truncated":true}
+{"run":"weather-7","spans_examined":4,"steps":[{"duration_ns":390000000,"fingerprint":"llm:gpt-6.1-sol#8b9a07d4aac0a133","index":0,"kind":"llm","model":"gpt-6.1-sol","name":"openai.chat","parent_span_id":"wf","request":[{"content":"You are a weather assistant.","role":"system"},{"content":"What's the weather in Paris?","role":"user"}],"request_digest":"8b9a07d4aac0a133c789406dfccd9477618c1049ca0255f58b262fc72fca3d8b","response":[{"finish_reason":"tool_calls","role":"assistant","tool_calls":[{"arguments":{"city":"Paris"},"id":"call_w1","name":"get_weather"}]}],"response_digest":"bc0a9a93dfc45c687262d0e46fceb83a1c7c92d362ccb045210310872c51d35f","service":"weather-agent","span_id":"llm-1","start_ns":1791964800010000000,"status":"ok","tokens":{"cache_read":null,"cache_write":null,"context":82,"input":82,"output":17},"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],"tenant":null,"truncated":true}
 ```
 
 | Field | Type | Description |
@@ -1152,7 +1152,7 @@ then counts the steps read, not the run's.
 | `400 {"error":"…"}` | Missing `run`, unknown field, or a bad `mode` / `tenant`; malformed `edits` or `live_after`; an edit naming a step the run does not have or of the other kind, an edit after the live point, a live point past the last step, or an edited answer with neither text nor a tool call — each named |
 | `403` | A bound credential named another tenant |
 | `404 {"error":"run not found"}` | No spans carry that run id in scope |
-| `409 {"error":"step 0 (llm:gpt-4o) recorded no response — …"}` | The run cannot be replayed: a model step with no recorded answer (content capture off); an offloaded answer that cannot be read, or that is past `--tape-max-bytes` (the message says which); in strict mode a request that cannot be read or was not recorded as a message list — a bare prompt (text or a JSON object, with or without system instructions beside it), or a list holding something other than messages; a run of more than 20,000 spans (unless a fork goes live within its first 20,000); or a snapshot larger than one tenant's whole share (64 MiB), which can never be held — refused as soon as building it passes the share. The message names the step and the remedy. Carries `x-should-retry: false` |
+| `409 {"error":"step 0 (llm:gpt-6.1-sol) recorded no response — …"}` | The run cannot be replayed: a model step with no recorded answer (content capture off); an offloaded answer that cannot be read, or that is past `--tape-max-bytes` (the message says which); in strict mode a request that cannot be read or was not recorded as a message list — a bare prompt (text or a JSON object, with or without system instructions beside it), or a list holding something other than messages; a run of more than 20,000 spans (unless a fork goes live within its first 20,000); or a snapshot larger than one tenant's whole share (64 MiB), which can never be held — refused as soon as building it passes the share. The message names the step and the remedy. Carries `x-should-retry: false` |
 | `429` with `Retry-After` | No room now. Each tenant's data — and the operator view, as a share of its own — may be held by 64 live replays and 64 MiB of memory; the registry as a whole by 1,024 replays and 512 MiB. Memory is everything a replay retains, counted generously: answers, tool records, identifiers, erasure bookkeeping, collection overhead, and its call log at its 4,096-entry bound (about 96 KiB). A full share answers with the seconds until enough of that share's replays expire. A full registry answers the same to unbound operators and a flat `60` to bound credentials, which do not learn when another tenant's replay expires. A live replay is never evicted |
 
 ### `GET /v1/replays/{id}`
@@ -1232,7 +1232,7 @@ curl -X POST http://localhost:8080/v1/replays/rp_70235b53074a150e1cca9771c76a88b
 ```
 
 ```json
-{"content":[{"id":"call_w1","input":{"city":"Paris"},"name":"get_weather","type":"tool_use"}],"id":"msg_traza70235b53074as0","model":"gpt-4o-2024-08-06","role":"assistant","stop_reason":"tool_use","stop_sequence":null,"type":"message","usage":{"input_tokens":82,"output_tokens":17}}
+{"content":[{"id":"call_w1","input":{"city":"Paris"},"name":"get_weather","type":"tool_use"}],"id":"msg_traza70235b53074as0","model":"gpt-6.1-sol","role":"assistant","stop_reason":"tool_use","stop_sequence":null,"type":"message","usage":{"input_tokens":82,"output_tokens":17}}
 ```
 
 Errors take Anthropic's shape, `{"type":"error","error":{"type",…}}`, with the
@@ -1278,7 +1278,7 @@ curl 'http://localhost:8080/v1/diff?a=weather-7&b=weather-8'
 ```
 
 ```json
-{"a":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-7","steps":3,"tokens":233,"truncated":false},"aligned":[{"a":0,"b":0,"fingerprint_a":"llm:gpt-4o-2024-08-06#8b9a07d4aac0a133","fingerprint_b":"llm:gpt-4o-2024-08-06#1ae84ec741143bc4","op":"changed","why":"input"},{"a":1,"b":1,"fingerprint_a":"tool:get_weather#6e1e312d537bc71b","fingerprint_b":"tool:get_weather#ac8cc520a3295a36","op":"changed","why":"input"},{"a":2,"b":2,"fingerprint_a":"llm:gpt-4o-2024-08-06#6db28425e9e18cdb","fingerprint_b":"llm:gpt-4o-2024-08-06#592c7b1d345f6104","op":"changed","why":"input"}],"b":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-8","steps":3,"tokens":233,"truncated":false},"delta":{"cost_usd":0.0,"duration_ns":0,"errors":0,"steps":0,"tokens":0},"first_divergence":{"a":0,"b":0,"explanation":"step 0 of a and step 0 of b (llm:gpt-4o-2024-08-06) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b","kind":"input"},"truncated":false}
+{"a":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-7","steps":3,"tokens":233,"truncated":false},"aligned":[{"a":0,"b":0,"fingerprint_a":"llm:gpt-6.1-sol#8b9a07d4aac0a133","fingerprint_b":"llm:gpt-6.1-sol#1ae84ec741143bc4","op":"changed","why":"input"},{"a":1,"b":1,"fingerprint_a":"tool:get_weather#6e1e312d537bc71b","fingerprint_b":"tool:get_weather#ac8cc520a3295a36","op":"changed","why":"input"},{"a":2,"b":2,"fingerprint_a":"llm:gpt-6.1-sol#6db28425e9e18cdb","fingerprint_b":"llm:gpt-6.1-sol#592c7b1d345f6104","op":"changed","why":"input"}],"b":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-8","steps":3,"tokens":233,"truncated":false},"delta":{"cost_usd":0.0,"duration_ns":0,"errors":0,"steps":0,"tokens":0},"first_divergence":{"a":0,"b":0,"explanation":"step 0 of a and step 0 of b (llm:gpt-6.1-sol) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b","kind":"input"},"truncated":false}
 ```
 
 | Field | Type | Description |
@@ -1320,7 +1320,7 @@ curl 'http://localhost:8080/v1/recall?q=weather+Paris&limit=1'
 ```
 
 ```json
-{"runs":[{"cost_usd":0.0,"last_end_ns":1791964801000000000,"outcome":"success","outcome_source":"derived","run":"weather-7","score":3,"skeleton":["llm:gpt-4o-2024-08-06","tool:get_weather","llm:gpt-4o-2024-08-06"],"skeleton_truncated":false,"steps":3,"tenant":"","truncated":false}],"truncated":false}
+{"runs":[{"cost_usd":0.0,"last_end_ns":1791964801000000000,"outcome":"success","outcome_source":"derived","run":"weather-7","score":3,"skeleton":["llm:gpt-6.1-sol","tool:get_weather","llm:gpt-6.1-sol"],"skeleton_truncated":false,"steps":3,"tenant":"","truncated":false}],"truncated":false}
 ```
 
 Ranking: outcome first (successes first under `any`), then `score` — the
@@ -1366,7 +1366,7 @@ curl 'http://localhost:8080/v1/blame?path=src/item.rs&line=pub%20price%3A%20u64%
 ```
 
 ```json
-{"line":"pub price: u64,","matches":[{"agent":"general-purpose","at_ns":1767607225000000000,"file":"/tmp/demo-shop/src/item.rs","model":"claude-haiku-4-5-20251001","outcome":"applied","project":"/tmp/demo-shop","prompt":"Add a price field to Item in src/item.rs","run":"11111111-1111-4111-8111-111111111111","service":"claude-code","span_id":"fe06d3b7c5815378","step_index":10,"tenant":"","tool":"MultiEdit","trace_id":"257eaef69d566d3579947aac638045ca"}],"path":"src/item.rs","searched_spans":6,"truncated":false}
+{"line":"pub price: u64,","matches":[{"agent":"general-purpose","at_ns":1767607225000000000,"file":"/tmp/demo-shop/src/item.rs","model":"claude-haiku-5-5","outcome":"applied","project":"/tmp/demo-shop","prompt":"Add a price field to Item in src/item.rs","run":"11111111-1111-4111-8111-111111111111","service":"claude-code","span_id":"fe06d3b7c5815378","step_index":10,"tenant":"","tool":"MultiEdit","trace_id":"257eaef69d566d3579947aac638045ca"}],"path":"src/item.rs","searched_spans":6,"truncated":false}
 ```
 
 A step **introduces** a line when its edit adds it more times than it removes
@@ -1459,7 +1459,7 @@ curl 'http://127.0.0.1:8080/v1/fate/cohorts'
 ```
 
 ```json
-{"bounds":{"cohorts_dropped":0,"node_cap":false,"runs_dropped":0,"runs_partial":0,"runs_tracked":226,"signature_cap":false,"spans_read":1342,"spans_skipped":0,"window_narrowed":false},"built_at_ns":1792298013667246000,"cohorts":[{"abandoned":9,"agent":"support-agent","base_rate":0.5444,"failure":73,"runs":180,"success":98,"tenant":"","unknown":6},{"abandoned":4,"agent":"support-agent","base_rate":0.6,"failure":12,"runs":40,"success":24,"task":"dd8fe599d8750716","tenant":"","unknown":0},{"abandoned":0,"agent":"researcher","base_rate":0.5,"failure":20,"runs":40,"success":20,"tenant":"","unknown":0}],"truncated":false,"window":{"since_ns":1789706013667246000,"until_ns":1792298013667246000}}
+{"bounds":{"cohorts_dropped":0,"node_cap":false,"runs_dropped":0,"runs_partial":0,"runs_tracked":394,"signature_cap":false,"spans_read":2856,"spans_skipped":0,"window_narrowed":false},"built_at_ns":1792370034748436000,"cohorts":[{"abandoned":9,"agent":"support-agent","base_rate":0.5444,"failure":73,"runs":180,"success":98,"tenant":"","unknown":6},{"abandoned":4,"agent":"support-agent","base_rate":0.6,"failure":12,"runs":40,"success":24,"task":"dd8fe599d8750716","tenant":"","unknown":0},{"abandoned":7,"agent":"ci-fix","base_rate":0.6424,"failure":52,"runs":165,"success":106,"tenant":"","unknown":3},{"abandoned":0,"agent":"researcher","base_rate":0.5,"failure":20,"runs":40,"success":20,"tenant":"","unknown":0}],"truncated":false,"window":{"since_ns":1789778034748436000,"until_ns":1792370034748436000}}
 ```
 
 ### `GET /v1/fate/map`
@@ -1562,7 +1562,7 @@ curl 'http://127.0.0.1:8080/v1/fate/runs/live-healthy-0'
 ```
 
 ```json
-{"agent":"support-agent","base_rate":0.5444,"ci95":[0.6695,0.842],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 69 of 90 times (76.7%, 95% CI 66.9–84.2%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792303815044948000,"matched_depth":4,"min_support":30,"next":[{"ci95":[0.7985,0.9534],"success_rate":0.9,"token":"llm:gpt-4o","visits":60},{"ci95":[0.3315,0.6685],"repeat":true,"success_rate":0.5,"token":"tool:issue_refund","visits":30}],"node":{"abandoned":0,"ci95":[0.6695,0.842],"cost_usd_avg":0.006,"depth":4,"failure":21,"lift":1.4082,"p_fail_given_here":0.2333,"pooled":["tool:issue_refund","tool:issue_refund×2"],"success":69,"success_rate":0.7667,"token":"tool:issue_refund","visits":90},"outcome":"unknown","p_success":0.7667,"partial":false,"path":["llm:gpt-4o","tool:search_orders","llm:gpt-4o","tool:issue_refund"],"recommended_next":"llm:gpt-4o","run":"live-healthy-0","steps":4,"support":90,"tenant":"","verdict":"on_track"}
+{"agent":"support-agent","base_rate":0.5444,"ci95":[0.6695,0.842],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 69 of 90 times (76.7%, 95% CI 66.9–84.2%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792370034773920000,"matched_depth":4,"min_support":30,"next":[{"ci95":[0.7985,0.9534],"success_rate":0.9,"token":"llm:gpt-6.1-sol","visits":60},{"ci95":[0.3315,0.6685],"repeat":true,"success_rate":0.5,"token":"tool:issue_refund","visits":30}],"node":{"abandoned":0,"ci95":[0.6695,0.842],"cost_usd_avg":0.006,"depth":4,"failure":21,"lift":1.4082,"p_fail_given_here":0.2333,"pooled":["tool:issue_refund","tool:issue_refund×2"],"success":69,"success_rate":0.7667,"token":"tool:issue_refund","visits":90},"outcome":"unknown","p_success":0.7667,"partial":false,"path":["llm:gpt-6.1-sol","tool:search_orders","llm:gpt-6.1-sol","tool:issue_refund"],"recommended_next":"llm:gpt-6.1-sol","run":"live-healthy-0","steps":4,"support":90,"tenant":"","verdict":"on_track"}
 ```
 
 **Errors.** `400` for an empty or over-long (1,024 bytes) run id,
@@ -2856,7 +2856,7 @@ curl http://127.0.0.1:8080/v1/runs/live
 ```
 
 ```json
-{"runs":[{"agent":"triage","cost_usd":0.0,"current":{"kind":"llm","name":"gpt-4o-mini","pending":false,"started_ns":1792000004000001000},"errors":0,"last_activity_ns":1792298718444962000,"pending_nudges":0,"policy":"support","reasons":[],"run":"sess-42","service":"support-app","started_ns":1792000000000000000,"steps":8,"tenant":"","tokens":1840,"verdict":"continue"}],"truncated":false,"window_ns":900000000000}
+{"runs":[{"agent":"triage","cost_usd":0.0,"current":{"kind":"llm","name":"gpt-6-luna","pending":false,"started_ns":1792000004000001000},"errors":0,"last_activity_ns":1792298718444962000,"pending_nudges":0,"policy":"support","reasons":[],"run":"sess-42","service":"support-app","started_ns":1792000000000000000,"steps":8,"tenant":"","tokens":1840,"verdict":"continue"}],"truncated":false,"window_ns":900000000000}
 ```
 
 | Field | Description |

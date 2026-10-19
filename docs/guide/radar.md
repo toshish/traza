@@ -68,8 +68,8 @@ edit, and two runs in five started failing where one in twenty had:
         }
       ],
       "current": {
-        "model_requested": "gpt-4o",
-        "model_returned": "gpt-4o-2024-08-06",
+        "model_requested": "gpt-6.1-sol",
+        "model_returned": "gpt-6.1-sol",
         "sdk_version": "opentelemetry/1.27.0",
         "service_version": "1.5.0",
         "system_prompt": "118dd41ec67c4887"
@@ -111,7 +111,7 @@ curl 'http://127.0.0.1:8080/v1/changes?run=ticket-076'
 ```
 
 ```json
-{"agent":"support-bot","downstream_of":[{"at_ns":1792135560000000000,"dimension":"system_prompt","explanation":"error rate 5.0% → 40.0% (p<0.001); success rate 95.0% → 60.0% (p<0.001)","to":"118dd41ec67c4887","verdict":"regression"},{"at_ns":1792135560000000000,"dimension":"service_version","explanation":"error rate 5.0% → 40.0% (p<0.001); success rate 95.0% → 60.0% (p<0.001)","to":"1.5.0","verdict":"regression"}],"errored":true,"fingerprint":{"model_requested":"gpt-4o","model_returned":"gpt-4o-2024-08-06","path":"llm:gpt-4o-2024-08-06 > tool:lookup_order > llm:gpt-4o-2024-08-06","sdk_version":"opentelemetry/1.27.0","service_version":"1.5.0","system_prompt":"118dd41ec67c4887"},"outcome":"failure","run":"ticket-076","start_ns":1792136520000000000,"tenant":""}
+{"agent":"support-bot","downstream_of":[{"at_ns":1792135560000000000,"dimension":"system_prompt","explanation":"error rate 5.0% → 40.0% (p<0.001); success rate 95.0% → 60.0% (p<0.001)","to":"118dd41ec67c4887","verdict":"regression"},{"at_ns":1792135560000000000,"dimension":"service_version","explanation":"error rate 5.0% → 40.0% (p<0.001); success rate 95.0% → 60.0% (p<0.001)","to":"1.5.0","verdict":"regression"}],"errored":true,"fingerprint":{"model_requested":"gpt-6.1-sol","model_returned":"gpt-6.1-sol","path":"llm:gpt-6.1-sol > tool:lookup_order > llm:gpt-6.1-sol","sdk_version":"opentelemetry/1.27.0","service_version":"1.5.0","system_prompt":"118dd41ec67c4887"},"outcome":"failure","run":"ticket-076","start_ns":1792136520000000000,"tenant":""}
 ```
 
 `fingerprint` is the run's value for each dimension it carries, plus its
@@ -289,7 +289,7 @@ because the provider changed under you. To catch this, each run gets a
 **top-level path**: its first four step tokens (`kind:name`, as a
 [tape](replay.md) signature has them), with consecutive repeats bucketed `x`,
 `x×2`, `x×3-5` and `x×6+`, and ` > …` when more steps follow. For example:
-`llm:gpt-4o > tool:search×2 > llm:gpt-4o > …`.
+`llm:gpt-6.1-sol > tool:search×2 > llm:gpt-6.1-sol > …`.
 
 Path distributions in adjacent windows are compared by **Jensen–Shannon
 distance** (base 2, from 0 for identical distributions to 1 for disjoint

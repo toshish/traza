@@ -306,21 +306,26 @@ surface, which reads as *this was free* rather than *nobody told me the rates*.
 ```json
 {
   "models": {
-    "gpt-5.6-sol":   {"input_per_mtok": 1.25, "output_per_mtok": 10.00},
-    "gpt-4o-mini*":  {"input_per_mtok": 0.15, "output_per_mtok": 0.60},
-    "gpt-4o*":       {"input_per_mtok": 2.50, "output_per_mtok": 10.00,
-                      "cache_read_per_mtok": 1.25},
-    "claude-sonnet-*": {"input_per_mtok": 3.00, "output_per_mtok": 15.00,
-                        "cache_read_per_mtok": 0.30, "cache_write_per_mtok": 3.75}
+    "gpt-6.1-sol":       {"input_per_mtok": 2.00, "output_per_mtok": 10.00,
+                          "cache_read_per_mtok": 0.10, "cache_write_per_mtok": 2.50},
+    "gpt-6-luna":        {"input_per_mtok": 0.10, "output_per_mtok": 0.50,
+                          "cache_read_per_mtok": 0.01, "cache_write_per_mtok": 0.125},
+    "claude-opus-5-5":   {"input_per_mtok": 4.00, "output_per_mtok": 20.00,
+                          "cache_read_per_mtok": 0.20, "cache_write_per_mtok": 5.00},
+    "claude-sonnet-5-5": {"input_per_mtok": 2.00, "output_per_mtok": 10.00,
+                          "cache_read_per_mtok": 0.10, "cache_write_per_mtok": 2.50}
   }
 }
 ```
 
 Rates are **USD per million tokens**, the unit vendors quote, so the file can
-be checked against a price page without arithmetic. A key ending in `*` is a
-prefix pattern; the longest match wins regardless of the order the file lists
-them in, and an exact name beats every pattern. A bare `"*"` is a default rate
-for everything unnamed.
+be checked against a price page without arithmetic; the ones above are the
+vendors' list prices on 2026-10-18. A key ending in `*` is a prefix pattern;
+the longest match wins regardless of the order the file lists them in, and an
+exact name beats every pattern. A bare `"*"` is a default rate for everything
+unnamed. Prefer exact names: a family pattern such as `claude-sonnet-*` also
+matches every later model of that family, which is often priced differently,
+and silently prices it at the older model's rate.
 
 There is no built-in table, and there will not be one: prices change on the
 vendor's schedule rather than Traza's, and self-hosted models have no public
@@ -328,7 +333,8 @@ rate at all.
 
 **What derived cost is.** Arithmetic over the tokens the span reported, at the
 rates you configured. It is not a bill — it knows nothing about batch tiers,
-reasoning tokens billed at a third rate, or negotiated pricing.
+long-prompt tiers, reasoning tokens billed at a third rate, or negotiated
+pricing.
 
 **Cached prompt tokens** are priced only when the model's entry names their
 rates: `cache_read_per_mtok` and `cache_write_per_mtok`, both optional, both

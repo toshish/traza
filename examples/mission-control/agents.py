@@ -134,7 +134,7 @@ TICKETS = [
     "Your app double-billed me for order #F-3317.",
 ]
 SYSTEM = "You are a support agent. Use tools to find orders and issue refunds. Be brief."
-GPT = ("llm", "gpt-4o")
+GPT = ("llm", "gpt-6.1-sol")
 
 # The support agent's paths. Their names and steps are the history's, so
 # foresight has something to judge a live run against.
@@ -211,7 +211,7 @@ def post_history(api):
                 if kind == "llm":
                     attrs = {"gen_ai.operation.name": "chat", "gen_ai.request.model": name,
                              "gen_ai.usage.input_tokens": 600 + 40 * position, "gen_ai.usage.output_tokens": 90,
-                             "llm.cost_usd": 0.0024}
+                             "llm.cost_usd": 0.0021}
                     status = "ok"
                 else:
                     attrs = {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name,
@@ -328,7 +328,7 @@ class Run(threading.Thread):
             out = {"role": "assistant", "content": "Let me look into that."}
         attrs = {"gen_ai.operation.name": "chat", "gen_ai.request.model": model,
                  "gen_ai.usage.input_tokens": tokens_in, "gen_ai.usage.output_tokens": tokens_out,
-                 "llm.cost_usd": round(tokens_in * 2.5e-6 + tokens_out * 1e-5, 6),
+                 "llm.cost_usd": round(tokens_in * 2e-6 + tokens_out * 1e-5, 6),
                  "gen_ai.input.messages": json.dumps(self.messages), "gen_ai.output.messages": json.dumps([out])}
         if agent:
             attrs["gen_ai.agent.name"] = agent
@@ -416,11 +416,11 @@ class TeamRun(Run):
         turn = 0
         while turn < len(self.turns):
             agent = self.turns[turn]
-            work = [("llm", "claude-sonnet-4-5")]
+            work = [("llm", "claude-sonnet-5-5")]
             if agent == "billing":
                 work.append(("tool", "lookup_invoice"))
             if agent == "refunds":
-                work += [("tool", "issue_refund"), ("llm", "claude-sonnet-4-5")]
+                work += [("tool", "issue_refund"), ("llm", "claude-sonnet-5-5")]
             agent_id, a0 = hexid(16), time.time()
             for kind, name in work:
                 while True:
@@ -661,7 +661,7 @@ def run_fork(api, parent, replay):
                 answer = {"role": "assistant", "content": "I could not find that order; I've asked a person to check it."}
             spans.append(span(trace, root, f"chat {name}", "support-agent", run_id, t0, time.time(), "ok", {
                 **tags, "gen_ai.operation.name": "chat", "gen_ai.request.model": name,
-                "gen_ai.usage.input_tokens": 500, "gen_ai.usage.output_tokens": 40, "llm.cost_usd": 0.00165,
+                "gen_ai.usage.input_tokens": 500, "gen_ai.usage.output_tokens": 40, "llm.cost_usd": 0.0014,
                 "gen_ai.input.messages": json.dumps(messages), "gen_ai.output.messages": json.dumps([answer])}))
             messages.append({k: v for k, v in answer.items() if v is not None})
             if live:

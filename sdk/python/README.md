@@ -222,7 +222,7 @@ llm = OpenAI(base_url=replay.openai_base_url, api_key=traza.token or "traza-open
 messages = [{"role": "system", "content": "You are a weather assistant."},
             {"role": "user", "content": "What's the weather in Paris?"}]
 while True:
-    answer = llm.chat.completions.create(model="gpt-4o", messages=messages, tools=TOOLS)
+    answer = llm.chat.completions.create(model="gpt-6.1-sol", messages=messages, tools=TOOLS)
     message = answer.choices[0].message
     messages.append(message.model_dump(exclude_none=True))
     if not message.tool_calls:
@@ -266,14 +266,14 @@ Comparing runs, and recalling earlier ones
 ```python
 diff = traza.diff("weather-7", "weather-8")
 diff.first_divergence.explanation
-# 'step 0 of a and step 0 of b (llm:gpt-4o-2024-08-06) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b'
+# 'step 0 of a and step 0 of b (llm:gpt-6.1-sol) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b'
 for step in diff.aligned:
     print(step.op, step.why, step.fingerprint_a, step.fingerprint_b)
 diff.delta.cost_usd, diff.delta.steps        # b minus a
 
 for run in traza.recall("weather Paris", outcome="any", limit=5):
     print(run.run, run.outcome, run.score, " -> ".join(run.skeleton))
-# weather-7 success 3 llm:gpt-4o-2024-08-06 -> tool:get_weather -> llm:gpt-4o-2024-08-06
+# weather-7 success 3 llm:gpt-6.1-sol -> tool:get_weather -> llm:gpt-6.1-sol
 ```
 
 `tape(run, resolve=False)` returns the run's steps with their inputs, outputs,

@@ -200,8 +200,8 @@ non-zero number, `true`, a non-empty list) or `field OP value`:
 | `>`, `>=`, `<`, `<=` | numeric comparison |
 
 Values are a quoted string (`"…"` or `'…'`), a bare word (`error`,
-`src/main.rs`, `gpt-4o`), a number (`0.5`, `-3`), a duration (`500ms`, `30s`,
-`2m`, `1h`, `1d`; also `ns`, `us`), `true` / `false`, a regex (`/…/` or
+`src/main.rs`, `gpt-6.1-sol`), a number (`0.5`, `-3`), a duration (`500ms`,
+`30s`, `2m`, `1h`, `1d`; also `ns`, `us`), `true` / `false`, a regex (`/…/` or
 `/…/i` after `~`; a string after `~` is a regex too), a capture (`@f`), or a
 scaled capture (`2*@c`).
 
@@ -554,7 +554,7 @@ matches Claude Code's `Bash`.
 **5. An expensive model call.** `llm[cost>0.5]` — metered cost, or priced from
 the server's rates.
 
-**6. A model family over a budget.** `llm(/^gpt-4o/)[tokens>20000]`.
+**6. A model family over a budget.** `llm(/^gpt-6/)[tokens>20000]`.
 
 **7. A dangerous command, by argument.** `tool(bash)[args.command~"^rm -rf"]`.
 

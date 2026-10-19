@@ -172,7 +172,7 @@ fn documented_recipes_are_served_by_the_filter_api() {
                 "agent-web",
                 1_000_000_000,
                 3000,
-                json!({"llm.model": "gpt-5.6-sol", "llm.prompt_tokens": 120,
+                json!({"llm.model": "sim-model", "llm.prompt_tokens": 120,
                        "llm.completion_tokens": 80, "llm.total_tokens": 200,
                        "llm.temperature": 0.7, "llm.stop_reason": "stop",
                        "llm.cost_usd": 0.012})
@@ -184,7 +184,7 @@ fn documented_recipes_are_served_by_the_filter_api() {
                 "agent-web",
                 2_000_000_000,
                 400,
-                json!({"llm.model": "gpt-5.6-sol", "llm.tool_name": "web_search"})
+                json!({"llm.model": "sim-model", "llm.tool_name": "web_search"})
             ),
             llm_span(
                 "t2",
@@ -201,7 +201,7 @@ fn documented_recipes_are_served_by_the_filter_api() {
     assert_eq!(status, 200);
 
     // Recipe: all spans for one model (index-served attribute filter).
-    let (status, body) = server.request("GET", "/v1/spans?attr.llm.model=gpt-5.6-sol", None);
+    let (status, body) = server.request("GET", "/v1/spans?attr.llm.model=sim-model", None);
     assert_eq!(status, 200);
     assert_eq!(
         body["spans"].as_array().map(Vec::len),
@@ -266,7 +266,7 @@ fn conventions_flow_through_otlp() {
                 "startTimeUnixNano": "1700000000000000000",
                 "endTimeUnixNano": "1700000001500000000",
                 "attributes": [
-                    {"key": "llm.model", "value": {"stringValue": "gpt-5.6-sol"}},
+                    {"key": "llm.model", "value": {"stringValue": "sim-model"}},
                     {"key": "llm.total_tokens", "value": {"intValue": "200"}}
                 ],
                 "events": [{"name": "llm.completion",
@@ -278,7 +278,7 @@ fn conventions_flow_through_otlp() {
     );
     assert_eq!(status, 200, "OTLP LLM span: {body}");
 
-    let (status, body) = server.request("GET", "/v1/spans?attr.llm.model=gpt-5.6-sol", None);
+    let (status, body) = server.request("GET", "/v1/spans?attr.llm.model=sim-model", None);
     assert_eq!(status, 200);
     let spans = body["spans"].as_array().expect("array");
     assert_eq!(spans.len(), 1, "OTLP llm.model indexed: {body}");

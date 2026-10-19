@@ -70,7 +70,7 @@ def span(trace, span_id, name, start_ms, end_ms, attributes):
 
 
 def weather_run(session, trace, at_ms=0, result=RAIN, extra=None):
-    llm = {"gen_ai.system": "openai", "gen_ai.request.model": "gpt-4o", "gen_ai.response.model": "gpt-4o-2024-08-06"}
+    llm = {"gen_ai.system": "openai", "gen_ai.request.model": "gpt-6.1-sol", "gen_ai.response.model": "gpt-6.1-sol"}
     spans = [
         span(trace, "llm-1", "openai.chat", at_ms, at_ms + 400, {
             **llm,
@@ -137,7 +137,7 @@ AGENT = textwrap.dedent(
             record.write(key + "\\n")
     task = sys.argv[1]
     def chat(messages):
-        body = json.dumps({"model": "gpt-4o", "messages": messages}).encode()
+        body = json.dumps({"model": "gpt-6.1-sol", "messages": messages}).encode()
         request = urllib.request.Request(base + "/chat/completions", data=body, method="POST",
             headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
         with urllib.request.urlopen(request, timeout=10) as answer:
@@ -215,7 +215,7 @@ def setUpModule():
 def provider_answer(request):
     """The stub provider: one final answer, whatever it is asked."""
     return response(200, json.dumps({
-        "id": "chatcmpl-live", "object": "chat.completion", "created": 1, "model": "gpt-4o-live",
+        "id": "chatcmpl-live", "object": "chat.completion", "created": 1, "model": "gpt-6.1-sol-live",
         "choices": [{"index": 0, "finish_reason": "stop",
                      "message": {"role": "assistant", "content": "Live: it is sunny in Paris."}}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
@@ -271,7 +271,7 @@ class ForkGoesLive(unittest.TestCase):
                 self.assertTrue(base.startswith("http://127.0.0.1:") and base.endswith("/openai/v1"))
                 self.assertNotEqual(key, "sk-real-provider-key", "the agent never holds the real key")
                 # Step 0 comes from the recording.
-                status, first = chat(base, key, {"model": "gpt-4o", "messages": messages()})
+                status, first = chat(base, key, {"model": "gpt-6.1-sol", "messages": messages()})
                 self.assertEqual(status, 200)
                 self.assertEqual(first["choices"][0]["message"]["tool_calls"][0]["id"], "call_w1")
                 # Step 1, the tool, is the edit.
@@ -281,7 +281,7 @@ class ForkGoesLive(unittest.TestCase):
                 self.assertEqual(len(provider.requests), 0, "nothing has gone live yet")
                 # Step 2 is past the cut: the provider answers it.
                 edited = json.dumps(tool.result)
-                status, live = chat(base, key, {"model": "gpt-4o", "messages": messages(tool_result=edited)})
+                status, live = chat(base, key, {"model": "gpt-6.1-sol", "messages": messages(tool_result=edited)})
                 self.assertEqual(status, 200)
                 self.assertEqual(live["choices"][0]["message"]["content"], "Live: it is sunny in Paris.")
                 self.assertTrue(fork.is_live)
@@ -295,7 +295,7 @@ class ForkGoesLive(unittest.TestCase):
                 self.assertEqual(fork.call_tool("get_weather", lambda: "ran live"), "ran live")
                 # A caller without the fork's secret is refused.
                 with self.assertRaises(urllib.error.HTTPError) as refused:
-                    chat(base, "someone-else", {"model": "gpt-4o", "messages": messages()})
+                    chat(base, "someone-else", {"model": "gpt-6.1-sol", "messages": messages()})
                 self.assertEqual(refused.exception.code, 401)
                 refused.exception.close()
             self.assertIsNone(active_fork())
@@ -318,7 +318,7 @@ class ForkGoesLive(unittest.TestCase):
                 self.assertEqual(fork.call_tool("open_session", lambda: "opened"), "opened")
                 self.assertFalse(fork.is_live, "a tool going live is not the model calls going live")
                 # ...and step 0 still comes from the recording, strictly matched.
-                status, first = chat(base, key, {"model": "gpt-4o", "messages": messages()})
+                status, first = chat(base, key, {"model": "gpt-6.1-sol", "messages": messages()})
                 self.assertEqual(status, 200)
                 self.assertEqual(first["choices"][0]["message"]["tool_calls"][0]["id"], "call_w1")
                 self.assertEqual(len(provider.requests), 0, "no recorded model call reached the provider")
@@ -326,7 +326,7 @@ class ForkGoesLive(unittest.TestCase):
                 self.assertTrue(tool.edited, "the edit is still served after a tool went live")
                 # Past the cut the model endpoint itself says so, and only then
                 # do model calls go to the provider.
-                status, live = chat(base, key, {"model": "gpt-4o",
+                status, live = chat(base, key, {"model": "gpt-6.1-sol",
                                                 "messages": messages(tool_result=json.dumps(tool.result))})
                 self.assertEqual(live["choices"][0]["message"]["content"], "Live: it is sunny in Paris.")
                 self.assertTrue(fork.is_live)
@@ -336,10 +336,10 @@ class ForkGoesLive(unittest.TestCase):
 
     def test_without_live_the_edit_is_served_and_the_recording_plays_on(self):
         with Fork(CLIENT, "weather-7", 0, response="It is sunny in Paris.", live=False) as fork:
-            status, answer = chat(fork.openai_base_url, fork.api_key, {"model": "gpt-4o", "messages": messages()})
+            status, answer = chat(fork.openai_base_url, fork.api_key, {"model": "gpt-6.1-sol", "messages": messages()})
             self.assertEqual(answer["choices"][0]["message"]["content"], "It is sunny in Paris.")
             status, answer = chat(fork.openai_base_url, fork.api_key,
-                                  {"model": "gpt-4o", "messages": messages(tool_result="whatever")})
+                                  {"model": "gpt-6.1-sol", "messages": messages(tool_result="whatever")})
             self.assertEqual(answer["choices"][0]["message"]["content"], "It's raining in Paris, 12°C.")
         self.assertFalse(fork.is_live)
 
@@ -378,10 +378,10 @@ class ForksSideBySide(unittest.TestCase):
                 self.assertEqual(inner.live_openai_base_url, provider.url + "/v1")
                 self.assertEqual(inner.live_openai_api_key, "sk-real-provider-key")
                 with inner:
-                    chat(inner.openai_base_url, inner.api_key, {"model": "gpt-4o", "messages": messages()})
+                    chat(inner.openai_base_url, inner.api_key, {"model": "gpt-6.1-sol", "messages": messages()})
                     self.assertEqual(inner.tool_result("get_weather").result, "rain")
                     status, live = chat(inner.openai_base_url, inner.api_key,
-                                        {"model": "gpt-4o", "messages": messages(tool_result="rain")})
+                                        {"model": "gpt-6.1-sol", "messages": messages(tool_result="rain")})
                     self.assertEqual(live["choices"][0]["message"]["content"], "Live: it is sunny in Paris.")
                 self.assertEqual(len(provider.requests), 1, "inner went live to the provider itself")
                 self.assertEqual(provider.requests[0].headers["authorization"], "Bearer sk-real-provider-key")
@@ -492,8 +492,8 @@ class TapeTests(unittest.TestCase):
     def test_an_agent_on_the_recorded_path_passes(self):
         def agent(tape):
             base, key = os.environ["OPENAI_BASE_URL"], os.environ["OPENAI_API_KEY"]
-            chat(base, key, {"model": "gpt-4o", "messages": messages()})
-            chat(base, key, {"model": "gpt-4o", "messages": messages(tool_result=RAIN)})
+            chat(base, key, {"model": "gpt-6.1-sol", "messages": messages()})
+            chat(base, key, {"model": "gpt-6.1-sol", "messages": messages(tool_result=RAIN)})
 
         status = replay_test(CLIENT, "weather-7", agent)
         self.assertEqual((status.served, status.remaining), (2, 0))
@@ -502,7 +502,7 @@ class TapeTests(unittest.TestCase):
     def test_a_divergence_fails_naming_the_message_and_the_text(self):
         def agent(tape):
             chat(os.environ["OPENAI_BASE_URL"], os.environ["OPENAI_API_KEY"],
-                 {"model": "gpt-4o", "messages": messages(user="What's the weather in Lyon?")})
+                 {"model": "gpt-6.1-sol", "messages": messages(user="What's the weather in Lyon?")})
 
         with self.assertRaises(TapeMismatch) as caught:
             replay_test(CLIENT, "weather-7", agent)
@@ -518,12 +518,12 @@ class TapeTests(unittest.TestCase):
     def test_stopping_early_and_overrunning_both_fail(self):
         with TapeTest(CLIENT, "weather-7") as tape:
             chat(os.environ["OPENAI_BASE_URL"], os.environ["OPENAI_API_KEY"],
-                 {"model": "gpt-4o", "messages": messages()})
+                 {"model": "gpt-6.1-sol", "messages": messages()})
         self.assertIn("stopped after 1 of the 2 model calls", tape.failure())
         with TapeTest(CLIENT, "weather-7", mode="loose") as tape:
             for _ in range(3):
                 try:
-                    chat(tape.replay.openai_base_url, "x", {"model": "gpt-4o", "messages": messages()})
+                    chat(tape.replay.openai_base_url, "x", {"model": "gpt-6.1-sol", "messages": messages()})
                 except urllib.error.HTTPError as error:
                     self.assertEqual(error.code, 410)
                     error.close()
@@ -751,7 +751,7 @@ class PytestPlugin(unittest.TestCase):
                         "type": "function", "function": {"name": "get_weather", "arguments": "{\\"city\\":\\"Paris\\"}"}}]})
                     messages.append({"role": "tool", "tool_call_id": "call_w1", "content": tool_result})
                 request = urllib.request.Request(os.environ["OPENAI_BASE_URL"] + "/chat/completions",
-                    data=json.dumps({"model": "gpt-4o", "messages": messages}).encode(), method="POST",
+                    data=json.dumps({"model": "gpt-6.1-sol", "messages": messages}).encode(), method="POST",
                     headers={"Content-Type": "application/json",
                              "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"]})
                 with urllib.request.urlopen(request, timeout=10) as answer:

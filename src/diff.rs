@@ -16,8 +16,8 @@
 //! | llm steps whose model or `gen_ai.request.*` parameters differ | `changed` | `config` |
 //! | a step only one run has | `insert` / `delete` | `structure` |
 //!
-//! A model change alters the signature (`llm:gpt-4o` is not
-//! `llm:gpt-4o-mini`), so the alignment alone would report it as a deletion
+//! A model change alters the signature (`llm:gpt-6.1-sol` is not
+//! `llm:gpt-6-luna`), so the alignment alone would report it as a deletion
 //! plus an insertion. Inside each unaligned gap, llm steps from the two runs
 //! that both name a model are therefore paired in order and reported as one
 //! `config` change — which is what a model swap is.

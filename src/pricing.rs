@@ -132,7 +132,7 @@ pub struct Pricing {
     /// Exact model names.
     exact: BTreeMap<String, Rate>,
     /// Patterns written `prefix*`, stored without the star. Longest match
-    /// wins, so `gpt-4o-mini*` beats `gpt-4o*` for `gpt-4o-mini-2024-07-18`
+    /// wins, so `claude-sonnet-5*` beats `claude-sonnet*` for `claude-sonnet-5-5`
     /// regardless of what order the file listed them in.
     prefixes: Vec<(String, Rate)>,
 }
@@ -147,15 +147,17 @@ impl Pricing {
     ///
     /// ```json
     /// {"models": {
-    ///   "gpt-5.6-sol":  {"input_per_mtok": 1.25, "output_per_mtok": 10.0,
-    ///                    "cache_read_per_mtok": 0.125},
-    ///   "claude-opus-*": {"input_per_mtok": 15.0, "output_per_mtok": 75.0,
-    ///                     "cache_read_per_mtok": 1.5, "cache_write_per_mtok": 18.75}
+    ///   "gpt-6.1-sol":     {"input_per_mtok": 2.0, "output_per_mtok": 10.0,
+    ///                       "cache_read_per_mtok": 0.1, "cache_write_per_mtok": 2.5},
+    ///   "claude-opus-5-5": {"input_per_mtok": 4.0, "output_per_mtok": 20.0,
+    ///                       "cache_read_per_mtok": 0.2, "cache_write_per_mtok": 5.0}
     /// }}
     /// ```
     ///
     /// The two cache rates are optional; see [`Self::cost_with_cache`] for
-    /// what they change.
+    /// what they change. Name models exactly where you can: a family pattern
+    /// such as `claude-opus-*` also matches the family's later models, which
+    /// are often priced differently.
     ///
     /// Every rejection names the model it was reading. A pricing file is
     /// edited by hand, by somebody copying numbers off a price page, and
@@ -357,9 +359,9 @@ mod tests {
     use super::*;
 
     const TABLE: &str = r#"{"models": {
-        "gpt-5.6-sol": {"input_per_mtok": 1.25, "output_per_mtok": 10.0},
-        "gpt-4o-mini*": {"input_per_mtok": 0.15, "output_per_mtok": 0.6},
-        "gpt-4o*": {"input_per_mtok": 2.5, "output_per_mtok": 10.0}
+        "sim-model": {"input_per_mtok": 1.25, "output_per_mtok": 10.0},
+        "sim-large-mini*": {"input_per_mtok": 0.15, "output_per_mtok": 0.6},
+        "sim-large*": {"input_per_mtok": 2.5, "output_per_mtok": 10.0}
     }}"#;
 
     #[test]
@@ -367,7 +369,7 @@ mod tests {
         let pricing = Pricing::parse(TABLE).expect("parses");
         // 5138 in at $1.25/Mtok + 7488 out at $10/Mtok.
         let cost = pricing
-            .cost("gpt-5.6-sol", Some(5138), Some(7488))
+            .cost("sim-model", Some(5138), Some(7488))
             .expect("priced");
         assert!((cost - (0.005138 * 1.25 + 0.007488 * 10.0)).abs() < 1e-12);
     }
@@ -377,13 +379,15 @@ mod tests {
         let pricing = Pricing::parse(TABLE).expect("parses");
         assert_eq!(
             pricing
-                .rate("gpt-4o-mini-2024-07-18")
+                .rate("sim-large-mini-2024-07-18")
                 .map(|r| r.input_per_mtok),
             Some(0.15),
-            "gpt-4o-mini* is longer than gpt-4o* and must win"
+            "sim-large-mini* is longer than sim-large* and must win"
         );
         assert_eq!(
-            pricing.rate("gpt-4o-2024-08-06").map(|r| r.input_per_mtok),
+            pricing
+                .rate("sim-large-2024-08-06")
+                .map(|r| r.input_per_mtok),
             Some(2.5)
         );
     }
@@ -392,13 +396,13 @@ mod tests {
     fn an_exact_name_beats_any_prefix() {
         let pricing = Pricing::parse(
             r#"{"models": {
-                "gpt-4o*": {"input_per_mtok": 2.5, "output_per_mtok": 10.0},
-                "gpt-4o-special": {"input_per_mtok": 0.0, "output_per_mtok": 0.0}
+                "sim-large*": {"input_per_mtok": 2.5, "output_per_mtok": 10.0},
+                "sim-large-special": {"input_per_mtok": 0.0, "output_per_mtok": 0.0}
             }}"#,
         )
         .expect("parses");
         assert_eq!(
-            pricing.cost("gpt-4o-special", Some(1000), Some(1000)),
+            pricing.cost("sim-large-special", Some(1000), Some(1000)),
             Some(0.0)
         );
     }
@@ -408,8 +412,8 @@ mod tests {
         // Only a total is known: input and output are priced differently, so
         // there is no honest answer here.
         let pricing = Pricing::parse(TABLE).expect("parses");
-        assert_eq!(pricing.cost("gpt-5.6-sol", None, Some(7488)), None);
-        assert_eq!(pricing.cost("gpt-5.6-sol", Some(5138), None), None);
+        assert_eq!(pricing.cost("sim-model", None, Some(7488)), None);
+        assert_eq!(pricing.cost("sim-model", Some(5138), None), None);
     }
 
     #[test]
@@ -449,9 +453,9 @@ mod tests {
         let one = Pricing::parse(TABLE).expect("parses");
         let reordered = Pricing::parse(
             r#"{"models": {
-                "gpt-4o*": {"input_per_mtok": 2.5, "output_per_mtok": 10.0},
-                "gpt-4o-mini*": {"input_per_mtok": 0.15, "output_per_mtok": 0.6},
-                "gpt-5.6-sol": {"input_per_mtok": 1.25, "output_per_mtok": 10.0}
+                "sim-large*": {"input_per_mtok": 2.5, "output_per_mtok": 10.0},
+                "sim-large-mini*": {"input_per_mtok": 0.15, "output_per_mtok": 0.6},
+                "sim-model": {"input_per_mtok": 1.25, "output_per_mtok": 10.0}
             }}"#,
         )
         .expect("parses");
@@ -463,9 +467,9 @@ mod tests {
 
         let repriced = Pricing::parse(
             r#"{"models": {
-                "gpt-5.6-sol": {"input_per_mtok": 1.26, "output_per_mtok": 10.0},
-                "gpt-4o-mini*": {"input_per_mtok": 0.15, "output_per_mtok": 0.6},
-                "gpt-4o*": {"input_per_mtok": 2.5, "output_per_mtok": 10.0}
+                "sim-model": {"input_per_mtok": 1.26, "output_per_mtok": 10.0},
+                "sim-large-mini*": {"input_per_mtok": 0.15, "output_per_mtok": 0.6},
+                "sim-large*": {"input_per_mtok": 2.5, "output_per_mtok": 10.0}
             }}"#,
         )
         .expect("parses");
@@ -492,9 +496,9 @@ mod tests {
 
     #[test]
     fn rejections_name_the_model() {
-        let error = Pricing::parse(r#"{"models": {"gpt-5.6-sol": {"input_per_mtok": 1.25}}}"#)
+        let error = Pricing::parse(r#"{"models": {"sim-model": {"input_per_mtok": 1.25}}}"#)
             .expect_err("missing output rate");
-        assert!(error.contains("gpt-5.6-sol"), "{error}");
+        assert!(error.contains("sim-model"), "{error}");
         assert!(error.contains("output_per_mtok"), "{error}");
 
         let error = Pricing::parse(
@@ -646,8 +650,8 @@ mod tests {
         assert_eq!(
             pricing.fingerprint(),
             legacy(
-                &[("gpt-5.6-sol", 1.25, 10.0)],
-                &[("gpt-4o-mini", 0.15, 0.6), ("gpt-4o", 2.5, 10.0)]
+                &[("sim-model", 1.25, 10.0)],
+                &[("sim-large-mini", 0.15, 0.6), ("sim-large", 2.5, 10.0)]
             )
         );
 

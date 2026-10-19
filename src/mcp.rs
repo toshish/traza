@@ -2567,7 +2567,7 @@ fn search_properties(paging: bool) -> Value {
         },
         "attributes": {
             "type": "object",
-            "description": "Exact matches, e.g. {\"gen_ai.request.model\": \"gpt-4o\"}. \
+            "description": "Exact matches, e.g. {\"gen_ai.request.model\": \"gpt-6.1-sol\"}. \
                             Scalars match whether stored as number or string.",
         },
         "exclude_attributes": {
@@ -4019,7 +4019,7 @@ fn pairs(arguments: &Map<String, Value>, field: &str) -> Result<Vec<(String, Val
     let object = value.as_object().ok_or_else(|| {
         ToolError(format!(
             "{field} must be an object of key/value pairs, e.g. \
-             {{\"gen_ai.request.model\": \"gpt-4o\"}}."
+             {{\"gen_ai.request.model\": \"gpt-6.1-sol\"}}."
         ))
     })?;
     Ok(object

@@ -37,7 +37,7 @@ curl http://127.0.0.1:8080/v1/runs/live
 ```
 
 ```json
-{"runs":[{"agent":"triage","cost_usd":0.0,"current":{"kind":"llm","name":"gpt-4o-mini","pending":false,"started_ns":1792000004000001000},"errors":0,"last_activity_ns":1792298718444962000,"pending_nudges":0,"policy":"support","reasons":[],"run":"sess-42","service":"support-app","started_ns":1792000000000000000,"steps":8,"tenant":"","tokens":1840,"verdict":"continue"}],"truncated":false,"window_ns":900000000000}
+{"runs":[{"agent":"triage","cost_usd":0.0,"current":{"kind":"llm","name":"gpt-6-luna","pending":false,"started_ns":1792000004000001000},"errors":0,"last_activity_ns":1792298718444962000,"pending_nudges":0,"policy":"support","reasons":[],"run":"sess-42","service":"support-app","started_ns":1792000000000000000,"steps":8,"tenant":"","tokens":1840,"verdict":"continue"}],"truncated":false,"window_ns":900000000000}
 ```
 
 A run is **live** while its last **activity** — a span arriving, or a

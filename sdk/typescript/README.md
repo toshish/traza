@@ -227,7 +227,7 @@ const messages: OpenAI.ChatCompletionMessageParam[] = [
   { role: "user", content: "What's the weather in Paris?" },
 ];
 for (;;) {
-  const answer = await openai.chat.completions.create({ model: "gpt-4o", messages, tools });
+  const answer = await openai.chat.completions.create({ model: "gpt-6.1-sol", messages, tools });
   const message = answer.choices[0]!.message;
   messages.push(message);
   if (!message.tool_calls?.length) break;
@@ -273,12 +273,12 @@ Comparing runs, and recalling earlier ones
 ```ts
 const diff = await traza.diff("weather-7", "weather-8");
 diff.first_divergence?.explanation;
-// "step 0 of a and step 0 of b (llm:gpt-4o-2024-08-06) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b"
+// "step 0 of a and step 0 of b (llm:gpt-6.1-sol) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b"
 for (const step of diff.aligned) console.log(step.op, step.why, step.fingerprint_a, step.fingerprint_b);
 
 const { runs } = await traza.recall("weather Paris", { outcome: "any", limit: 5 });
 for (const run of runs) console.log(run.run, run.outcome, run.skeleton.join(" -> "));
-// weather-7 success llm:gpt-4o-2024-08-06 -> tool:get_weather -> llm:gpt-4o-2024-08-06
+// weather-7 success llm:gpt-6.1-sol -> tool:get_weather -> llm:gpt-6.1-sol
 ```
 
 `tape(run, { resolve })` returns the run's steps with their inputs, outputs,
