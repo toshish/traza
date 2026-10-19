@@ -2,7 +2,10 @@
 //
 // The Changes screen, rendered from GET /v1/changes as a 0.28.0 server
 // answered it over the behaviour corpus and the insight corpus's support
-// bot, whose v1.5.0 deploy edited one word of its prompt.
+// bot, whose v1.5.0 deploy edited one word of its prompt. The behaviour
+// corpus lays each branch's runs out one after another in time, so the
+// coding agent's requested models change where its sub-agent branch starts
+// and ends, and the second of those changes reads as a regression.
 
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -28,6 +31,7 @@ const { ChangesScreen, regimes } = await import('./ChangesScreen.jsx');
 const { api } = await import('../lib/api.js');
 
 const OPEN = { auth: 'open', scope: 'admin', operator: true, tenant: null };
+const agentNamed = (name) => changes.agents.find((a) => a.agent === name);
 
 async function show(query = '') {
   const go = vi.fn();
@@ -44,9 +48,11 @@ describe('the timeline', () => {
     await show();
     expect(api.changes).toHaveBeenCalledWith({ since: undefined, environment: undefined, run: undefined }, expect.anything());
     const agents = screen.getAllByTestId('agent-changes');
-    expect(agents).toHaveLength(4);
-    expect(agents[0].textContent).toContain('support-bot: regression at 2026-10-17T06:34:56Z');
-    expect(document.body.textContent).toContain('2 regressions in this window');
+    expect(agents).toHaveLength(5);
+    expect(agents[0].textContent).toContain('ci-fix: regression at 2026-10-18T23:26:09Z');
+    expect(agents[1].textContent).toContain('support-bot: regression at 2026-10-17T23:17:54Z');
+    // ci-fix's model change, and support-bot's prompt and version.
+    expect(document.body.textContent).toContain('3 regressions in this window');
   });
 
   it('marks the change points, and tints the stretch a regression set up', async () => {
@@ -60,18 +66,18 @@ describe('the timeline', () => {
   });
 
   it('splits an agent into regimes at its change points', () => {
-    const bot = changes.agents[0];
+    const bot = agentNamed('support-bot');
     const r = regimes(bot);
     expect(r).toHaveLength(2);
     expect(r[0]).toMatchObject({ from: bot.first_run_ns, verdict: null, error: 0.05, n: 60 });
     expect(r[1]).toMatchObject({ to: bot.last_run_ns, verdict: 'regression', label: '1.5.0', error: 0.4, n: 60 });
-    expect(regimes(changes.agents[2])).toEqual([]);
+    expect(regimes(agentNamed('researcher'))).toEqual([]);
   });
 
   it('labels no stretch with a rate when unlisted change points may have cut its sides', () => {
     // Past 40 changes the lowest-ranked are not listed, yet each still
     // bounds its neighbours' sides: a drawn stretch may hold several.
-    const r = regimes({ ...changes.agents[0], truncated: true });
+    const r = regimes({ ...agentNamed('support-bot'), truncated: true });
     expect(r.map((s) => s.label)).toEqual(['1.4.2', '1.5.0']);
     expect(r.map((s) => s.error)).toEqual([null, null]);
   });

@@ -59,6 +59,10 @@ describe('the cohorts and the map', () => {
     expect(cards[0]).toContain('180 runs');
     expect(cards[0]).toContain('+6 live');
     expect(cards[1]).toContain('task dd8fe599');
+    // The coding agent's cohort: Claude Code in CI, three runs still live.
+    expect(cards[2]).toContain('ci-fix');
+    expect(cards[2]).toContain('165 runs');
+    expect(cards[2]).toContain('+3 live');
     expect(api.fateCohorts).toHaveBeenCalledWith({ since: undefined }, expect.anything());
     expect(api.fateMap).toHaveBeenCalledWith(expect.objectContaining({ agent: 'support-agent', depth: 12, min_support: 3, tenant: '' }), expect.anything());
     expect(screen.getByTestId('tile-runs').textContent).toContain('180');
@@ -67,32 +71,32 @@ describe('the cohorts and the map', () => {
   it('draws every node, sized by runs, with fatal forks and hotspots named in words', async () => {
     await show('agent=support-agent');
     expect(screen.getAllByTestId('fate-node')).toHaveLength(supportMap.nodes_shown);
-    const loop = node(['llm:gpt-4o', 'tool:search_orders×3-5']);
+    const loop = node(['llm:gpt-6.1-sol', 'tool:search_orders×3-5']);
     expect(loop.textContent).toContain('FATAL FORK p <0.001');
     expect(loop.textContent).toContain('10.0%');
     expect(loop.getAttribute('aria-label')).toMatch(/50 runs, success 10\.0%, 95% interval 4\.3–21\.4%, fatal fork/);
-    expect(node(['llm:gpt-4o']).textContent).toContain('HOTSPOT 1.50 bits');
+    expect(node(['llm:gpt-6.1-sol']).textContent).toContain('HOTSPOT 1.50 bits');
     expect(screen.getAllByTestId('fatal-fork')).toHaveLength(2);
   });
 
   it('reads a hovered node: its interval, support, and cost and duration means', async () => {
     await show('agent=support-agent');
-    fireEvent.mouseMove(node(['llm:gpt-4o', 'tool:search_orders×3-5']), { clientX: 10, clientY: 10 });
+    fireEvent.mouseMove(node(['llm:gpt-6.1-sol', 'tool:search_orders×3-5']), { clientX: 10, clientY: 10 });
     const tip = screen.getByRole('tooltip').textContent;
     expect(tip).toContain('4.3–21.4%');
     expect(tip).toContain('5 / 40 / 5');
-    expect(tip).toContain('$0.00400'); // 0.2 over 50 runs
+    expect(tip).toContain('$0.00460'); // $0.23 over 50 runs
     expect(tip).toContain('5.00 s'); // 249.849 s over 50 runs
     expect(tip).toContain('71.5% of 130');
   });
 
   it('opens a clicked node with its example runs, a diff of a success against a failure, and the TQL that finds them', async () => {
     await show('agent=support-agent');
-    fireEvent.click(node(['llm:gpt-4o', 'tool:search_orders×3-5']));
+    fireEvent.click(node(['llm:gpt-6.1-sol', 'tool:search_orders×3-5']));
     const params = new URLSearchParams(window.location.hash.split('?')[1]);
-    expect(params.get('node')).toBe('llm:gpt-4o\u0001tool:search_orders×3-5');
+    expect(params.get('node')).toBe('llm:gpt-6.1-sol\u0001tool:search_orders×3-5');
     cleanup();
-    const { go } = await show('agent=support-agent&node=' + encodeURIComponent('llm:gpt-4o\u0001tool:search_orders×3-5'));
+    const { go } = await show('agent=support-agent&node=' + encodeURIComponent('llm:gpt-6.1-sol\u0001tool:search_orders×3-5'));
     const panel = screen.getByTestId('node-panel');
     expect(panel.textContent).toContain('search_loop-9');
     expect(panel.textContent).toContain('p(failure | here)80.0%');
@@ -101,8 +105,8 @@ describe('the cohorts and the map', () => {
     // The search is the cohort's: its agent, in its tenant.
     fireEvent.click(screen.getByText('Find these runs'));
     expect(go).toHaveBeenCalledWith(['behaviors'], {
-      q: '^llm[signature="llm:gpt-4o"] -> tool[signature="tool:search_orders"]{3,5}$'
-        + ' | ^llm[signature="llm:gpt-4o"] -> tool[signature="tool:search_orders"]{3,5} -> step[signature!="tool:search_orders"]',
+      q: '^llm[signature="llm:gpt-6.1-sol"] -> tool[signature="tool:search_orders"]{3,5}$'
+        + ' | ^llm[signature="llm:gpt-6.1-sol"] -> tool[signature="tool:search_orders"]{3,5} -> step[signature!="tool:search_orders"]',
       agent: 'support-agent', tenant: '',
     });
     fireEvent.click(screen.getByText('search_loop-0'));
@@ -111,18 +115,18 @@ describe('the cohorts and the map', () => {
 
   it("says a task map's search covers every task of the agent", async () => {
     api.fateMap.mockResolvedValueOnce({ ...supportMap, task: 'dd8fe599d8750716' });
-    const { go } = await show('agent=support-agent&task=dd8fe599d8750716&node=' + encodeURIComponent('llm:gpt-4o'));
+    const { go } = await show('agent=support-agent&task=dd8fe599d8750716&node=' + encodeURIComponent('llm:gpt-6.1-sol'));
     expect(screen.getByTestId('node-panel').textContent).toContain('searches every task of support-agent');
     fireEvent.click(screen.getByText('Find these runs'));
     expect(go).toHaveBeenCalledWith(['behaviors'], {
-      q: '^llm[signature="llm:gpt-4o"]$ | ^llm[signature="llm:gpt-4o"] -> step[signature!="llm:gpt-4o"]', agent: 'support-agent', tenant: '',
+      q: '^llm[signature="llm:gpt-6.1-sol"]$ | ^llm[signature="llm:gpt-6.1-sol"] -> step[signature!="llm:gpt-6.1-sol"]', agent: 'support-agent', tenant: '',
     });
   });
 
   it('offers no search for a node another branch reads the same as', async () => {
     // A tool literally named search×2, called once, beside search called twice.
     api.fateMap.mockResolvedValueOnce(miniMap);
-    await show('agent=mini-agent&node=' + encodeURIComponent('llm:gpt-4o-mini\u0001tool:search×2'));
+    await show('agent=mini-agent&node=' + encodeURIComponent('llm:gpt-6-luna\u0001tool:search×2'));
     expect(screen.getByTestId('node-panel').textContent).toContain('runs through here1');
     expect(screen.queryByText('Find these runs')).toBeNull();
   });
@@ -192,10 +196,10 @@ describe('a run on its map', () => {
     expect(banner).toContain('on track');
     expect(banner).toContain('runs that took this path succeeded 69 of 90 times');
     expect(banner).toContain('last step open, pooled');
-    expect(screen.getByTestId('next-options').textContent).toMatch(/llm:gpt-4orecommended/);
-    const refund = ['llm:gpt-4o', 'tool:search_orders', 'llm:gpt-4o', 'tool:issue_refund'];
+    expect(screen.getByTestId('next-options').textContent).toMatch(/llm:gpt-6\.1-solrecommended/);
+    const refund = ['llm:gpt-6.1-sol', 'tool:search_orders', 'llm:gpt-6.1-sol', 'tool:issue_refund'];
     expect(node(refund).textContent).toContain('THIS RUN');
-    expect(node([...refund, 'llm:gpt-4o']).textContent).toContain('RECOMMENDED NEXT');
+    expect(node([...refund, 'llm:gpt-6.1-sol']).textContent).toContain('RECOMMENDED NEXT');
     // The run's node is the one opened.
     expect(screen.getByTestId('node-panel').textContent).toContain('runs through here60');
   });
@@ -205,7 +209,7 @@ describe('a run on its map', () => {
     const banner = screen.getByTestId('run-foresight').textContent;
     expect(banner).toContain('likely failure');
     expect(banner).toContain('5 of 50 times (10.0%, 95% CI 4.3–21.4%)');
-    expect(node(['llm:gpt-4o', 'tool:search_orders×3-5']).textContent).toContain('THIS RUN');
+    expect(node(['llm:gpt-6.1-sol', 'tool:search_orders×3-5']).textContent).toContain('THIS RUN');
     // How far the map's verdicts at this depth have been worth trusting.
     expect(screen.getByTestId('run-skill').textContent).toContain('skill 21% at depth 2');
     expect(screen.getByTestId('run-skill').textContent).not.toContain('Do not act');
@@ -254,7 +258,7 @@ describe('a run on its map', () => {
     expect(screen.getByTestId('run-foresight').textContent).toContain('novel');
     expect(document.body.textContent).toContain('NEVER TAKEN HERE BEFORE');
     expect(document.body.textContent).toContain('delete_database');
-    expect(node(['llm:gpt-4o', 'tool:search_orders']).textContent).toContain('RECOMMENDED NEXT');
+    expect(node(['llm:gpt-6.1-sol', 'tool:search_orders']).textContent).toContain('RECOMMENDED NEXT');
   });
 
   it('does not light a run on one task of its agent, which is not what it was judged against', async () => {
@@ -295,7 +299,7 @@ describe('when the route moves on while an answer is on its way', () => {
   });
 
   it("opens the runs of the map still drawn in that map's tenant, not the tenant whose map is loading", async () => {
-    const loop = encodeURIComponent('llm:gpt-4o\u0001tool:search_orders×3-5');
+    const loop = encodeURIComponent('llm:gpt-6.1-sol\u0001tool:search_orders×3-5');
     const go = vi.fn();
     const view = render(<ForesightScreen go={go} params={new URLSearchParams('agent=support-agent&tenant=acme&node=' + loop)}
       identity={OPEN} pushToast={vi.fn()} />);

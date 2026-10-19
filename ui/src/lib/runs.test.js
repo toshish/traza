@@ -54,7 +54,7 @@ describe('splitFingerprint', () => {
       .toEqual({ kind: 'tool', name: 'search_orders', hash: 'be2c24774ede8979' });
     expect(splitFingerprint('tool:issue#42#0123456789abcdef'))
       .toEqual({ kind: 'tool', name: 'issue#42', hash: '0123456789abcdef' });
-    expect(splitFingerprint('llm:gpt-4o')).toEqual({ kind: 'llm', name: 'gpt-4o', hash: '' });
+    expect(splitFingerprint('llm:gpt-6.1-sol')).toEqual({ kind: 'llm', name: 'gpt-6.1-sol', hash: '' });
   });
 });
 

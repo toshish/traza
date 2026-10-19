@@ -111,10 +111,10 @@ def coder_run(run, start, outcome="success"):
         nonlocal clock
         clock += gap
         sid = format(len(spans) + 1, "016x")
-        spans.append(span(trace, sid, "chat claude-sonnet-4-5", "coder", clock, 1400 * MS, {
+        spans.append(span(trace, sid, "chat claude-sonnet-5-5", "coder", clock, 1400 * MS, {
             "session.id": run,
             "gen_ai.operation.name": "chat", "gen_ai.provider.name": "anthropic",
-            "gen_ai.request.model": "claude-sonnet-4-5-20250929",
+            "gen_ai.request.model": "claude-sonnet-5-5",
             "gen_ai.system_instructions": system,
             "gen_ai.tool.definitions": TOOLS,
             "gen_ai.input.messages": list(turns),
@@ -228,9 +228,9 @@ def simple_coder(run, start, plan, outcome):
         tid = f"t{i}"
         call = tool_use(tid, name, args)
         sid = format(len(spans) + 1, "016x")
-        spans.append(span(trace, sid, "chat claude-sonnet-4-5", "coder", clock, 900 * MS, {
+        spans.append(span(trace, sid, "chat claude-sonnet-5-5", "coder", clock, 900 * MS, {
             "session.id": run, "gen_ai.operation.name": "chat", "gen_ai.provider.name": "anthropic",
-            "gen_ai.request.model": "claude-sonnet-4-5-20250929",
+            "gen_ai.request.model": "claude-sonnet-5-5",
             "gen_ai.system_instructions": "You are a careful coding agent working in /srv/app.",
             "gen_ai.tool.definitions": TOOLS,
             "gen_ai.input.messages": list(turns), "gen_ai.output.messages": [call],
@@ -248,9 +248,9 @@ def simple_coder(run, start, plan, outcome):
         clock += 300 * MS
         turns.append(tool_result(tid, result))
     sid = format(len(spans) + 1, "016x")
-    spans.append(span(trace, sid, "chat claude-sonnet-4-5", "coder", clock, 700 * MS, {
+    spans.append(span(trace, sid, "chat claude-sonnet-5-5", "coder", clock, 700 * MS, {
         "session.id": run, "gen_ai.operation.name": "chat", "gen_ai.provider.name": "anthropic",
-        "gen_ai.request.model": "claude-sonnet-4-5-20250929",
+        "gen_ai.request.model": "claude-sonnet-5-5",
         "gen_ai.system_instructions": "You are a careful coding agent working in /srv/app.",
         "gen_ai.input.messages": list(turns), "gen_ai.output.messages": [said("Stopping here.")],
         "gen_ai.usage.input_tokens": 300, "gen_ai.usage.output_tokens": 20,
@@ -277,8 +277,8 @@ def support_bot():
         attrs = {"session.id": run, "service.version": "1.5.0" if v2 else "1.4.2",
                  "telemetry.sdk.name": "opentelemetry", "telemetry.sdk.version": "1.27.0"}
         root = format(n + 1, "016x")
-        llm0 = dict(attrs, **{"gen_ai.operation.name": "chat", "gen_ai.request.model": "gpt-4o",
-                              "gen_ai.response.model": "gpt-4o-2024-08-06",
+        llm0 = dict(attrs, **{"gen_ai.operation.name": "chat", "gen_ai.request.model": "gpt-6.1-sol",
+                              "gen_ai.response.model": "gpt-6.1-sol",
                               "gen_ai.input.messages": [{"role": "system", "content": prompt},
                                                         {"role": "user", "content": f"Ticket {n}: refund order {9000 + n}"}],
                               "gen_ai.usage.input_tokens": 410, "gen_ai.usage.output_tokens": 60})
@@ -288,10 +288,10 @@ def support_bot():
         spans.append(span(trace, root, "support.handle_ticket", "support-bot", start, 6 * SEC,
                           dict(attrs, **{"traceloop.span.kind": "workflow"}),
                           status="error" if failed else "ok"))
-        spans.append(span(trace, root[:-1] + "a", "chat gpt-4o", "support-bot", start + 100 * MS, 1500 * MS, llm0, parent=root))
+        spans.append(span(trace, root[:-1] + "a", "chat gpt-6.1-sol", "support-bot", start + 100 * MS, 1500 * MS, llm0, parent=root))
         spans.append(span(trace, root[:-1] + "b", "execute_tool lookup_order", "support-bot", start + 1700 * MS, 400 * MS,
                           tool0, status="error" if failed else "ok", parent=root))
-        spans.append(span(trace, root[:-1] + "c", "chat gpt-4o", "support-bot", start + 2200 * MS, 1500 * MS, llm1,
+        spans.append(span(trace, root[:-1] + "c", "chat gpt-6.1-sol", "support-bot", start + 2200 * MS, 1500 * MS, llm1,
                           status="error" if failed else "ok", parent=root))
     return spans
 
@@ -307,7 +307,7 @@ def markup_run():
     call = tool_use("x1", "Read", {"file_path": "README.md"})
     back = tool_result("x1", result)
     llm = {"session.id": run, "gen_ai.operation.name": "chat", "gen_ai.provider.name": "anthropic",
-           "gen_ai.request.model": "claude-sonnet-4-5-20250929", "gen_ai.usage.input_tokens": 90,
+           "gen_ai.request.model": "claude-sonnet-5-5", "gen_ai.usage.input_tokens": 90,
            "gen_ai.usage.output_tokens": 20, "gen_ai.usage.cache_read.input_tokens": 0}
     return [
         span(trace, "r0", "coder.session", "coder", start, 1500 * MS,

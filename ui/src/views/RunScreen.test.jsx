@@ -64,7 +64,7 @@ describe('the tape', () => {
     api.tape.mockResolvedValueOnce({
       ...tape,
       steps: [
-        { ...llm, index: 0, model: 'claude-sonnet-4-5', tokens: { input: 2, output: 555, cache_read: 40011, cache_write: 200, context: 40213 } },
+        { ...llm, index: 0, model: 'claude-sonnet-5-5', tokens: { input: 2, output: 555, cache_read: 40011, cache_write: 200, context: 40213 } },
         { ...tool, index: 1 },
         { ...llm, index: 2, tokens: { input: 1200, output: 40, cache_read: 1024, cache_write: null, context: 1200 } },
         { ...llm, index: 3 },

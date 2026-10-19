@@ -11,7 +11,7 @@ import { render, act, cleanup, fireEvent, screen } from '@testing-library/react'
 const spansOf = (tenant) => [{
   trace_id: 't1', span_id: 'root', parent_span_id: null, name: 'agent', service: 'weather-agent',
   start_time_ns: 1_000_000_000, end_time_ns: 2_000_000_000, status: 'ok', events: [],
-  attributes: { 'session.id': 'weather-7', 'gen_ai.request.model': 'gpt-4o' },
+  attributes: { 'session.id': 'weather-7', 'gen_ai.request.model': 'gpt-6.1-sol' },
   ...(tenant ? { $tenant: tenant } : {}),
 }];
 

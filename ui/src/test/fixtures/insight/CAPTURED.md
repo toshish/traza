@@ -11,14 +11,38 @@ seed --data-dir ./data --behaviours
 traza-server import claude-code --path tests/fixtures/import/claude-code --data-dir ./data --no-state
 traza-server import codex --path tests/fixtures/import/codex --data-dir ./data --no-state
 traza-server --data-dir ./data --port 8080 --pricing pricing.json
-python3 ui/src/test/fixtures/insight/corpus.py http://127.0.0.1:8080
+python3 -I ui/src/test/fixtures/insight/corpus.py http://127.0.0.1:8080
+python3 -I ui/src/test/fixtures/insight/capture.py http://127.0.0.1:8080 ui/src/test/fixtures/insight
 ```
 
-`pricing.json` named input, output, cache-read and cache-write rates for
-`claude-sonnet-*`, `claude-haiku-*` and `gpt-4o*`, so the Cache Autopsy
-prices what it loses. The behaviour corpus's six live runs are live only for
-the 15 minutes after seeding; the `fate_run_*` fixtures were captured inside
-that window, so their last step is open and pooled.
+The behaviour corpus has three cohorts. `support-agent` (180 runs, on
+`gpt-6.1-sol`) and `researcher` (40 runs, on `claude-sonnet-5-5`) are the
+ones the Foresight tests draw. `ci-fix` is Claude Code in a CI job (165
+runs, on `claude-sonnet-5-5` with a `claude-haiku-5-5` sub-agent). The
+corpus meters every model call by its tokens at its model's list price. Its
+nine live runs (six of `support-agent`, three of `ci-fix`) are live only for
+the 15 minutes after seeding. `capture.py` asks for the `fate_run_*` fixtures
+first, inside that window, so their last step is open and pooled.
+
+The imported Claude Code sessions run on `claude-opus-5-5` with a
+`claude-haiku-5-5` sub-agent; the Codex sessions on `gpt-6.1-sol` and
+`gpt-6-luna`. `corpus.py` adds the coding runs (`claude-sonnet-5-5`), the
+support bot (`gpt-6.1-sol`) and the markup run. None of these meter a cost,
+so `pricing.json` prices them, and the Cache Autopsy prices what it loses:
+
+```json
+{
+  "models": {
+    "claude-opus-5-5":   {"input_per_mtok": 4.00, "output_per_mtok": 20.00, "cache_read_per_mtok": 0.20, "cache_write_per_mtok": 5.00},
+    "claude-sonnet-5-5": {"input_per_mtok": 2.00, "output_per_mtok": 10.00, "cache_read_per_mtok": 0.10, "cache_write_per_mtok": 2.50},
+    "claude-haiku-5-5":  {"input_per_mtok": 0.10, "output_per_mtok": 0.50,  "cache_read_per_mtok": 0.01, "cache_write_per_mtok": 0.125},
+    "gpt-6.1-sol":       {"input_per_mtok": 2.00, "output_per_mtok": 10.00, "cache_read_per_mtok": 0.10, "cache_write_per_mtok": 2.50},
+    "gpt-6-luna":        {"input_per_mtok": 0.10, "output_per_mtok": 0.50,  "cache_read_per_mtok": 0.01, "cache_write_per_mtok": 0.125}
+  }
+}
+```
+
+The rates are the vendors' list prices on 2026-10-18.
 
 ## Which request made which file
 
@@ -37,7 +61,7 @@ that window, so their last step is open and pooled.
 | `xray_inject.json` | `GET /v1/xray/1a7ec700000000000000000000000000/s3` (`inject-1`) |
 | `changes.json`, `changes_run.json` | `GET /v1/changes`, and `?run=ticket-076` |
 | `tql_tamper.json` | `GET /v1/trajectories/search?q=test[error] ..> edit[file~"(^|/)tests?/"] ..> test[not error]` |
-| `tql_cc_year.json` | the same search for `test[error] ..> edit` with `since` a year back |
+| `tql_cc_year.json` | the same search for `test[error] ..> edit`, with `since` a year back and `agent=claude-code`: unscoped, the year's first 50 matches are all newer runs |
 | `tql_explain.json` | `GET /v1/trajectories/explain?q=edit[file=@f] (..> edit[file=@f]){4,} within 10` |
 | `tql_bad_field.json` | `GET /v1/trajectories/search?q=tool(bash)[stauts=error]` (400) |
 | `detectors.json`, `findings.json` | `GET /v1/detectors`, `GET /v1/detectors/findings` |
@@ -49,18 +73,27 @@ that window, so their last step is open and pooled.
 
 Each of these came from a fresh `traza-server --data-dir <empty>` given only
 the spans described, so the case it shows is the only thing in it.
+`stores.py` posts each store and makes its requests:
+
+```sh
+python3 -I ui/src/test/fixtures/insight/stores.py <store> http://127.0.0.1:8080 ui/src/test/fixtures/insight
+```
+
+The `loops` and `tenants` stores meter each model call by its tokens at its
+model's list price. The others record no usage.
 
 | File | Store | Request |
 |---|---|---|
-| `blame_unconfirmed.json` | Three `Edit` calls writing `let total = items.len();` into `/srv/shop/src/cart.rs`, one run each: one with status `error` and Claude Code's not-found result, one with no status and no result, one with status `ok` and a result | `GET /v1/blame?path=src/cart.rs&line=let total = items.len();` |
-| `changes_params.json` | 120 runs of `tuned-bot`, whose `gen_ai.request.stop` once spelled out a temperature and whose `max_tokens` was text, then became `stop="END"`, `temperature=0.7` and `max_tokens=1024` (error rate 0% → 40%); and 120 runs of `triage-bot`, whose one-word prompt edit moved success from 8 of 8 ended runs to 0 of 8, every other run declaring `session.outcome=escalated` | `GET /v1/changes` |
-| `cache_long.json` | Three calls of `long-ctx-1`: 2,000 one-line turns, the same with an instruction put ahead of them, and that with one more turn | `GET /v1/cache/long-ctx-1` |
-| `xray_unread.json` | `--payload-threshold-bytes 200`; two calls of `unread-1` in one conversation, the first's two instructions inline, the second's request (the same two and a long question) offloaded | `GET /v1/xray/0ff10ad0000000000000000000000000/00000000000000d1?resolve=false` |
-| `fate_map_loops.json`, `fate_map_mini.json` | Ten completed runs, three hours old: `loop-agent`'s `s1`…`s7` made one `gpt-4o` call then called `search` 1 to 7 times, and `cap3` called `Search` three times; `mini-agent`'s `lit` called a tool literally named `search×2` once and `two` called `search` twice, each between two `gpt-4o-mini` calls | `GET /v1/fate/map?agent=loop-agent&min_support=1` (and `mini-agent`) |
+| `blame_unconfirmed.json` | `blame`: three `Edit` calls writing `let total = items.len();` into `/srv/shop/src/cart.rs`, one run each: one with status `error` and Claude Code's not-found result, one with no status and no result, one with status `ok` and a result | `GET /v1/blame?path=src/cart.rs&line=let total = items.len();` |
+| `changes_params.json` | `params`: 120 runs of `tuned-bot`, whose `gen_ai.request.stop` once spelled out a temperature and whose `max_tokens` was text, then became `stop="END"`, `temperature=0.7` and `max_tokens=1024` (error rate 0% → 40%); and 120 runs of `triage-bot`, whose one-word prompt edit moved success from 8 of 8 ended runs to 0 of 8, every other run declaring `session.outcome=escalated`; all on `gpt-6.1-sol` | `GET /v1/changes` |
+| `cache_long.json` | `long`: three `claude-sonnet-5-5` calls of `long-ctx-1`: 2,000 one-line turns, the same with an instruction put ahead of them, and that with one more turn | `GET /v1/cache/long-ctx-1` |
+| `xray_unread.json` | `unread`, on a server run with `--payload-threshold-bytes 200`: two `claude-sonnet-5-5` calls of `unread-1` in one conversation, the first's two instructions inline, the second's request (the same two and a long question) offloaded | `GET /v1/xray/0ff10ad0000000000000000000000000/00000000000000d1?resolve=false` |
+| `fate_map_loops.json`, `fate_map_mini.json` | `loops`: ten completed runs, three hours old: `loop-agent`'s `s1`…`s7` made one `gpt-6.1-sol` call then called `search` 1 to 7 times, and `cap3` called `Search` three times; `mini-agent`'s `lit` called a tool literally named `search×2` once and `two` called `search` twice, each between two `gpt-6-luna` calls | `GET /v1/fate/map?agent=loop-agent&min_support=1` (and `mini-agent`) |
 | `tql_loops.json` | The same store | For every node of `fate_map_loops.json`, `GET /v1/trajectories/search?q=…&agent=loop-agent&limit=100` with the query the dashboard's **Find these runs** sends, and the one the wave-3 dashboard sent; the file maps each query to its answer |
-| `changes_tenants.json` | 60 runs each of `support-agent` in tenants `acme` and `globex`, `service.version` 1.0.0 then 1.1.0 (globex's error rate 7% → 33%) | `GET /v1/changes` in the operator view |
+| `changes_tenants.json` | `tenants`: 60 runs each of `support-agent` in tenants `acme` and `globex`, on `gpt-6.1-sol`, `service.version` 1.0.0 then 1.1.0 (globex's error rate 7% → 33%) | `GET /v1/changes` in the operator view |
 
-The Live screen's `../live_stream_removed.txt` is `GET /v1/runs/live/stream`
-from a server run with `--fuse-max-runs 1 --live-window-seconds 3`: one run,
-then a second that took the guard's one slot (the first `evicted`), then
-three quiet seconds (the second `expired`).
+The Live screen's `../live_stream_removed.txt` is the `removed` store,
+written to `ui/src/test/fixtures`: `GET /v1/runs/live/stream` from a server
+run with `--fuse-max-runs 1 --live-window-seconds 3`. One run, then a second
+that took the guard's one slot (the first `evicted`), then three quiet
+seconds (the second `expired`).

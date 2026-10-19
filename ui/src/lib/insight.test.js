@@ -97,12 +97,12 @@ describe('the Fate Map', () => {
     expect(branchWidth(90, 180)).toBe(9);
     expect(branchWidth(1, 180)).toBe(1.5);
     const layout = layoutFate(supportMap.root);
-    const loop = layout.byKey.get(pathKey(['llm:gpt-4o', 'tool:search_orders×3-5']));
+    const loop = layout.byKey.get(pathKey(['llm:gpt-6.1-sol', 'tool:search_orders×3-5']));
     expect(loop.stroke).toBeCloseTo((50 / 180) * 18);
   });
 
   it('folds a collapsed branch and says how many children it hides', () => {
-    const key = pathKey(['llm:gpt-4o']);
+    const key = pathKey(['llm:gpt-6.1-sol']);
     const layout = layoutFate(supportMap.root, { collapsed: new Set([key]) });
     expect(layout.nodes).toHaveLength(2);
     expect(layout.byKey.get(key).hiddenChildren).toBe(3);
@@ -118,7 +118,7 @@ describe('the Fate Map', () => {
     expect(layout.edges.map((edge) => edge.to.key).sort()).toEqual(layout.nodes.slice(1).map((entry) => entry.key).sort());
     // The first keeps its plain path, so a link, a fork or a run's path that
     // names it by its text still opens it.
-    expect(twins[0].key).toBe(pathKey(['llm:gpt-4o-mini', 'tool:search×2']));
+    expect(twins[0].key).toBe(pathKey(['llm:gpt-6-luna', 'tool:search×2']));
     expect(nodeAtKey(miniMap.root, twins[0].key)).toBe(twins[0].node);
     expect(nodeAtKey(miniMap.root, twins[1].key)).toBe(twins[1].node);
     expect(nodeAtKey(miniMap.root, twins[1].key).example_runs.map((e) => e.run)).toEqual(['two']);
@@ -129,7 +129,7 @@ describe('the Fate Map', () => {
     expect(folded.nodes).toHaveLength(layout.nodes.length - 1);
     expect(folded.byKey.get(twins[0].key).hiddenChildren).toBe(0);
     // A key reads back as the tokens of its path, for display and search.
-    expect(keyTokens(twins[1].key)).toEqual(['llm:gpt-4o-mini', 'tool:search×2']);
+    expect(keyTokens(twins[1].key)).toEqual(['llm:gpt-6-luna', 'tool:search×2']);
     expect(keyTokens('')).toEqual([]);
     expect(nodeAtKey(miniMap.root, '')).toBe(miniMap.root);
     expect(nodeAtKey(miniMap.root, twins[1].key + '\u0001tool:nope')).toBeNull();
@@ -138,7 +138,7 @@ describe('the Fate Map', () => {
   it('opens the branch a fork or hotspot entry describes, where two read the same', () => {
     const [mini] = miniMap.root.children;
     const [first, second] = mini.children;
-    const entry = { path: ['llm:gpt-4o-mini', 'tool:search×2'], visits: second.visits, success_rate: second.success_rate };
+    const entry = { path: ['llm:gpt-6-luna', 'tool:search×2'], visits: second.visits, success_rate: second.success_rate };
     expect(nodeAtKey(miniMap.root, entryKey(miniMap.root, entry))).toBe(second);
     expect(nodeAtKey(miniMap.root, entryKey(miniMap.root, { ...entry, success_rate: first.success_rate }))).toBe(first);
     // A path the map does not draw keys as its text.
@@ -147,10 +147,10 @@ describe('the Fate Map', () => {
   });
 
   it('finds a node by path, and its means from the sums the map carries', () => {
-    const loop = nodeAt(supportMap.root, ['llm:gpt-4o', 'tool:search_orders×3-5']);
+    const loop = nodeAt(supportMap.root, ['llm:gpt-6.1-sol', 'tool:search_orders×3-5']);
     expect(loop.visits).toBe(50);
     expect(loop.fatal_fork).toBe(true);
-    expect(nodeAt(supportMap.root, ['llm:gpt-4o', 'tool:nope'])).toBeNull();
+    expect(nodeAt(supportMap.root, ['llm:gpt-6.1-sol', 'tool:nope'])).toBeNull();
     const means = nodeMeans(loop);
     expect(means.cost).toBeCloseTo(loop.cost_usd_sum / 50);
     expect(means.durationNs).toBeCloseTo(loop.duration_ns_sum / 50);
@@ -158,21 +158,21 @@ describe('the Fate Map', () => {
 
   it('lights a live run up to its open last step, pooled with the bucket it may still grow into', () => {
     const lit = runOnMap(supportMap.root, healthy);
-    const refund = ['llm:gpt-4o', 'tool:search_orders', 'llm:gpt-4o', 'tool:issue_refund'];
+    const refund = ['llm:gpt-6.1-sol', 'tool:search_orders', 'llm:gpt-6.1-sol', 'tool:issue_refund'];
     expect(lit.atKey).toBe(pathKey(refund));
     expect(lit.keys.has(pathKey(refund))).toBe(true);
     expect([...lit.pooled].sort()).toEqual([pathKey(refund), pathKey([...refund.slice(0, 3), 'tool:issue_refund×2'])].sort());
-    expect(lit.recommendedKey).toBe(pathKey([...refund, 'llm:gpt-4o']));
+    expect(lit.recommendedKey).toBe(pathKey([...refund, 'llm:gpt-6.1-sol']));
     expect(lit.unmatched).toEqual([]);
   });
 
   it('marks where a novel run left the known paths', () => {
     const lit = runOnMap(supportMap.root, novel);
-    expect(lit.atKey).toBe(pathKey(['llm:gpt-4o']));
+    expect(lit.atKey).toBe(pathKey(['llm:gpt-6.1-sol']));
     expect(lit.unmatched).toEqual(['tool:delete_database']);
     expect(lit.divergence.took).toBe('tool:delete_database');
-    expect(lit.recommendedKey).toBe(pathKey(['llm:gpt-4o', 'tool:search_orders']));
-    expect(runOnMap(supportMap.root, doomed).atKey).toBe(pathKey(['llm:gpt-4o', 'tool:search_orders×3-5']));
+    expect(lit.recommendedKey).toBe(pathKey(['llm:gpt-6.1-sol', 'tool:search_orders']));
+    expect(runOnMap(supportMap.root, doomed).atKey).toBe(pathKey(['llm:gpt-6.1-sol', 'tool:search_orders×3-5']));
   });
 
   it('places nothing on a map drawn shorter than where foresight judged the run, and says how far it got', () => {
@@ -183,8 +183,8 @@ describe('the Fate Map', () => {
     expect(cut.walked).toBe(2);
     expect(cut.matchedDepth).toBe(4);
     expect(cut.atKey).toBeNull();
-    expect(cut.reachedKey).toBe(pathKey(['llm:gpt-4o', 'tool:search_orders']));
-    expect([...cut.keys].sort()).toEqual([pathKey([]), pathKey(['llm:gpt-4o']), pathKey(['llm:gpt-4o', 'tool:search_orders'])].sort());
+    expect(cut.reachedKey).toBe(pathKey(['llm:gpt-6.1-sol', 'tool:search_orders']));
+    expect([...cut.keys].sort()).toEqual([pathKey([]), pathKey(['llm:gpt-6.1-sol']), pathKey(['llm:gpt-6.1-sol', 'tool:search_orders'])].sort());
     expect(cut.pooled.size).toBe(0);
     expect(cut.recommendedKey).toBeNull();
     // Pruned rather than cut: at min support 100 the doomed run's loop
@@ -196,28 +196,28 @@ describe('the Fate Map', () => {
     // A novel run's divergence is drawn only from the node it diverged at.
     const ghost = runOnMap(supportMin100.root, novel);
     expect(ghost.complete).toBe(true);
-    expect(ghost.atKey).toBe(pathKey(['llm:gpt-4o']));
+    expect(ghost.atKey).toBe(pathKey(['llm:gpt-6.1-sol']));
     expect(ghost.divergence.took).toBe('tool:delete_database');
     expect(runOnMap(supportMap.root, healthy).complete).toBe(true);
   });
 
   it('turns a path into the TQL that finds the runs which took it: signatures, the last repeat held to its bucket', () => {
-    expect(pathToTql(['llm:gpt-4o', 'tool:search_orders×3-5'])).toBe(
-      '^llm[signature="llm:gpt-4o"] -> tool[signature="tool:search_orders"]{3,5}$'
-      + ' | ^llm[signature="llm:gpt-4o"] -> tool[signature="tool:search_orders"]{3,5} -> step[signature!="tool:search_orders"]');
+    expect(pathToTql(['llm:gpt-6.1-sol', 'tool:search_orders×3-5'])).toBe(
+      '^llm[signature="llm:gpt-6.1-sol"] -> tool[signature="tool:search_orders"]{3,5}$'
+      + ' | ^llm[signature="llm:gpt-6.1-sol"] -> tool[signature="tool:search_orders"]{3,5} -> step[signature!="tool:search_orders"]');
     // Six or more has no upper bound: nothing to hold the last token to.
-    expect(pathToTql(['llm:gpt-4o', 'tool:issue_refund×2', 'agent:x×6+']))
-      .toBe('^llm[signature="llm:gpt-4o"] -> tool[signature="tool:issue_refund"]{2} -> agent[signature="agent:x"]{6,}');
+    expect(pathToTql(['llm:gpt-6.1-sol', 'tool:issue_refund×2', 'agent:x×6+']))
+      .toBe('^llm[signature="llm:gpt-6.1-sol"] -> tool[signature="tool:issue_refund"]{2} -> agent[signature="agent:x"]{6,}');
     expect(pathToTql(['tool:say "hi"\\now'])).toContain('tool[signature="tool:say \\"hi\\"\\\\now"]');
     expect(pathToTql(['llm:a-very-long-cut-name…'])).toBeNull();
     // The fold token stands for every deeper run: no query says exactly which.
-    expect(pathToTql(['llm:gpt-4o', '…'])).toBeNull();
+    expect(pathToTql(['llm:gpt-6.1-sol', '…'])).toBeNull();
     expect(pathToTql([])).toBeNull();
-    expect(pathToTql(cc.path)).toMatch(/^\^llm\[signature="llm:claude-sonnet-4-5-20250929"\] -> tool\[signature="tool:Read"\]/);
+    expect(pathToTql(cc.path)).toMatch(/^\^llm\[signature="llm:claude-opus-5-5"\] -> tool\[signature="tool:Read"\]/);
   });
 
   it('splits and shortens tokens without losing the repeat bucket', () => {
-    expect(splitToken('llm:claude-sonnet-4-5')).toEqual({ kind: 'llm', name: 'claude-sonnet-4-5' });
+    expect(splitToken('llm:claude-sonnet-5-5')).toEqual({ kind: 'llm', name: 'claude-sonnet-5-5' });
     expect(splitToken('^')).toEqual({ kind: '', name: '^' });
     expect(shortName('search_orders_for_the_customer×3-5', 16)).toBe('search_orde…×3-5');
     expect(shortName('short', 16)).toBe('short');
@@ -261,10 +261,10 @@ describe('the Fate Map', () => {
 
 describe('Find these runs', () => {
   // Each loop-agent run's own path, from its id: `s<n>` called `search` n
-  // times after one gpt-4o call, `cap3` called `Search` three times.
+  // times after one gpt-6.1-sol call, `cap3` called `Search` three times.
   const bucket = (n) => (n === 1 ? '' : n === 2 ? '×2' : n <= 5 ? '×3-5' : '×6+');
-  const pathOf = (run) => (run === 'cap3' ? ['llm:gpt-4o', 'tool:Search×3-5']
-    : ['llm:gpt-4o', `tool:search${bucket(Number(run.slice(1)))}`]);
+  const pathOf = (run) => (run === 'cap3' ? ['llm:gpt-6.1-sol', 'tool:Search×3-5']
+    : ['llm:gpt-6.1-sol', `tool:search${bucket(Number(run.slice(1)))}`]);
   const nodes = [];
   (function walk(node, path) {
     for (const child of node.children || []) {
@@ -292,9 +292,9 @@ describe('Find these runs', () => {
     // `search×2` called once and `search` called twice: one text, two branches.
     const [mini] = miniMap.root.children;
     expect(mini.children.map((c) => c.token)).toEqual(['tool:search×2', 'tool:search×2']);
-    expect(pathToTql(['llm:gpt-4o-mini', 'tool:search×2'], miniMap.root)).toBeNull();
-    expect(pathToTql(['llm:gpt-4o-mini', 'tool:search×2', 'llm:gpt-4o-mini'], miniMap.root)).toBeNull();
-    expect(pathToTql(['llm:gpt-4o-mini'], miniMap.root)).not.toBeNull();
+    expect(pathToTql(['llm:gpt-6-luna', 'tool:search×2'], miniMap.root)).toBeNull();
+    expect(pathToTql(['llm:gpt-6-luna', 'tool:search×2', 'llm:gpt-6-luna'], miniMap.root)).toBeNull();
+    expect(pathToTql(['llm:gpt-6-luna'], miniMap.root)).not.toBeNull();
     // A name that itself holds the mark: where it ends cannot be read.
     expect(pathToTql(['tool:x×2×2'])).toBeNull();
   });

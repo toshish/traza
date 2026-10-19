@@ -58,12 +58,15 @@ describe('a search', () => {
     expect(go).toHaveBeenCalledWith(['run', 'fix-parser-7'], { step: '5', tenant: '' });
     fireEvent.click(within(match).getByTitle('step 31: tool Edit'));
     expect(go).toHaveBeenCalledWith(['run', 'fix-parser-7'], { step: '31', tenant: '' });
-    expect(screen.getByTestId('tql-results').textContent).toContain('351 of 351 runs scanned');
+    expect(screen.getByTestId('tql-results').textContent).toContain('519 of 519 runs scanned');
   });
 
   it('reaches back a year for the imported Claude Code session, which edited after a failing test', async () => {
-    await show('window=1y&q=' + encodeURIComponent('test[error] ..> edit'));
+    // Unscoped, the year's first 50 matches are all newer runs: the search
+    // names the session's agent.
+    await show('window=1y&agent=claude-code&q=' + encodeURIComponent('test[error] ..> edit'));
     expect(api.trajectories.mock.calls[0][0].since).toMatch(/^\d{19}$/);
+    expect(api.trajectories.mock.calls[0][0].agent).toBe('claude-code');
     const runs = screen.getAllByTestId('tql-match').map((m) => m.textContent);
     expect(runs.some((t) => t.includes('11111111-1111-4111-8111-111111111111'))).toBe(true);
   });
@@ -71,7 +74,7 @@ describe('a search', () => {
   it('continues a page with the cursor the server gave, never with a window of its own', async () => {
     api.trajectories.mockImplementation(async (params) => (params.cursor ? page2 : page1));
     await show('window=1y&q=' + encodeURIComponent('test[error] ..> edit'));
-    expect(screen.getAllByTestId('tql-match').map((m) => m.textContent).join()).toContain('fix-parser-7');
+    expect(screen.getAllByTestId('tql-match').map((m) => m.textContent).join()).toContain('live-ci-healthy-0');
     fireEvent.click(screen.getByText('Continue with the runs not yet checked'));
     const routed = new URLSearchParams(window.location.hash.split('?')[1]);
     expect(routed.get('cursor')).toBe(page1.next_cursor);
@@ -83,7 +86,7 @@ describe('a search', () => {
     await show('window=1y&q=' + encodeURIComponent('test[error] ..> edit') + '&cursor=' + encodeURIComponent(page1.next_cursor));
     expect(api.trajectories).toHaveBeenCalledWith(expect.objectContaining({ cursor: page1.next_cursor, since: undefined }), expect.anything());
     expect(screen.getByTestId('tql-results').textContent).toContain('continued from the page before');
-    expect(screen.getAllByTestId('tql-match').map((m) => m.textContent).join()).toContain('thrash-3');
+    expect(screen.getAllByTestId('tql-match').map((m) => m.textContent).join()).toContain('fix-parser-7');
     expect(screen.getByText('Continue with the runs not yet checked')).toBeTruthy();
     api.trajectories.mockImplementation(async (params) => (params.since ? ccSearch : tamper));
   });
@@ -156,10 +159,10 @@ describe('the detector library', () => {
     const { go } = await show();
     const rows = screen.getAllByTestId('detector').map((d) => d.textContent);
     expect(rows[0]).toContain('Edited the tests to make them pass');
-    expect(rows[0]).toContain('1 of 351 runs');
+    expect(rows[0]).toContain('1 of 519 runs');
     expect(rows).toHaveLength(findings.detectors.filter((d) => d.runs_matched).length);
     const panel = screen.getByTestId('findings').textContent;
-    expect(panel).toContain('62.0%');
+    expect(panel).toContain('62.7%');
     expect(panel).toContain('No findings in this window:');
     expect(panel).toContain('Agents handing work back and forth');
     fireEvent.click(screen.getAllByText('giveup-5')[0]);
@@ -168,10 +171,10 @@ describe('the detector library', () => {
 
   it("draws a detector's success rate with its interval, and calls it worse only when the interval says so", async () => {
     await show();
-    // One run matched, and failed: 0% of 1 cannot be told from the 62.0% baseline.
+    // One run matched, and failed: 0% of 1 cannot be told from the 62.7% baseline.
     const row = screen.getAllByTestId('detector').find((d) => d.textContent.includes('hallucinated_tool'));
     expect(row.textContent).toContain('0% of 1 known');
-    expect(within(row).getByRole('img', { name: /success 0\.0%, 95% interval 0\.0–79\.3%, base rate 62\.0%/ })).toBeTruthy();
+    expect(within(row).getByRole('img', { name: /success 0\.0%, 95% interval 0\.0–79\.3%, base rate 62\.7%/ })).toBeTruthy();
     expect(within(row).getByTestId('detector-rate').style.color).not.toBe('var(--error)');
   });
 

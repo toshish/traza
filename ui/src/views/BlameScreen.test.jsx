@@ -44,11 +44,11 @@ describe('blame', () => {
     expect(match).toContain('MultiEdit');
     expect(match).toContain('in sub-agent general-purpose');
     expect(match).toContain('Add a price field to Item in src/item.rs');
-    expect(match).toContain('claude-haiku-4-5-20251001');
+    expect(match).toContain('claude-haiku-5-5');
     expect(match).toContain('/tmp/demo-shop/src/item.rs');
     fireEvent.click(screen.getByText('Open the step on its tape'));
     expect(go).toHaveBeenCalledWith(['run', '11111111-1111-4111-8111-111111111111'], { tenant: '', step: '10' });
-    expect(screen.getByTestId('blame-matches').textContent).toContain('from 14 edit calls checked in every project');
+    expect(screen.getByTestId('blame-matches').textContent).toContain('from 110 edit calls checked in every project');
   });
 
   it('names the applied edit, and lists an edit with no result recorded after it as an attempt', async () => {

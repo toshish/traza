@@ -64,7 +64,7 @@ describe('the Cache Autopsy', () => {
     await show('fix-parser-7', 'step=30&tenant=');
     expect(api.cache).toHaveBeenCalledWith('fix-parser-7', { tenant: '', ttl_seconds: undefined }, expect.anything());
     expect(screen.getByTestId('tile-breaks').textContent).toContain('3');
-    expect(screen.getByTestId('tile-cost').textContent).toContain('0.00578');
+    expect(screen.getByTestId('tile-cost').textContent).toContain('0.00406');
     const calls = screen.getAllByTestId('cache-call');
     expect(calls).toHaveLength(19);
     expect(calls.map((c) => c.getAttribute('data-cause')).filter((c) => c !== 'stable'))

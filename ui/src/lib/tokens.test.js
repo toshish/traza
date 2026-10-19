@@ -15,14 +15,14 @@ describe('cacheConvention', () => {
     expect(cacheConvention('aws.bedrock', 'anything')).toBe('exclusive');
     expect(cacheConvention('openai')).toBe('inclusive');
     expect(cacheConvention('azure.ai.openai')).toBe('inclusive');
-    expect(cacheConvention('gcp.vertex_ai', 'Claude-Sonnet-4@2025')).toBe('exclusive');
-    expect(cacheConvention('gcp.vertex_ai', 'gemini-2.5-pro')).toBe('inclusive');
+    expect(cacheConvention('gcp.vertex_ai', 'Claude-Sonnet-5-5@2026')).toBe('exclusive');
+    expect(cacheConvention('gcp.vertex_ai', 'gemini-3.8-flash')).toBe('inclusive');
     expect(cacheConvention('gcp.vertex_ai', 'llama-3')).toBe('unknown');
     expect(cacheConvention('gcp.vertex_ai')).toBe('unknown');
     // OpenInference host names, and a provider not in the table.
     expect(cacheConvention('aws')).toBe('unknown');
-    expect(cacheConvention('openrouter', 'claude-sonnet-4-5')).toBe('unknown');
-    expect(cacheConvention(undefined, 'claude-sonnet-4-5')).toBe('unknown');
+    expect(cacheConvention('openrouter', 'claude-sonnet-5-5')).toBe('unknown');
+    expect(cacheConvention(undefined, 'claude-sonnet-5-5')).toBe('unknown');
   });
 });
 
