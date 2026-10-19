@@ -65,6 +65,17 @@ use serde_json::{json, Value};
 use traza::tail::{TailCursor, TailRead};
 use traza::{CompactionConfig, Config, Durability, Profile, Span, SpanCursor, SpanFilter, Store};
 
+// Tapes, replays, diffs and recall: their routes live beside this file.
+#[path = "traza-server/replay_routes.rs"]
+mod replay_routes;
+// Trajectory queries and the detector library.
+#[path = "traza-server/tql_routes.rs"]
+mod tql_routes;
+
+// Agent Blame: its route lives beside this file.
+#[path = "traza-server/blame_routes.rs"]
+mod blame_routes;
+
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 // Headers get a far tighter budget than bodies: without one, a 64 MiB
 // garbage "header" plus a 64 MiB declared body doubles the documented
@@ -164,12 +175,16 @@ impl RouteClass {
             (_, traza::mcp::ENDPOINT) => Self::Mcp,
             ("POST", "/v1/spans" | "/v1/traces") => Self::Ingest,
             ("GET", "/v1/spans") => Self::Search,
+            ("GET", blame_routes::BLAME) => Self::Search,
             // Long-lived responses, held open by the consumer rather than by
             // the server's own work. Export moved out of `search` with the
             // tail: its duration tracks dataset size, so it was already
             // dragging the search percentiles toward whatever the largest
             // export happened to be.
             ("GET", "/v1/export" | "/v1/tail") => Self::Stream,
+            // A long-poll is held open by the consumer's wait, not by work.
+            ("GET", "/v1/fuses/events") => Self::Stream,
+            ("GET", traza::steer::http::LIVE_STREAM) => Self::Stream,
             ("GET", path) if path.starts_with("/v1/stats") => Self::Stats,
             ("GET", "/v1/sessions") => Self::Stats,
             ("GET", path)
@@ -180,6 +195,20 @@ impl RouteClass {
                 Self::Lookup
             }
             ("GET", "/v1/annotations") => Self::Lookup,
+            ("GET", path) if path.starts_with("/v1/tapes/") => Self::Lookup,
+            // A run read by id, as a tape is; the live listing is answered
+            // from memory alone, as the fuse routes in `other` are.
+            ("GET", path) if path.starts_with("/v1/runs/") && path.ends_with("/topology") => {
+                Self::Lookup
+            }
+            ("GET", path) if traza::xray::http::handles(path) => Self::Lookup,
+            ("GET", "/v1/diff" | "/v1/recall") => Self::Stats,
+            ("GET", path) if path.starts_with("/v1/fate/") => Self::Stats,
+            ("GET", traza::radar::ROUTE) => Self::Stats,
+            ("GET", path) if tql_routes::handles(path) => Self::Stats,
+            // Fork listings read and diff many runs; golden listings fold
+            // tagged spans and annotations.
+            ("GET", "/v1/forks" | "/v1/goldens") => Self::Stats,
             _ => Self::Other,
         }
     }
@@ -630,6 +659,10 @@ default 30000; streams and erasure work are exempt)] \
 [--tail-ring-spans N (live-tail replay depth; default 8192)] \
 [--tail-ring-bytes N (live-tail memory ceiling, whichever bound binds first; \
 default 32MiB)] \
+[--max-span-attributes N (default 1024)] [--max-attribute-key-bytes N (default 256)] \
+[--max-span-events N (default 1024)] [--max-span-bytes N (as stored, after payload offload; \
+default 4MiB)] [--max-batch-spans N (default 100000)] \
+(admission caps: a violating batch is refused whole with 400; 0 disables each) \
 [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] \
 [--pricing FILE (per-model rates, to derive a cost for LLM spans that did not meter one; \
 a metered llm.cost_usd always wins)] \
@@ -639,13 +672,43 @@ a metered llm.cost_usd always wins)] \
 [--mcp-max-result-bytes N (default 32768)] [--mcp-max-payload-bytes N (default 262144)] \
 [--mcp-allowed-origin ORIGIN (repeatable; browser origins allowed to drive /v1/mcp \
 besides loopback)] \
+[--fuse-max-cost-usd F] [--fuse-max-tokens N] [--fuse-max-steps N] \
+[--fuse-max-duration-seconds N] [--fuse-max-repeats N (default 12)] \
+[--fuse-repeat-window-steps N (the steps max-repeats counts over; default 50, at most 1000)] \
+[--fuse-max-error-streak N] [--fuse-max-handoff-cycles N] \
+(the global default run-fuse policy; 0 removes a limit) \
+[--fuse-action stop|warn (default warn)] [--fuse-max-runs N (live runs kept; default 100000)] \
+[--no-fuses (do not observe runs; every /v1/fuses route answers 409)] \
+[--fate-max-runs N (completed runs per Fate Map cohort, newest first; default 20000)] \
+[--fate-max-nodes N (Fate Map tree nodes per build; default 50000)] \
+[--fate-cache-seconds N (how long a Fate Map build is served; 0 disables the cache and the \
+predictive fuses; default 300)] \
+[--fate-tenant-maps N (tenants whose default-window Fate Map, the one predictive fuses read, \
+stays cached; default 32)] \
+[--fate-build-seconds N (budget of a background Fate Map build, never less than the query \
+deadline; default 120)] \
+[--live-window-seconds N (how recent a run's activity must be for GET /v1/runs/live; \
+default 900)] \
+[--tape-max-bytes N (payload bytes one tape or replay inlines; default 8MiB)] \
+[--xray-stale-steps N (steps after which an unreferenced tool result is stale in the \
+context X-Ray; default 20)] \
+[--radar-max-runs N (runs one change analysis reads, the newest; default 20000)] \
 [--allow-unauthenticated-non-loopback] [--version] \
 [--restore BACKUP_DIR (install a backup into --data-dir, then serve it)]\n\
        traza-server mcp --url URL [--token TOKEN] \
 (stdio bridge: speaks MCP on stdin/stdout and forwards to a running server)\n\
        traza-server verify --erasure ID|latest [--data-dir DIR] [--json] \
 (offline erasure receipt: re-checks every domain and prints the result of each; \
-exits 0 erased-and-conclusive, 3 erased-but-inconclusive, 2 not erased)";
+exits 0 erased-and-conclusive, 3 erased-but-inconclusive, 2 not erased)\n\
+       traza-server verify --ledger [--data-dir DIR] [--json] \
+(offline ledger verification: recomputes every head, checks the latest checkpoint names the \
+live manifest, re-digests its files; read-only; exits 0 intact, 2 broken)\n\
+       traza-server import claude-code|codex [--path DIR] [--watch] [--url URL [--token T] | \
+--data-dir DIR | --dry-run] [--tenant T] [--since DURATION] [--project-filter SUBSTR] \
+[--state FILE | --no-state] [--interval-ms N] [--json] \
+(record coding-agent transcripts as runs; --watch follows them live)\n\
+       traza-server blame FILE:LINE [--url URL] [--token T] [--tenant T] [--limit N] [--json] \
+(which agent step introduced this line; exits 0 found, 1 not found)";
 
 /// Everything the command line decides, with the profile already resolved
 /// against the explicit flags.
@@ -661,6 +724,10 @@ struct Options {
     profile: Profile,
     compaction_enabled: bool,
     mcp: McpOptions,
+    /// `--tape-max-bytes`: payload bytes one tape (or replay) inlines.
+    tape_max_bytes: usize,
+    /// `--radar-max-runs`: runs one change analysis reads.
+    radar_max_runs: usize,
     config: Config,
 }
 
@@ -725,6 +792,19 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut tail_ring_spans = traza::DEFAULT_TAIL_RING_SPANS;
     let mut tail_ring_bytes = traza::DEFAULT_TAIL_RING_BYTES;
     let mut wal_commit_window_us: Option<u64> = None;
+    // Admission caps; 0 disables each, like every other bound here.
+    let mut max_span_attributes = traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES as u64;
+    let mut max_attribute_key_bytes = traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES as u64;
+    let mut max_span_events = traza::caps::DEFAULT_MAX_SPAN_EVENTS as u64;
+    let mut max_span_bytes = traza::caps::DEFAULT_MAX_SPAN_BYTES as u64;
+    let mut max_batch_spans = traza::caps::DEFAULT_MAX_BATCH_SPANS as u64;
+    let cap = |value: u64| (value > 0).then_some(value as usize);
+    let mut fuses = traza::guard::FuseConfig::default();
+    let mut fate = traza::fate::FateConfig::default();
+    let mut steer = traza::steer::SteerConfig::default();
+    let mut tape_max_bytes = traza::tape::DEFAULT_TAPE_MAX_BYTES;
+    let mut xray_stale_steps = traza::xray::DEFAULT_STALE_STEPS;
+    let mut radar_max_runs = traza::radar::DEFAULT_MAX_RUNS;
 
     let value = |i: usize, name: &str| -> Result<&String, String> {
         args.get(i)
@@ -822,6 +902,26 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 i += 1;
                 wal_commit_window_us = Some(number(i, "--wal-commit-window-us")?);
             }
+            "--max-span-attributes" => {
+                i += 1;
+                max_span_attributes = number(i, "--max-span-attributes")?;
+            }
+            "--max-attribute-key-bytes" => {
+                i += 1;
+                max_attribute_key_bytes = number(i, "--max-attribute-key-bytes")?;
+            }
+            "--max-span-events" => {
+                i += 1;
+                max_span_events = number(i, "--max-span-events")?;
+            }
+            "--max-span-bytes" => {
+                i += 1;
+                max_span_bytes = number(i, "--max-span-bytes")?;
+            }
+            "--max-batch-spans" => {
+                i += 1;
+                max_batch_spans = number(i, "--max-batch-spans")?;
+            }
             // Content search still works without it — segments are scanned
             // rather than skipped — so this trades query latency for seal CPU
             // and about 1-2% of segment size.
@@ -901,8 +1001,128 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 mcp.allowed_origins
                     .push(origin.trim_end_matches('/').to_owned());
             }
+            // The global default fuse policy. `0` removes a limit, as it
+            // disables every other knob here.
+            "--fuse-max-cost-usd" => {
+                i += 1;
+                let raw = value(i, "--fuse-max-cost-usd")?;
+                let cost: f64 = raw
+                    .parse()
+                    .ok()
+                    .filter(|cost: &f64| cost.is_finite() && *cost >= 0.0)
+                    .ok_or("--fuse-max-cost-usd must be a non-negative number".to_owned())?;
+                fuses.limits.max_cost_usd = (cost > 0.0).then_some(cost);
+            }
+            "--fuse-max-tokens" => {
+                i += 1;
+                let limit = number(i, "--fuse-max-tokens")?;
+                fuses.limits.max_tokens = (limit > 0).then_some(limit);
+            }
+            "--fuse-max-steps" => {
+                i += 1;
+                let limit = number(i, "--fuse-max-steps")?;
+                fuses.limits.max_steps = (limit > 0).then_some(limit);
+            }
+            "--fuse-max-duration-seconds" => {
+                i += 1;
+                let limit = number(i, "--fuse-max-duration-seconds")?;
+                fuses.limits.max_duration_seconds = (limit > 0).then_some(limit);
+            }
+            "--fuse-max-repeats" => {
+                i += 1;
+                let limit = number(i, "--fuse-max-repeats")?;
+                if limit == 1 {
+                    return Err(
+                        "--fuse-max-repeats must be 0 (off) or at least 2 — a single \
+                                occurrence is not a repeat"
+                            .to_owned(),
+                    );
+                }
+                fuses.limits.max_repeats = (limit > 0).then_some(limit);
+            }
+            "--fuse-repeat-window-steps" => {
+                i += 1;
+                let window = number(i, "--fuse-repeat-window-steps")?;
+                if window == 0 || window > traza::guard::MAX_REPEAT_WINDOW_STEPS {
+                    return Err(format!(
+                        "--fuse-repeat-window-steps must be 1 to {}",
+                        traza::guard::MAX_REPEAT_WINDOW_STEPS
+                    ));
+                }
+                fuses.limits.repeat_window_steps = Some(window);
+            }
+            "--fuse-max-error-streak" => {
+                i += 1;
+                let limit = number(i, "--fuse-max-error-streak")?;
+                fuses.limits.max_error_streak = (limit > 0).then_some(limit);
+            }
+            "--fuse-max-handoff-cycles" => {
+                i += 1;
+                let limit = number(i, "--fuse-max-handoff-cycles")?;
+                fuses.limits.max_handoff_cycles = (limit > 0).then_some(limit);
+            }
+            "--live-window-seconds" => {
+                i += 1;
+                let seconds = number(i, "--live-window-seconds")?;
+                if seconds == 0 {
+                    return Err("--live-window-seconds must be at least 1".to_owned());
+                }
+                steer.live_window = Duration::from_secs(seconds);
+            }
+            "--fuse-action" => {
+                i += 1;
+                fuses.action = match value(i, "--fuse-action")?.as_str() {
+                    "stop" => traza::guard::Action::Stop,
+                    "warn" => traza::guard::Action::Warn,
+                    _ => return Err("--fuse-action must be stop|warn".to_owned()),
+                };
+            }
+            "--fuse-max-runs" => {
+                i += 1;
+                fuses.max_runs = (number(i, "--fuse-max-runs")? as usize).max(1);
+            }
+            "--no-fuses" => fuses.enabled = false,
+            "--fate-max-runs" => {
+                i += 1;
+                fate.max_runs = (number(i, "--fate-max-runs")? as usize).max(1);
+            }
+            "--fate-max-nodes" => {
+                i += 1;
+                fate.max_nodes = (number(i, "--fate-max-nodes")? as usize).max(1);
+            }
+            "--fate-cache-seconds" => {
+                i += 1;
+                fate.cache_ttl = Duration::from_secs(number(i, "--fate-cache-seconds")?);
+            }
+            "--fate-tenant-maps" => {
+                i += 1;
+                fate.tenant_maps = (number(i, "--fate-tenant-maps")? as usize).max(1);
+            }
+            "--fate-build-seconds" => {
+                i += 1;
+                fate.build_budget = Duration::from_secs(number(i, "--fate-build-seconds")?);
+            }
             "--allow-unauthenticated-non-loopback" => {
                 allow_unauthenticated_non_loopback = true;
+            }
+            "--tape-max-bytes" => {
+                i += 1;
+                tape_max_bytes = number(i, "--tape-max-bytes")? as usize;
+            }
+            "--xray-stale-steps" => {
+                i += 1;
+                let steps = number(i, "--xray-stale-steps")?;
+                if steps == 0 {
+                    return Err("--xray-stale-steps must be at least 1".to_owned());
+                }
+                xray_stale_steps = steps as usize;
+            }
+            "--radar-max-runs" => {
+                i += 1;
+                radar_max_runs = match number(i, "--radar-max-runs")? {
+                    0 => return Err("--radar-max-runs must be at least 1".to_owned()),
+                    runs => runs as usize,
+                };
             }
             "--help" | "-h" => {
                 println!("{USAGE}");
@@ -930,6 +1150,21 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         ));
     }
 
+    // Live runs keep their behaviour paths for foresight, which reads only
+    // cached Fate Maps: with the cache off, nothing would read them.
+    fuses.live_paths = !fate.cache_ttl.is_zero();
+    // A window narrower than the repeat limit could never trip it.
+    if let (Some(window), Some(repeats)) =
+        (fuses.limits.repeat_window_steps, fuses.limits.max_repeats)
+    {
+        if window < repeats {
+            return Err(format!(
+                "--fuse-repeat-window-steps {window} cannot hold --fuse-max-repeats {repeats} \
+                 repeats; widen the window to at least {repeats} steps"
+            ));
+        }
+    }
+
     Ok(Some(Options {
         data_dir,
         host,
@@ -941,6 +1176,8 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         profile,
         compaction_enabled,
         mcp,
+        tape_max_bytes,
+        radar_max_runs,
         config: Config {
             // Explicit flag beats profile beats built-in default, in that
             // order and regardless of where each appeared.
@@ -973,6 +1210,15 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             tail_ring_spans,
             tail_ring_bytes,
             pricing: std::sync::Arc::new(pricing),
+            max_span_attributes: cap(max_span_attributes),
+            max_attribute_key_bytes: cap(max_attribute_key_bytes),
+            max_span_events: cap(max_span_events),
+            max_span_bytes: cap(max_span_bytes),
+            max_batch_spans: cap(max_batch_spans),
+            fuses,
+            fate,
+            steer,
+            xray_stale_steps,
         },
     }))
 }
@@ -991,6 +1237,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
 fn run_verify(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut data_dir = PathBuf::from("./data");
     let mut erasure: Option<String> = None;
+    let mut ledger = false;
     let mut as_json = false;
     let mut i = 0;
     while i < args.len() {
@@ -1008,6 +1255,7 @@ fn run_verify(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         .clone(),
                 );
             }
+            "--ledger" => ledger = true,
             "--json" => as_json = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
@@ -1017,8 +1265,14 @@ fn run_verify(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         i += 1;
     }
+    if ledger {
+        if erasure.is_some() {
+            return Err("verify takes one of --erasure or --ledger, not both".into());
+        }
+        return run_verify_ledger(&data_dir, as_json);
+    }
     let Some(erasure) = erasure else {
-        return Err("verify requires --erasure <id|latest>".into());
+        return Err("verify requires --erasure <id|latest> or --ledger".into());
     };
 
     let store = match Store::open(&data_dir, Config::default()) {
@@ -1065,6 +1319,39 @@ fn run_verify(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `traza-server verify --ledger`: the ledger and the live generation,
+/// verified offline and read-only (see [`traza::ledger::verify_offline`]).
+/// Exits 0 when intact, 2 when anything is broken — every problem named, by
+/// entry or by file — and 1 when it cannot verify at all.
+fn run_verify_ledger(
+    data_dir: &std::path::Path,
+    as_json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let verification = match traza::ledger::verify_offline(data_dir) {
+        Ok(verification) => verification,
+        Err(traza::Error::AlreadyOpen) => {
+            return Err(format!(
+                "{} is owned by a live traza-server; ask that server instead: \
+                 GET /v1/ledger/verify returns the same verification",
+                data_dir.display()
+            )
+            .into())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match as_json {
+        true => println!(
+            "{}",
+            serde_json::to_string_pretty(&verification).unwrap_or_else(|_| "{}".to_owned())
+        ),
+        false => print!("{}", verification.render_text()),
+    }
+    if !verification.intact {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `traza-server mcp --url ...` is the stdio bridge, not a server. It opens
@@ -1073,10 +1360,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if args.first().map(String::as_str) == Some("mcp") {
         return run_mcp_bridge(&args[1..]);
     }
-    // `traza-server verify --erasure ...` produces the erasure receipt
-    // offline, against a data directory no live server owns.
+    // `traza-server verify --erasure ...` produces the erasure receipt, and
+    // `verify --ledger` the ledger verification, offline, against a data
+    // directory no live server owns.
     if args.first().map(String::as_str) == Some("verify") {
         return run_verify(&args[1..]);
+    }
+    // `traza-server import …` and `traza-server blame …` are clients: they
+    // read transcripts or a source file and talk to a server (or, for
+    // import, a data directory no server holds). See `traza::import`.
+    if let Some(command @ ("import" | "blame")) = args.first().map(String::as_str) {
+        let outcome = match command {
+            "import" => traza::import::import_main(&args[1..]),
+            _ => traza::import::blame_main(&args[1..]),
+        };
+        // Exit 1 is an answer for `blame` (no agent wrote the line), so a
+        // failure to answer at all exits 2.
+        match outcome {
+            Ok(0) => return Ok(()),
+            Ok(code) => std::process::exit(code),
+            Err(message) => {
+                eprintln!("traza-server: {message}");
+                std::process::exit(2);
+            }
+        }
     }
     let Some(options) = parse_args(&args)? else {
         return Ok(());
@@ -1092,23 +1399,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         profile,
         compaction_enabled,
         mcp,
+        tape_max_bytes,
+        radar_max_runs,
         config,
     } = options;
+    replay_routes::configure(tape_max_bytes);
+    traza::radar::configure(radar_max_runs);
     let durability = config.durability;
-    let ttl_seconds = config.ttl_seconds;
 
     // Bearer auth from TRAZA_TOKENS; unset is allowed on loopback by default.
     // A set-but-invalid value refuses startup — running open when the operator
-    // tried to configure auth would be the worst failure mode.
+    // tried to configure auth would be the worst failure mode. Runtime
+    // credentials (credentials.jsonl) count as configured auth too; the peek
+    // is read-only because the directory lock is not held yet.
     let auth_config = traza::auth::AuthConfig::from_env()
         .map_err(|error| format!("auth configuration: {error}"))?;
-    if auth_config.is_none() && !is_loopback_bind(&host) && !allow_unauthenticated_non_loopback {
+    if auth_config.is_none()
+        && !is_loopback_bind(&host)
+        && !allow_unauthenticated_non_loopback
+        && !traza::credentials::CredentialStore::has_api_credentials(&data_dir)?
+    {
         return Err(format!(
-            "refusing unauthenticated non-loopback bind {host}; configure TRAZA_TOKENS or pass --allow-unauthenticated-non-loopback explicitly"
+            "refusing unauthenticated non-loopback bind {host}; configure TRAZA_TOKENS, create a runtime credential (POST /v1/admin/credentials on a loopback start), or pass --allow-unauthenticated-non-loopback explicitly"
         )
         .into());
     }
-    let auth = Arc::new(auth_config);
     let metrics = Arc::new(ServerMetrics::default());
     // Latched before the first connection is accepted; see [`TEST_PANIC`].
     // Unset, empty, and "0" all disable — `TRAZA_TEST_PANIC=0` must not
@@ -1139,6 +1454,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => Store::open(&data_dir, config.clone())?,
     });
+    // The environment's credentials join the runtime ones; from here on the
+    // store's credential set is the only thing the auth gate consults.
+    if let Some(auth_config) = &auth_config {
+        engine
+            .credentials()
+            .install_env(auth_config, traza::mcp::unix_nanos_now())
+            .map_err(|error| format!("auth configuration: {error}"))?;
+    }
 
     // TTL enforcement, segment compaction, and the buffer's non-volume bounds
     // live in the engine; the server only schedules them. Compaction ticks far
@@ -1153,7 +1476,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // buffer bounds all switched off.
     {
         let maintainer = Arc::clone(&engine);
-        let ttl_enabled = ttl_seconds.is_some() || !config.tenant_ttl_seconds.is_empty();
         let _ = compaction_enabled;
         thread::Builder::new()
             .name("traza-maintenance".into())
@@ -1179,8 +1501,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(error) = maintainer.compact_segments() {
                         eprintln!("segment compaction failed: {error}");
                     }
-                    // TTL keeps its documented one-minute cadence.
-                    if ttl_enabled && ticks % 12 == 0 {
+                    // TTL keeps its documented one-minute cadence. Not gated
+                    // on the startup flags any more: a runtime limits
+                    // document can introduce a window, and with no window
+                    // anywhere the pass returns before taking a lock.
+                    if ticks % 12 == 0 {
                         if let Err(error) = maintainer.compact_expired() {
                             eprintln!("expiry compaction failed: {error}");
                         }
@@ -1200,6 +1525,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("checkpoint failed: {error}");
                         }
                     }
+                }
+            })?;
+    }
+    // Fate Maps the predictive fuses asked for are built here, off every
+    // request path: a fuse check reads only a cached map and never builds
+    // one. A thread of its own, because a build runs up to
+    // --fate-build-seconds and must not hold up compaction or an erasure
+    // resume.
+    {
+        let warmer = Arc::clone(&engine);
+        thread::Builder::new()
+            .name("traza-foresight".into())
+            .spawn(move || loop {
+                thread::sleep(std::time::Duration::from_secs(2));
+                if let Err(error) = warmer.maintain_fate() {
+                    eprintln!("fate map warm-up failed: {error}");
+                }
+            })?;
+    }
+    // Usage counters get a thread of their own rather than a slot in the
+    // maintenance tick: that tick runs a merge, an expiry pass or an erasure
+    // purge serially, any of which can take far longer than five seconds,
+    // and the documented crash-loss bound is the gap between two writes. The
+    // write is skipped when nothing changed, so an idle store does not fsync.
+    {
+        let persister = Arc::clone(&engine);
+        thread::Builder::new()
+            .name("traza-usage".into())
+            .spawn(move || loop {
+                thread::sleep(std::time::Duration::from_secs(5));
+                if let Err(error) = persister.persist_usage() {
+                    eprintln!("usage persistence failed: {error}");
                 }
             })?;
     }
@@ -1249,6 +1606,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             },
             mcp.limits.max_result_bytes,
         );
+    }
+
+    // The global fuse policy applies to every run no tenant policy governs,
+    // so what it will do is announced rather than discovered from a header.
+    match config.fuses.enabled {
+        true => eprintln!(
+            "traza-server: run fuses on — global policy: {} at {}",
+            config.fuses.action.as_str(),
+            serde_json::to_string(&config.fuses.limits).unwrap_or_default(),
+        ),
+        false => eprintln!("traza-server: run fuses off (--no-fuses)"),
     }
 
     // The dashboard is served from disk (ui/ `npm run build` output), never
@@ -1338,7 +1706,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         metrics.connections_accepted.increment();
         let connection_engine = Arc::clone(&engine);
-        let connection_auth = Arc::clone(&auth);
         let connection_ui = Arc::clone(&ui);
         let connection_metrics = Arc::clone(&metrics);
         let connection_mcp = Arc::clone(&mcp);
@@ -1349,7 +1716,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = handle_connection(
                     stream,
                     &connection_engine,
-                    &connection_auth,
                     &connection_ui,
                     &connection_metrics,
                     &connection_mcp,
@@ -1504,16 +1870,23 @@ fn forward(
 /// scheme and the path to `/`.
 fn split_url(url: &str) -> Result<(String, u16, String), Box<dyn std::error::Error>> {
     let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
-    if scheme == "https" {
-        return Err(
-            "the bridge speaks plain HTTP; put TLS termination in front of it, and \
-                    point --url at the plaintext side"
-                .into(),
-        );
-    }
     let (authority, path) = rest
         .split_once('/')
         .map_or((rest, String::new()), |(a, p)| (a, format!("/{p}")));
+    if scheme == "https" {
+        // The forwarder takes the origin and the bridge keeps its path; any
+        // user:password the URL carried is not repeated.
+        let origin = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, after)| after);
+        return Err(format!(
+            "the bridge speaks plain HTTP; to reach https://{origin}{path} over TLS, run `traza \
+             forward --upstream https://{origin}` (the Python SDK) and point --url at \
+             http://127.0.0.1:8089{path}, or point --url at the plaintext side of the server's \
+             TLS termination"
+        )
+        .into());
+    }
     let (host, port) = match authority.rsplit_once(':') {
         Some((host, port)) => (host.to_owned(), port.parse::<u16>()?),
         None => (authority.to_owned(), 80),
@@ -1547,7 +1920,6 @@ fn is_loopback_bind(host: &str) -> bool {
 fn handle_connection(
     stream: TcpStream,
     engine: &Store,
-    auth: &Option<traza::auth::AuthConfig>,
     ui: &traza::ui::UiRoot,
     metrics: &ServerMetrics,
     mcp: &McpOptions,
@@ -1574,47 +1946,35 @@ fn handle_connection(
             }
         };
         let started = std::time::Instant::now();
-        // A request answered WITHOUT reading its body leaves those bytes in
-        // the socket, where they would be read as the next request. Any such
-        // path must close.
-        let body_is_unread = head.content_length > 0;
+        // When the request arrived, on both clocks: a replay call is judged
+        // against its replay's expiry from here, so the time its body takes
+        // to arrive and be decoded, parsed and digested counts too.
+        let arrival = traza::replay::Arrival::at(traza::mcp::unix_nanos_now(), started);
         let keep_alive = head.wants_keep_alive();
 
-        // The dashboard SHELL is served before the auth gate: the page must
-        // load in a browser without credentials, while every /v1 call it makes
-        // below stays gated (the page attaches the bearer token itself).
-        // Static assets carry no stored data, so this leaks nothing.
-        if head.method == "GET" {
-            let path = percent_decode(
-                head.target
-                    .split_once('?')
-                    .map_or(head.target.as_str(), |(path, _)| path),
-            );
-            if let Some(file) = ui.resolve(&path) {
-                let mut responder = connection.responder(keep_alive && !body_is_unread);
-                responder.file(&file)?;
-                if responder.keep_alive {
-                    continue;
-                }
-                return Ok(());
+        // Answers that need no credential, decided from the head alone and
+        // all sent from here, so that consuming the request is not each
+        // route's job to remember. It is consumed BEFORE the answer: on a
+        // reused connection the next head must be parsed from where this
+        // request ends, and on a closing one the close must not find the
+        // client's bytes unread (which turns it into a reset that can beat
+        // the response). The declared body is discarded, never buffered, so
+        // this gives an unauthenticated client no way to make the server hold
+        // its bytes.
+        if let Some(answer) = pre_auth_answer(&head, ui) {
+            if let Err(error) = connection.discard_request() {
+                let mut responder = connection.responder(false);
+                return responder.json(400, json!({"error": error.to_string()}));
             }
-            if matches!(path.as_str(), "/" | "/dashboard" | "/dashboard/") {
-                let mut responder = connection.responder(keep_alive && !body_is_unread);
-                responder.json(
-                    404,
-                    json!({
-                        "error": "no dashboard build found",
-                        "next": format!(
-                            "build it with: cd ui && npm ci && npm run build (serving {})",
-                            ui.directory().display()
-                        ),
-                    }),
-                )?;
-                if responder.keep_alive {
-                    continue;
-                }
-                return Ok(());
+            let mut responder = connection.responder(keep_alive);
+            match answer {
+                PreAuthAnswer::Json(status, body) => responder.json(status, body)?,
+                PreAuthAnswer::File(file) => responder.file(&file)?,
             }
+            if keep_alive {
+                continue;
+            }
+            return Ok(());
         }
         // Auth verdicts need only the head: rejecting BEFORE the body read
         // means an unauthenticated client cannot make this server buffer
@@ -1645,12 +2005,20 @@ fn handle_connection(
         let is_eval_tombstone = head.method.eq_ignore_ascii_case("POST")
             && head_path.starts_with("/v1/datasets/")
             && head_path.ends_with("/tombstone");
+        // The pre-call fuse check is a READ that needs a body: an agent
+        // holding a read-only token must be able to ask whether its next step
+        // may run, so the method rule's POST-means-write does not apply.
+        let is_fuse_check =
+            head.method.eq_ignore_ascii_case("POST") && head_path == "/v1/fuses/check";
+        // Anchoring writes into the chain an auditor relies on: admin only,
+        // and (below) unbound only. The rule lives with the routes.
+        let is_ledger_admin = traza::ledger::requires_admin(&head.method, head_path);
         // Store-global operator surfaces. A bound (tenant-scoped) credential
         // is an untrusted principal in a multi-tenant deployment, and these
         // answer with the WHOLE store's numbers and controls — volumes that
         // disclose co-tenants, checkpoints and backups that move everyone's
         // data. Bound tokens get 403 here; their accounting surface is
-        // /v1/tenants.
+        // /v1/tenants (and /v1/usage).
         let is_operator_surface = matches!(
             head_path,
             "/v1/stats"
@@ -1659,59 +2027,90 @@ fn handle_connection(
                 | "/v1/verify"
                 | "/v1/checkpoint"
                 | "/v1/flush"
-        ) || head_path.starts_with("/v1/backups/");
-        let mut access = traza::mcp::Access::ReadWrite;
-        let mut principal: Option<traza::auth::Principal> = None;
-        if let Some(config) = auth {
-            let verdict = config
-                .principal_for(head.authorization.as_deref())
+        ) || head_path.starts_with("/v1/backups/")
+            || traza::ledger::operator_only(head_path);
+        // Backups need `admin` as well as an unbound credential: a pin holds
+        // every manifested byte on disk until it is released, so taking one
+        // is a capacity decision, not a write.
+        let is_backup = head_path.starts_with("/v1/backups/");
+        // The admin surfaces — credentials, tenant limits, and whatever is
+        // added under the prefix later — are unbound-admin only, decided by
+        // PREFIX rather than by a list, so a route added under /v1/admin/ is
+        // denied to bound and non-admin credentials before anyone remembers
+        // to list it.
+        let is_admin_surface = head_path == "/v1/admin" || head_path.starts_with("/v1/admin/");
+        let needs_admin = is_erasure_write
+            || is_eval_tombstone
+            || is_backup
+            || is_admin_surface
+            || is_ledger_admin;
+        // Replay routes are reads under any method, and their call routes
+        // also accept the token as `x-api-key`; see `replay_routes`.
+        let is_replay = replay_routes::is_replay_path(head_path);
+        let presented = replay_routes::presented_credential(
+            head.authorization.as_deref(),
+            head.x_api_key.as_deref(),
+            head_path,
+        );
+        let credentials = engine.credentials();
+        // The gate's verdict on a presented credential: who it is, then
+        // whether this route allows it. Run from the head, and run again
+        // after the body for a request the head admitted in open mode.
+        let authorize = |presented: Option<&str>| {
+            credentials
+                .authenticate(presented, traza::mcp::unix_nanos_now())
                 .and_then(|granted| {
-                    let allowed = if is_mcp {
+                    use traza::auth::{AuthFailure, Required};
+                    // Binding first: a bound credential on a store-global
+                    // surface is refused for WHAT it is, whatever its scope.
+                    if granted.tenant.is_some() && (is_operator_surface || is_admin_surface) {
+                        return Err(AuthFailure::Forbidden(Required::Unbound));
+                    }
+                    let allowed = if is_mcp || is_replay {
                         true
-                    } else if is_erasure_write || is_eval_tombstone {
-                        granted.scope.permits_erasure()
+                    } else if needs_admin {
+                        granted.scope == traza::auth::Scope::Admin
+                    } else if is_fuse_check {
+                        granted.scope.permits("GET")
                     } else {
                         granted.scope.permits(&head.method)
                     };
                     if !allowed {
-                        return Err(traza::auth::AuthFailure::Forbidden);
-                    }
-                    if granted.tenant.is_some() && is_operator_surface {
-                        return Err(traza::auth::AuthFailure::Forbidden);
+                        return Err(AuthFailure::Forbidden(if needs_admin {
+                            Required::Admin
+                        } else {
+                            Required::Rw
+                        }));
                     }
                     Ok(granted)
-                });
-            match verdict {
-                Ok(granted) => {
-                    access = match granted.scope {
-                        traza::auth::Scope::ReadOnly => traza::mcp::Access::Read,
-                        traza::auth::Scope::ReadWrite | traza::auth::Scope::Admin => {
-                            traza::mcp::Access::ReadWrite
-                        }
-                    };
-                    principal = Some(granted);
-                }
-                Err(failure) => {
-                    metrics.rejected.increment();
-                    let challenge = failure
-                        .www_authenticate()
-                        .map(|value| format!("WWW-Authenticate: {value}\r\n"))
-                        .unwrap_or_default();
-                    let body = failure.body();
-                    let reason = if failure.status() == 401 {
-                        "Unauthorized"
-                    } else {
-                        "Forbidden"
-                    };
-                    let mut responder = connection.responder(false);
-                    let head = format!(
-                        "HTTP/1.1 {} {reason}\r\n{challenge}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        failure.status(),
-                        body.len(),
-                    );
-                    return responder.raw(&head, body.as_bytes());
-                }
+                })
+        };
+        let mut principal: Option<traza::auth::Principal> = None;
+        let enforced = credentials.enforced();
+        if enforced {
+            match authorize(presented.as_deref()) {
+                Ok(granted) => principal = Some(granted),
+                Err(failure) => return refuse_auth(&mut connection, metrics, failure),
             }
+        }
+        // What the head alone can still refuse once authentication passed: a
+        // cross-site request to an admin-capability route in open mode, and
+        // an admin body not declared as JSON. The reasoning is on
+        // `traza::platform::screen`.
+        if let Some(reply) = traza::platform::screen(&traza::platform::Head {
+            method: &head.method,
+            path: head_path,
+            needs_admin,
+            enforced,
+            origin: head.origin.as_deref(),
+            content_type: &head.content_type,
+            content_length: head.content_length,
+        }) {
+            if reply.status == 403 {
+                metrics.rejected.increment();
+            }
+            let mut responder = connection.responder(false);
+            return responder.json(reply.status, reply.body);
         }
         let body = match connection.read_body(&head) {
             Ok(body) => body,
@@ -1720,13 +2119,36 @@ fn handle_connection(
                 return responder.json(400, json!({"error": error.to_string()}));
             }
         };
+        // The verdict above is as of the head, and the client decides how
+        // long its body takes to arrive. A request admitted in OPEN mode
+        // whose body lands after another request minted the first credential
+        // would otherwise act as the open-mode admin it no longer is — for as
+        // long as it cared to stall. So it authenticates now, exactly as if
+        // it had arrived after the bootstrap. This closes the window the
+        // client controls, on every route; the credential operations decide
+        // open mode once more under their own lock, which closes the rest
+        // for the one change that outlives the request.
+        if principal.is_none() && credentials.enforced() {
+            match authorize(presented.as_deref()) {
+                Ok(granted) => principal = Some(granted),
+                Err(failure) => return refuse_auth(&mut connection, metrics, failure),
+            }
+        }
+        let access = match principal.as_ref().map(|granted| granted.scope) {
+            Some(traza::auth::Scope::ReadOnly) => traza::mcp::Access::Read,
+            Some(traza::auth::Scope::ReadWrite | traza::auth::Scope::Admin) | None => {
+                traza::mcp::Access::ReadWrite
+            }
+        };
         let request = Request {
             method: head.method,
             target: head.target,
             content_type: head.content_type,
             origin: head.origin,
             mcp_protocol_version: head.mcp_protocol_version,
+            content_encoding: head.content_encoding,
             body,
+            arrival,
         };
         let mut responder = connection.responder(keep_alive);
         let class = RouteClass::of(&request.method, {
@@ -1762,6 +2184,91 @@ fn handle_connection(
         }
     }
     Ok(())
+}
+
+/// What a request answered before the auth gate gets back.
+enum PreAuthAnswer {
+    Json(u16, Value),
+    File(traza::ui::UiFile),
+}
+
+/// The answer to a request that needs no credential, or `None` when the
+/// request must go through the auth gate.
+///
+/// Decides only: [`handle_connection`] consumes the request and sends the
+/// answer, so a route added here cannot answer without consuming.
+fn pre_auth_answer(head: &RequestHead, ui: &traza::ui::UiRoot) -> Option<PreAuthAnswer> {
+    if head.method != "GET" {
+        return None;
+    }
+    let path = head
+        .target
+        .split_once('?')
+        .map_or(head.target.as_str(), |(path, _)| path);
+    // Liveness and readiness probes: a load balancer or orchestrator probing
+    // them holds no credential, and the answers carry nothing but the
+    // version. Not counted in the request metrics, which a probe every second
+    // would dominate.
+    match path {
+        "/healthz" => return Some(PreAuthAnswer::Json(200, traza::platform::health())),
+        "/readyz" => return Some(PreAuthAnswer::Json(200, traza::platform::readiness())),
+        _ => {}
+    }
+    // The dashboard SHELL: the page must load in a browser without
+    // credentials, while every /v1 call it makes stays gated (the page
+    // attaches the bearer token itself). Static assets carry no stored data,
+    // so this leaks nothing.
+    let path = percent_decode(path);
+    if let Some(file) = ui.resolve(&path) {
+        return Some(PreAuthAnswer::File(file));
+    }
+    if matches!(path.as_str(), "/" | "/dashboard" | "/dashboard/") {
+        return Some(PreAuthAnswer::Json(
+            404,
+            json!({
+                "error": "no dashboard build found",
+                "next": format!(
+                    "build it with: cd ui && npm ci && npm run build (serving {})",
+                    ui.directory().display()
+                ),
+            }),
+        ));
+    }
+    None
+}
+
+/// Answers a request the auth gate refused, and closes the connection: the
+/// gate usually refuses before the body is read, and bytes left unread in
+/// the socket must not be parsed as the next request.
+fn refuse_auth(
+    connection: &mut Connection,
+    metrics: &ServerMetrics,
+    failure: traza::auth::AuthFailure,
+) -> io::Result<()> {
+    metrics.rejected.increment();
+    let challenge = failure
+        .www_authenticate()
+        .map(|value| format!("WWW-Authenticate: {value}\r\n"))
+        .unwrap_or_default();
+    let body = failure.body();
+    let reason = if failure.status() == 401 {
+        "Unauthorized"
+    } else {
+        "Forbidden"
+    };
+    let mut responder = connection.responder(false);
+    let head = format!(
+        "HTTP/1.1 {} {reason}\r\n{challenge}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        failure.status(),
+        body.len(),
+    );
+    responder.raw(&head, body.as_bytes())
+}
+
+/// The challenge line a 401 decided past the gate carries, the same one the
+/// gate's own 401 does.
+fn unauthorized_challenge() -> String {
+    format!("WWW-Authenticate: {}\r\n", traza::auth::WWW_AUTHENTICATE)
 }
 
 /// Decodes an ingest body straight into spans.
@@ -1816,10 +2323,18 @@ fn engine_error(
         traza::Error::InvalidSpan(reason) => responder.json(400, json!({"error": reason})),
         traza::Error::Invalid(reason) => responder.json(400, json!({"error": reason})),
         traza::Error::Conflict(reason) => responder.json(409, json!({"error": reason})),
+        traza::Error::QuotaExceeded(refusal) => quota_exceeded(responder, &refusal),
+        traza::Error::Unauthenticated => responder.json_with_headers(
+            401,
+            json!({"error": "unauthorized"}),
+            &unauthorized_challenge(),
+        ),
         // An exhausted compute budget is the caller's to narrow, the same
         // rule as a too-broad sort: 503 would tell the client to retry with
         // backoff, and retrying an over-budget query without narrowing
-        // cannot help. Counted here — the one chokepoint every deadline 400
+        // cannot help. (An evidence pack's chain walk is the one exception:
+        // it keeps its progress, so a retry does help, and its message says
+        // so.) Counted here — the one chokepoint every deadline 400
         // passes through — so the metric covers every route that inherits
         // this mapping.
         error @ traza::Error::DeadlineExceeded(_) => {
@@ -1830,12 +2345,90 @@ fn engine_error(
     }
 }
 
-/// The one 403 body every cross-tenant refusal shares.
+/// The one 403 body every cross-tenant refusal shares. `required` says what
+/// would have worked: an unbound credential.
 fn foreign_tenant(responder: &mut Responder<'_>) -> io::Result<()> {
     responder.json(
         403,
-        json!({"error": "this credential is bound to a different tenant"}),
+        json!({"error": "this credential is bound to a different tenant", "required": "unbound"}),
     )
+}
+
+/// A `429` for a batch a tenant's quota or ingest pause refused: the refusal
+/// as JSON, and `Retry-After` in seconds. Native and OTLP ingest share it —
+/// an OTLP exporter retries on 429 with exactly this header, so the JSON body
+/// is for the humans reading its logs.
+fn quota_exceeded(
+    responder: &mut Responder<'_>,
+    refusal: &traza::usage::QuotaRefusal,
+) -> io::Result<()> {
+    responder.status = Some(429);
+    let body = serde_json::to_vec(&refusal.to_json())?;
+    let head = format!(
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: {}\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+        refusal.retry_after_seconds,
+        body.len(),
+        responder.connection_header()
+    );
+    responder.raw(&head, &body)
+}
+
+/// Applies a request's `Content-Encoding`, or says why it cannot (`Err`
+/// carries the status and message).
+///
+/// gzip is accepted on the two ingest routes only — that is what OTLP
+/// exporters send when compression is on — and decoded with a cap equal to
+/// the body cap, so a compressed request can never become a larger one than
+/// an uncompressed request could be. Any other route, and any other coding,
+/// is `415`: refusing names the problem, where passing compressed bytes to a
+/// JSON parser would answer with a parse error about the wrong thing.
+fn decode_content(encoding: &str, ingest: bool, body: Vec<u8>) -> Result<Vec<u8>, (u16, String)> {
+    match encoding {
+        "" | "identity" => Ok(body),
+        "gzip" | "x-gzip" if ingest => {
+            traza::gzip::gunzip(&body, MAX_REQUEST_BYTES).map_err(|error| match error {
+                traza::gzip::GzipError::TooLarge(_) => (413, error.to_string()),
+                traza::gzip::GzipError::Malformed(_) => (400, error.to_string()),
+            })
+        }
+        "gzip" | "x-gzip" => Err((
+            415,
+            "Content-Encoding: gzip is accepted on POST /v1/spans and POST /v1/traces only"
+                .to_owned(),
+        )),
+        other => Err((
+            415,
+            format!("unsupported Content-Encoding: {other}; send gzip or an uncompressed body"),
+        )),
+    }
+}
+
+/// The `Traza-Fuse` header line (with its CRLF) for an ingest's signals, or
+/// nothing when the batch raised none.
+fn fuse_header_line(signals: &[traza::guard::Signal]) -> String {
+    traza::guard::fuse_header(signals)
+        .map(|value| format!("Traza-Fuse: {value}\r\n"))
+        .unwrap_or_default()
+}
+
+/// A native ingest's `200`: the body plus, when the batch touched runs that
+/// are not `continue`, a `fuses` array naming them and the `Traza-Fuse`
+/// header for the most severe. The verdict rides the acknowledgement because
+/// the acknowledgement is the one thing every exporter already waits for.
+fn ingest_reply(
+    responder: &mut Responder<'_>,
+    mut body: Value,
+    signals: &[traza::guard::Signal],
+) -> io::Result<()> {
+    if !signals.is_empty() {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "fuses".to_owned(),
+                serde_json::to_value(signals).unwrap_or_else(|_| Value::Array(Vec::new())),
+            );
+        }
+    }
+    responder.json_with_headers(200, body, &fuse_header_line(signals))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1848,6 +2441,18 @@ fn serve_request(
     access: traza::mcp::Access,
     principal: Option<&traza::auth::Principal>,
 ) -> io::Result<()> {
+    let mut request = request;
+    if let Some(encoding) = request.content_encoding.take() {
+        let path = request
+            .target
+            .split_once('?')
+            .map_or(request.target.as_str(), |(path, _)| path);
+        let ingest = request.method == "POST" && matches!(path, "/v1/spans" | "/v1/traces");
+        match decode_content(&encoding, ingest, std::mem::take(&mut request.body)) {
+            Ok(body) => request.body = body,
+            Err((status, message)) => return responder.json(status, json!({"error": message})),
+        }
+    }
     let (path, query) = request
         .target
         .split_once('?')
@@ -1855,6 +2460,50 @@ fn serve_request(
     let scope: Option<&str> = principal.and_then(|principal| principal.tenant.as_deref());
     if path == traza::mcp::ENDPOINT {
         return serve_mcp(responder, &request, engine, mcp, access, principal);
+    }
+    // Identity, usage, and the /v1/admin/* surfaces (credentials, tenant
+    // limits): handled in the library, behind the gate above.
+    if let Some(reply) = traza::platform::route(
+        engine,
+        &request.method,
+        path,
+        query,
+        &request.body,
+        principal,
+    ) {
+        // A 401 here is a request that lost the bootstrap race (see
+        // `traza::credentials::Caller`); it carries the gate's challenge.
+        if reply.status == 401 {
+            return responder.json_with_headers(401, reply.body, &unauthorized_challenge());
+        }
+        return responder.json(reply.status, reply.body);
+    }
+    if path == blame_routes::BLAME && request.method == "GET" {
+        return blame_routes::serve(responder, query, engine, metrics, principal);
+    }
+    if replay_routes::handles(path) {
+        return replay_routes::serve(
+            responder,
+            &request.method,
+            path,
+            query,
+            &request.body,
+            engine,
+            metrics,
+            principal,
+            request.arrival,
+        );
+    }
+    if tql_routes::handles(path) {
+        return tql_routes::serve(
+            responder,
+            &request.method,
+            path,
+            query,
+            engine,
+            metrics,
+            principal,
+        );
     }
     match (request.method.as_str(), path) {
         ("POST", "/v1/spans") => {
@@ -1907,20 +2556,22 @@ fn serve_request(
                 // were acknowledged and deliberately not stored, and saying
                 // "accepted" about them would promise a durability nothing
                 // is backing.
-                Ok(admission) if admission.suppressed > 0 => responder.json(
-                    200,
+                Ok(admission) if admission.suppressed > 0 => ingest_reply(
+                    responder,
                     json!({
                         "accepted": admission.accepted,
                         "suppressed": admission.suppressed,
                         "durability": engine.durability().as_str(),
                     }),
+                    &admission.signals,
                 ),
-                Ok(admission) => responder.json(
-                    200,
+                Ok(admission) => ingest_reply(
+                    responder,
                     json!({
                         "accepted": admission.accepted,
                         "durability": engine.durability().as_str(),
                     }),
+                    &admission.signals,
                 ),
                 // A span the ENGINE refuses (an inadmissible tenant, an
                 // empty id from a library caller's shape) is the client's
@@ -1929,6 +2580,10 @@ fn serve_request(
                 Err(traza::Error::InvalidSpan(reason)) => {
                     responder.json(400, json!({"error": reason}))
                 }
+                // An admission cap, naming itself and the span: as much the
+                // client's defect as an empty id.
+                Err(traza::Error::Invalid(reason)) => responder.json(400, json!({"error": reason})),
+                Err(traza::Error::QuotaExceeded(refusal)) => quota_exceeded(responder, &refusal),
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
@@ -1986,21 +2641,29 @@ fn serve_request(
                     // on a protobuf writer dependency.
                     let body = otlp_partial_success_protobuf(admission.suppressed);
                     let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\n{}Content-Length: {}\r\nConnection: {}\r\n\r\n",
+                        fuse_header_line(&admission.signals),
                         body.len(),
                         responder.connection_header()
                     );
                     responder.raw(&head, &body)
                 }
-                Ok(admission) if admission.suppressed > 0 => responder.json(
+                // OTLP's response schema has no place for a verdict, so OTLP
+                // clients get the header alone and an unchanged body.
+                Ok(admission) if admission.suppressed > 0 => responder.json_with_headers(
                     200,
                     json!({"partialSuccess": {
                         "rejectedSpans": admission.suppressed,
                         "errorMessage":
                             "suppressed by a pending erasure covering these spans",
                     }}),
+                    &fuse_header_line(&admission.signals),
                 ),
-                Ok(_) => responder.json(200, json!({"partialSuccess": {}})),
+                Ok(admission) => responder.json_with_headers(
+                    200,
+                    json!({"partialSuccess": {}}),
+                    &fuse_header_line(&admission.signals),
+                ),
                 // Same rule as native ingest: a resource attribute the
                 // engine refuses (an invalid `traza.tenant`) is the
                 // exporter's misconfiguration, answered 400 and loudly —
@@ -2009,6 +2672,8 @@ fn serve_request(
                 Err(traza::Error::InvalidSpan(reason)) => {
                     responder.json(400, json!({"error": reason}))
                 }
+                Err(traza::Error::Invalid(reason)) => responder.json(400, json!({"error": reason})),
+                Err(traza::Error::QuotaExceeded(refusal)) => quota_exceeded(responder, &refusal),
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
@@ -2114,7 +2779,8 @@ fn serve_request(
                         return responder.json(
                             403,
                             json!({"error": "payload subjects are store-global; erasing one \
-                                             requires an unbound admin credential"}),
+                                             requires an unbound admin credential",
+                                   "required": "unbound"}),
                         )
                     }
                     Some(named) if named != bound => return foreign_tenant(responder),
@@ -2253,6 +2919,9 @@ fn serve_request(
             // layer, so a reader sees the whole ingest path in one scrape.
             let mut rendered = String::with_capacity(2048);
             engine.metrics().render_prometheus(&mut rendered);
+            engine.render_usage_prometheus(&mut rendered);
+            engine.render_fuse_metrics(&mut rendered);
+            engine.render_fate_metrics(&mut rendered);
             metrics.render_prometheus(&mut rendered);
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
@@ -2468,7 +3137,9 @@ fn serve_request(
                     json!({"annotations": serde_json::to_value(annotations)
                         .unwrap_or_else(|_| Value::Array(Vec::new()))}),
                 ),
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                // The walk spends the query budget: past it, the deadline
+                // 400 every query route answers.
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", _) if path.starts_with("/v1/payloads/") => {
@@ -2985,7 +3656,7 @@ fn serve_request(
                     json!({"scores": serde_json::to_value(scores)
                         .unwrap_or_else(|_| Value::Array(Vec::new()))}),
                 ),
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", path) if path.starts_with("/v1/experiments/") && path.ends_with("/summary") => {
@@ -3016,6 +3687,113 @@ fn serve_request(
                     serde_json::to_value(&view).unwrap_or_else(|_| json!({})),
                 ),
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        // Steering: the live-run stream owns its socket, like the tail; the
+        // rest live beside the engine API they call (traza::steer::http).
+        ("GET", traza::steer::http::LIVE_STREAM) => {
+            let tenant = match traza::steer::http::stream_scope(query, scope) {
+                Ok(tenant) => tenant,
+                Err(reply) => return responder.json(reply.status, reply.body),
+            };
+            let slot = match engine.live_stream_slot(tenant.as_deref()) {
+                Ok(slot) => slot,
+                Err(error) => return engine_error(responder, metrics, error),
+            };
+            responder.must_close();
+            let streamed = stream_live(responder.stream, engine, tenant.as_deref());
+            drop(slot);
+            streamed
+        }
+        (_, path) if traza::steer::http::handles(path) => {
+            let reply = traza::steer::http::serve(
+                engine,
+                &request.method,
+                path,
+                query,
+                &request.body,
+                scope,
+            );
+            if reply.deadline_exceeded {
+                metrics.query_deadline_exceeded.increment();
+            }
+            responder.json(reply.status, reply.body)
+        }
+        // Run fuses: policies, verdicts, the kill switch and the event feed.
+        // The routes live beside the engine API they call (traza::guard::http);
+        // the method rule above already authorized the request.
+        (_, path) if path.starts_with("/v1/fuses/") => {
+            let reply = traza::guard::http::serve(
+                engine,
+                &request.method,
+                path,
+                query,
+                &request.body,
+                scope,
+            );
+            if reply.deadline_exceeded {
+                metrics.query_deadline_exceeded.increment();
+            }
+            responder.json(reply.status, reply.body)
+        }
+        // The Fate Map and foresight: every route a read, living beside the
+        // engine API it calls (traza::fate::http).
+        (_, path) if traza::fate::http::handles(path) => {
+            let reply = traza::fate::http::serve(
+                engine,
+                &request.method,
+                path,
+                query,
+                scope,
+                traza::mcp::unix_nanos_now(),
+            );
+            if reply.deadline_exceeded {
+                metrics.query_deadline_exceeded.increment();
+            }
+            responder.json(reply.status, reply.body)
+        }
+        // The change radar. Routing, parameters and the tenant binding live
+        // in the library beside the analysis (traza::radar); the method rule
+        // above already authorized the read.
+        (_, path) if traza::radar::handles(path) => {
+            let reply = traza::radar::serve(
+                engine,
+                &request.method,
+                path,
+                query,
+                scope,
+                traza::mcp::unix_nanos_now(),
+            );
+            if reply.deadline_exceeded {
+                metrics.query_deadline_exceeded.increment();
+            }
+            responder.json(reply.status, reply.body)
+        }
+        // Context X-Ray and Cache Autopsy (traza::xray::http): reads, under
+        // the caller's tenant binding.
+        (_, path) if traza::xray::http::handles(path) => {
+            let reply = traza::xray::http::serve(engine, &request.method, path, query, scope);
+            if reply.deadline_exceeded {
+                metrics.query_deadline_exceeded.increment();
+            }
+            responder.json(reply.status, reply.body)
+        }
+        // The ledger and evidence packs. Routing, parameters and the
+        // evidence pack's tenant binding live in the library beside the
+        // ledger; the auth gate above already applied its operator and admin
+        // rules.
+        (method, path) if traza::ledger::handles(path) => {
+            let pairs: Vec<(String, String)> = query
+                .split('&')
+                .filter(|pair| !pair.is_empty())
+                .map(|pair| {
+                    let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                    (percent_decode(key), percent_decode(value))
+                })
+                .collect();
+            match traza::ledger::serve(engine, method, path, &pairs, &request.body, principal) {
+                Ok((status, body)) => responder.json(status, body),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         // A deliberate, externally reachable panic, for proving the slot
@@ -3265,6 +4043,80 @@ fn stream_tail(
         // signal, and it is what ends this thread.
         write_chunk(stream, frame.as_bytes())?;
         stream.flush()?;
+    }
+}
+
+/// Shortest gap between two change updates on a live-run stream: a burst of
+/// ingest touching the same runs coalesces into one update per run.
+const LIVE_COALESCE: Duration = Duration::from_millis(250);
+
+/// `GET /v1/runs/live/stream`: the live view as server-sent events.
+///
+/// Opens with `event: snapshot` — the live listing, as `GET /v1/runs/live`
+/// answers it — then sends `event: removed` (`{run, tenant, reason}`) when a
+/// run the client holds leaves the view — `evicted` from the guard's memory,
+/// or `expired` out of the window — and `event: run` with one live run's row
+/// each time that run changes, removals first, at most one update per
+/// [`LIVE_COALESCE`], and a comment heartbeat after [`TAIL_HEARTBEAT`] of
+/// quiet. When more runs change at once than one update carries, the client
+/// would hold more rows than the stream tracks, or an erasure sweeps the
+/// view, a fresh `snapshot` replaces everything the client holds. A client
+/// that reconnects starts again from a snapshot; there is no resumable
+/// cursor.
+fn stream_live(stream: &mut TcpStream, engine: &Store, tenant: Option<&str>) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    )?;
+    stream.flush()?;
+    let mut cursor = traza::steer::LiveCursor::default();
+    let mut last_write = std::time::Instant::now();
+    loop {
+        let update = match engine.live_wait(tenant, &mut cursor, TAIL_HEARTBEAT) {
+            Ok(update) => update,
+            // The response has begun; ending the stream is all that is left.
+            Err(error) => {
+                eprintln!("live-run stream ended: {error}");
+                return stream.flush();
+            }
+        };
+        let frame = match update {
+            traza::steer::LiveUpdate::Snapshot(page) => {
+                let payload = serde_json::to_value(&page).unwrap_or_else(|_| json!({}));
+                format!("event: snapshot\ndata: {payload}\n\n")
+            }
+            // Changes this stream may not see (another tenant's, or runs
+            // outside the window): nothing to send but a due heartbeat.
+            traza::steer::LiveUpdate::Changed { removed, runs }
+                if removed.is_empty() && runs.is_empty() =>
+            {
+                if last_write.elapsed() < TAIL_HEARTBEAT {
+                    std::thread::sleep(LIVE_COALESCE);
+                    continue;
+                }
+                ": tick\n\n".to_owned()
+            }
+            traza::steer::LiveUpdate::Changed { removed, runs } => {
+                let mut frame = String::new();
+                for gone in removed {
+                    let payload = serde_json::to_value(&gone).unwrap_or_else(|_| json!({}));
+                    frame.push_str(&format!("event: removed\ndata: {payload}\n\n"));
+                }
+                for run in runs {
+                    let payload = serde_json::to_value(&run).unwrap_or_else(|_| json!({}));
+                    frame.push_str(&format!("event: run\ndata: {payload}\n\n"));
+                }
+                frame
+            }
+            traza::steer::LiveUpdate::Idle => ": tick\n\n".to_owned(),
+        };
+        // A failed write is how a disconnect is detected.
+        write_chunk(stream, frame.as_bytes())?;
+        stream.flush()?;
+        last_write = std::time::Instant::now();
+        if frame.starts_with("event:") {
+            std::thread::sleep(LIVE_COALESCE);
+        }
     }
 }
 
@@ -3601,9 +4453,10 @@ fn serve_mcp(
 /// the attacker owns the name, so the browser sends *their* host in both
 /// headers and the comparison succeeds. Only two things may permit an origin:
 ///
-/// - it is a loopback page, which an attacker's site can never be — the
-///   browser stamps the origin of the page, and a page served from
-///   `evil.example` has that origin however its DNS resolves;
+/// - it is a loopback page ([`traza::platform::loopback_origin`]), which an
+///   attacker's site can never be — the browser stamps the origin of the
+///   page, and a page served from `evil.example` has that origin however its
+///   DNS resolves;
 /// - the operator named it with `--mcp-allowed-origin`.
 fn origin_allowed(origin: &str, allowed: &[String]) -> bool {
     // "null" is what a sandboxed iframe or a `file://` page sends. It is
@@ -3612,25 +4465,7 @@ fn origin_allowed(origin: &str, allowed: &[String]) -> bool {
         return false;
     }
     let origin = origin.trim().trim_end_matches('/');
-    if allowed.iter().any(|entry| entry == origin) {
-        return true;
-    }
-    let Some((scheme, authority)) = origin.split_once("://") else {
-        return false;
-    };
-    // A loopback *origin* — not a loopback destination. The scheme is checked
-    // too, so `javascript://localhost` and friends cannot pass as one.
-    matches!(scheme, "http" | "https")
-        && matches!(authority_host(authority), "localhost" | "127.0.0.1" | "::1")
-}
-
-/// The host part of an authority, with an IPv6 literal unwrapped from its
-/// brackets so `[::1]:8080` compares as `::1`.
-fn authority_host(authority: &str) -> &str {
-    if let Some(rest) = authority.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
-    }
-    authority.split(':').next().unwrap_or(authority)
+    allowed.iter().any(|entry| entry == origin) || traza::platform::loopback_origin(origin)
 }
 
 struct Request {
@@ -3641,7 +4476,11 @@ struct Request {
     /// endpoint has header-level rules the REST routes do not.
     origin: Option<String>,
     mcp_protocol_version: Option<String>,
+    /// `Content-Encoding:`, lowercased; see [`decode_content`].
+    content_encoding: Option<String>,
     body: Vec<u8>,
+    /// When the request's head was read.
+    arrival: traza::replay::Arrival,
 }
 
 /// A parsed request head: everything except the body, which is read only
@@ -3665,6 +4504,11 @@ struct RequestHead {
     origin: Option<String>,
     /// `MCP-Protocol-Version:` as sent. An unsupported value is a `400`.
     mcp_protocol_version: Option<String>,
+    /// `Content-Encoding:`, trimmed and lowercased.
+    content_encoding: Option<String>,
+    /// `x-api-key:` as sent — the Anthropic SDK's credential header, honoured
+    /// on replay routes only (see `replay_routes::presented_credential`).
+    x_api_key: Option<String>,
     content_length: usize,
     header_end: usize,
 }
@@ -3694,6 +4538,16 @@ impl RequestHead {
 struct Connection {
     stream: TcpStream,
     buffer: Vec<u8>,
+    /// Bytes of the request [`Self::read_head`] last returned — head and
+    /// declared body, counted from the front of `buffer` and running on into
+    /// the socket — that nothing has consumed yet. Tracked here, not by the
+    /// caller, because a request that is answered but not consumed is parsed
+    /// AGAIN as the next one: a single probe once came back to its client
+    /// `MAX_REQUESTS_PER_CONNECTION` times on a kept-alive connection.
+    unconsumed: usize,
+    /// The request being answered is a `HEAD`, whose response must not carry
+    /// a body.
+    head_request: bool,
 }
 
 impl Connection {
@@ -3701,6 +4555,8 @@ impl Connection {
         Self {
             stream,
             buffer: Vec::with_capacity(8192),
+            unconsumed: 0,
+            head_request: false,
         }
     }
 
@@ -3710,6 +4566,7 @@ impl Connection {
         Responder {
             stream: &mut self.stream,
             keep_alive,
+            omit_body: self.head_request,
             status: None,
         }
     }
@@ -3719,6 +4576,11 @@ impl Connection {
     /// `Ok(None)` means the peer closed cleanly at a request boundary — the
     /// ordinary end of a keep-alive connection, not an error.
     fn read_head(&mut self) -> io::Result<Option<RequestHead>> {
+        // Whatever of the previous request was not consumed is discarded
+        // first, so the head parsed below starts where that request ended
+        // whichever path answered it.
+        self.head_request = false;
+        self.discard_request()?;
         let mut chunk = [0_u8; 8192];
         let header_end = loop {
             // Check BEFORE reading: a pipelined request may already be sitting
@@ -3745,7 +4607,36 @@ impl Connection {
             }
             self.buffer.extend_from_slice(&chunk[..read]);
         };
-        parse_head(&self.buffer, header_end).map(Some)
+        let head = parse_head(&self.buffer, header_end)?;
+        self.unconsumed = head.header_end + head.content_length;
+        // Methods are case-sensitive: `head` is not HEAD, and its client
+        // expects whatever body the response declares.
+        self.head_request = head.method == "HEAD";
+        Ok(Some(head))
+    }
+
+    /// Consumes the rest of the current request without keeping its body.
+    ///
+    /// The part of the body still in the socket is read in chunks and
+    /// dropped, never accumulated, and never past the request's end: the
+    /// bytes after it are the next request.
+    fn discard_request(&mut self) -> io::Result<()> {
+        let buffered = self.unconsumed.min(self.buffer.len());
+        self.buffer.drain(..buffered);
+        self.unconsumed -= buffered;
+        let mut chunk = [0_u8; 8192];
+        while self.unconsumed > 0 {
+            let want = self.unconsumed.min(chunk.len());
+            let read = self.stream.read(&mut chunk[..want])?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete body",
+                ));
+            }
+            self.unconsumed -= read;
+        }
+        Ok(())
     }
 
     /// Reads `head`'s body and consumes the whole request from the buffer.
@@ -3765,6 +4656,7 @@ impl Connection {
         let body = self.buffer[head.header_end..needed].to_vec();
         // Whatever is left belongs to the next request.
         self.buffer.drain(..needed);
+        self.unconsumed = 0;
         Ok(body)
     }
 }
@@ -3802,6 +4694,8 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
     let mut connection = String::new();
     let mut origin = None;
     let mut mcp_protocol_version = None;
+    let mut content_encoding: Option<String> = None;
+    let mut x_api_key = None;
     let mut header_lines: Vec<&str> = Vec::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
@@ -3819,6 +4713,19 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
             }
             if name.eq_ignore_ascii_case("mcp-protocol-version") {
                 mcp_protocol_version = Some(value.trim().to_owned());
+            }
+            // Repeated headers join into the list they mean, so two
+            // `gzip` headers read as "gzip, gzip" and are refused rather than
+            // decoded once and misparsed.
+            if name.eq_ignore_ascii_case("content-encoding") {
+                let value = value.trim().to_ascii_lowercase();
+                content_encoding = Some(match content_encoding {
+                    Some(previous) => format!("{previous}, {value}"),
+                    None => value,
+                });
+            }
+            if name.eq_ignore_ascii_case("x-api-key") {
+                x_api_key = Some(value.trim().to_owned());
             }
         }
         header_lines.push(line);
@@ -3869,6 +4776,8 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
         connection,
         origin,
         mcp_protocol_version,
+        content_encoding,
+        x_api_key,
         content_length,
         header_end,
     })
@@ -3884,6 +4793,11 @@ struct Responder<'a> {
     stream: &'a mut TcpStream,
     /// Whether this connection will read another request after this response.
     keep_alive: bool,
+    /// Answering a `HEAD`: the head goes out as it would for `GET`, the body
+    /// does not. Its client reads no body whatever `Content-Length` says, so
+    /// one sent anyway would be read as the start of the next response. The
+    /// streaming routes write past this, and are GET-only.
+    omit_body: bool,
     /// Status of the response actually sent, for per-class accounting. A
     /// request that never reached a responder leaves this `None` and is not
     /// counted — an uncounted request beats one filed under a status it
@@ -3913,22 +4827,30 @@ impl Responder<'_> {
     /// Sends a JSON body. Head and body go out in one write: at ingest rates
     /// the extra syscall per response is pure overhead.
     fn json(&mut self, status: u16, body: Value) -> io::Result<()> {
+        self.json_with_headers(status, body, "")
+    }
+
+    /// [`Self::json`] with extra header lines, each already CRLF-terminated
+    /// and already safe to send.
+    fn json_with_headers(&mut self, status: u16, body: Value, extra: &str) -> io::Result<()> {
         self.status = Some(status);
         let encoded = serde_json::to_vec(&body)?;
         let reason = match status {
             200 => "OK",
             400 => "Bad Request",
+            401 => "Unauthorized",
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
             413 => "Payload Too Large",
+            415 => "Unsupported Media Type",
             429 => "Too Many Requests",
             503 => "Service Unavailable",
             _ => "Error",
         };
         self.raw(
             &format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: {}\r\n\r\n",
                 encoded.len(),
                 self.connection_header(),
             ),
@@ -3967,6 +4889,7 @@ impl Responder<'_> {
 
     /// Sends a caller-built head followed by `body`, in a single write.
     fn raw(&mut self, head: &str, body: &[u8]) -> io::Result<()> {
+        let body = if self.omit_body { &[] } else { body };
         let mut out = Vec::with_capacity(head.len() + body.len());
         out.extend_from_slice(head.as_bytes());
         out.extend_from_slice(body);
@@ -4017,6 +4940,21 @@ mod tests {
         parse_args(&args)
             .expect("parses")
             .expect("not a help invocation")
+    }
+
+    #[test]
+    fn steering_routes_land_in_the_class_their_work_belongs_to() {
+        for (method, path, class) in [
+            ("GET", "/v1/runs/sess-1/topology", RouteClass::Lookup),
+            ("GET", "/v1/runs/trace%3Aabc/topology", RouteClass::Lookup),
+            ("GET", "/v1/tapes/sess-1", RouteClass::Lookup),
+            ("GET", "/v1/runs/live/stream", RouteClass::Stream),
+            ("GET", "/v1/runs/live", RouteClass::Other),
+            ("GET", "/v1/runs/sess-1/nudges", RouteClass::Other),
+            ("POST", "/v1/runs/sess-1/nudges", RouteClass::Other),
+        ] {
+            assert_eq!(RouteClass::of(method, path), class, "{method} {path}");
+        }
     }
 
     #[test]

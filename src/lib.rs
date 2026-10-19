@@ -10,14 +10,26 @@ pub mod analytics;
 pub mod annotations;
 pub mod attribution;
 pub mod auth;
+pub mod blame;
+pub mod caps;
 pub mod content;
 mod crc;
+pub mod credentials;
+pub mod diff;
 pub mod erasure;
 pub mod evals;
 pub mod expiration;
+pub mod fate;
+pub mod fork;
 mod generation;
+pub mod guard;
+pub mod gzip;
 pub mod hash;
+pub mod import;
+mod ingest_hooks;
 pub mod insights;
+pub mod ledger;
+pub mod limits;
 pub mod mcp;
 mod media;
 pub mod metrics;
@@ -27,18 +39,30 @@ pub mod object_storage;
 pub mod otlp;
 pub mod otlp_pb;
 pub mod payload;
+pub mod platform;
 pub mod pricing;
+pub mod radar;
+pub mod recall;
+pub mod replay;
 mod rollup_file;
+pub mod run;
 pub mod seed;
 pub mod segment;
 pub mod semconv;
+pub mod steer;
 pub mod tail;
+pub mod tape;
+pub mod tql;
 pub mod ui;
+pub mod usage;
 mod wal;
+pub mod xray;
+pub mod zstd;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -519,6 +543,23 @@ impl Deadline {
         })
     }
 
+    /// The sooner of `deadline` and `slice` from now: for work a request
+    /// may do with what is left of its budget, but never more than `slice`
+    /// of it, and never unbounded even when no budget is configured.
+    pub(crate) fn capped(deadline: Option<Self>, slice: std::time::Duration) -> Self {
+        let now = Instant::now();
+        match deadline {
+            Some(deadline) => Self {
+                started: deadline.started,
+                at: deadline.at.min(now + slice),
+            },
+            None => Self {
+                started: now,
+                at: now + slice,
+            },
+        }
+    }
+
     /// Errs once the deadline has passed; a `None` deadline never does.
     /// `segments_examined` is whatever the caller has counted so far —
     /// reporting for the refusal's message, not accounting.
@@ -882,6 +923,32 @@ pub struct Config {
     /// counters computed under the old ones rather than silently reporting
     /// them forever. See [`crate::pricing`].
     pub pricing: std::sync::Arc<crate::pricing::Pricing>,
+    /// Attributes one span may carry at top level, or `None` for no cap.
+    /// A violation refuses the whole batch ([`Error::Invalid`]); see
+    /// [`crate::caps`].
+    pub max_span_attributes: Option<usize>,
+    /// Bytes one attribute key may have, in any of the span's attribute maps
+    /// (its own, its events', its links'), or `None` for no cap.
+    pub max_attribute_key_bytes: Option<usize>,
+    /// Events one span may carry, or `None` for no cap.
+    pub max_span_events: Option<usize>,
+    /// Serialized bytes one span may occupy AS STORED — after oversized
+    /// values are offloaded to payload references — or `None` for no cap.
+    pub max_span_bytes: Option<usize>,
+    /// Spans one ingest call may carry, or `None` for no cap.
+    pub max_batch_spans: Option<usize>,
+    /// The run guard: whether ingest feeds it, its default policy, and how
+    /// many runs it keeps live. On by default, warning on repeated steps
+    /// only. See [`guard`].
+    pub fuses: guard::FuseConfig,
+    /// The Fate Map's bounds and cache lifetime. See [`fate`].
+    pub fate: fate::FateConfig,
+    /// Steering: the live view's activity window. See [`steer`].
+    pub steer: steer::SteerConfig,
+    /// Steps after which a tool result no model output has drawn on is
+    /// reported stale by the context X-Ray (`--xray-stale-steps`; see
+    /// [`xray`]). Read-side only: nothing on the ingest path consults it.
+    pub xray_stale_steps: usize,
 }
 
 /// The last commit whose reader accepts every segment format retired WITHOUT
@@ -985,6 +1052,15 @@ impl Default for Config {
             tail_ring_spans: DEFAULT_TAIL_RING_SPANS,
             tail_ring_bytes: DEFAULT_TAIL_RING_BYTES,
             pricing: std::sync::Arc::new(crate::pricing::Pricing::default()),
+            max_span_attributes: Some(caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
+            max_attribute_key_bytes: Some(caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),
+            max_span_events: Some(caps::DEFAULT_MAX_SPAN_EVENTS),
+            max_span_bytes: Some(caps::DEFAULT_MAX_SPAN_BYTES),
+            max_batch_spans: Some(caps::DEFAULT_MAX_BATCH_SPANS),
+            fuses: guard::FuseConfig::default(),
+            fate: fate::FateConfig::default(),
+            steer: steer::SteerConfig::default(),
+            xray_stale_steps: xray::DEFAULT_STALE_STEPS,
         }
     }
 }
@@ -1024,12 +1100,17 @@ pub struct Stats {
 /// a suppressed span as durable: a `200` whose body says `accepted: 1` about
 /// a span that never reached memory or the log would be a durability claim
 /// with nothing behind it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Admission {
     /// Spans stored under the configured durability mode.
     pub accepted: usize,
     /// Spans dropped by the erasure admission barrier.
     pub suppressed: usize,
+    /// Run-guard signals the ingest observer raised for runs in this batch:
+    /// one per run whose verdict is not [`guard::Verdict::Continue`]. Empty
+    /// when no run in the batch is at `warn` or `stop`, and always empty when
+    /// fuses are disabled (`Config::fuses.enabled == false`).
+    pub signals: Vec<guard::Signal>,
 }
 
 /// Errors returned by storage operations.
@@ -1076,6 +1157,16 @@ pub enum Error {
     /// payload reference whose bytes are gone. Retryable once the state
     /// changes, which is exactly what HTTP 409 means.
     Conflict(String),
+    /// A tenant's monthly quota or ingest pause refused the whole batch (see
+    /// [`usage`]). Not the client's defect and not the store's: HTTP 429,
+    /// with the refusal saying which limit, how much is used, and when it
+    /// resets.
+    QuotaExceeded(usage::QuotaRefusal),
+    /// The caller presented no credential and the store now requires one: a
+    /// request admitted in open mode that reached the store after the first
+    /// credential did (see [`credentials::Caller`]). HTTP 401, answered like
+    /// any other missing credential.
+    Unauthenticated,
 }
 
 impl fmt::Display for Error {
@@ -1092,6 +1183,8 @@ impl fmt::Display for Error {
             Self::WalCorrupt(detail) => write!(f, "write-ahead log is corrupt: {detail}"),
             Self::Invalid(reason) => write!(f, "invalid request: {reason}"),
             Self::Conflict(reason) => write!(f, "conflict: {reason}"),
+            Self::QuotaExceeded(refusal) => write!(f, "{refusal}"),
+            Self::Unauthenticated => write!(f, "unauthorized: a credential is required"),
         }
     }
 }
@@ -1109,7 +1202,9 @@ impl StdError for Error {
             | Self::WalCorrupt(_)
             | Self::UnsupportedFilter(_)
             | Self::Invalid(_)
-            | Self::Conflict(_) => None,
+            | Self::Conflict(_)
+            | Self::QuotaExceeded(_)
+            | Self::Unauthenticated => None,
         }
     }
 }
@@ -1621,6 +1716,13 @@ struct WriteBuffer {
     /// against a bound measured in minutes, in the direction of a later, not
     /// earlier, seal.
     oldest_at: Option<Instant>,
+    /// Upserts over the buffer's life — never reset by a seal — so the
+    /// revision of the latest write. Assigned under the writer lock, it is
+    /// the order the store kept versions of a span in, which observers that
+    /// run after the lock is released cannot otherwise recover (see
+    /// [`Store::observe_admitted`]); and a read taken under the same lock
+    /// can report exactly which versions it holds ([`Store::trace_spans_at`]).
+    revision: u64,
 }
 
 impl WriteBuffer {
@@ -1638,6 +1740,7 @@ impl WriteBuffer {
             span.span_id.clone(),
         );
         self.upserts += 1;
+        self.revision += 1;
         if self.spans.is_empty() {
             self.oldest_at = Some(Instant::now());
         }
@@ -1655,6 +1758,11 @@ impl WriteBuffer {
             }
         }
         handle
+    }
+
+    /// The revision of the latest upsert; the next one takes this plus one.
+    fn revision(&self) -> u64 {
+        self.revision
     }
 
     fn len(&self) -> usize {
@@ -1759,16 +1867,65 @@ struct SealOutcome {
     folded: Option<generation::FoldedThrough>,
 }
 
+/// Directories whose lock THIS process holds, by canonical path.
+///
+/// A lock file's PID cannot tell this process's own lock from one left by an
+/// earlier process that had the same PID, and that is not a curiosity: in a
+/// container the server is PID 1 on every start, so after an unclean stop
+/// the stale lock names the restarted server. No other live process can have
+/// our PID, so a lock naming it is ours exactly when this set says so.
+///
+/// Its mutex is held across every acquisition and release, which is what
+/// makes the set authoritative: no thread here can see a lock file naming
+/// this process while the set has yet to record it, or has already let it
+/// go.
+static HELD_DIRECTORIES: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+fn held_directories() -> MutexGuard<'static, BTreeSet<PathBuf>> {
+    // Every change is a single insert or remove, so a panic elsewhere cannot
+    // leave the set half-updated: a poisoned lock still guards a true set.
+    HELD_DIRECTORIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Debug)]
 struct DirectoryLock {
     path: PathBuf,
+    /// The canonical directory, as recorded in [`HELD_DIRECTORIES`].
+    directory: PathBuf,
     _file: File,
 }
 
 impl DirectoryLock {
     fn acquire(path: PathBuf) -> Result<Self> {
-        match Self::try_create(&path) {
-            Ok(lock) => Ok(lock),
+        // Canonical, so every spelling of one directory — a symlink, a `.` —
+        // is the same entry. One that slipped past as "not held here" would
+        // read our own live lock as a predecessor's and reclaim it.
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory = fs::canonicalize(parent)?;
+        let mut held = held_directories();
+        if held.contains(&directory) {
+            return Err(Error::AlreadyOpen);
+        }
+        let file = Self::create_or_reclaim(&path)?;
+        held.insert(directory.clone());
+        Ok(Self {
+            path,
+            directory,
+            _file: file,
+        })
+    }
+
+    /// Creates the lock file, reclaiming a stale one. Called only from
+    /// [`Self::acquire`], holding [`HELD_DIRECTORIES`] with the directory
+    /// absent from it — which [`Self::owner_is_dead`] relies on.
+    fn create_or_reclaim(path: &Path) -> Result<File> {
+        match Self::try_create(path) {
+            Ok(file) => Ok(file),
             Err(Error::AlreadyOpen) => {
                 // The lock records its owner's PID. A crashed owner (killed
                 // server, OOM, power loss before unlink) must not wedge the
@@ -1781,14 +1938,14 @@ impl DirectoryLock {
                 // the race test). A reclamation sentinel closes it: exactly
                 // one reclaimer create_new-wins the sentinel, re-verifies
                 // staleness while holding it, and only then swaps the lock.
-                if Self::owner_is_dead(&path) && Self::reclaim_sentinel(&path) {
-                    let result = if Self::owner_is_dead(&path) {
-                        let _ = fs::remove_file(&path);
-                        Self::try_create(&path)
+                if Self::owner_is_dead(path) && Self::reclaim_sentinel(path) {
+                    let result = if Self::owner_is_dead(path) {
+                        let _ = fs::remove_file(path);
+                        Self::try_create(path)
                     } else {
                         Err(Error::AlreadyOpen)
                     };
-                    let _ = fs::remove_file(Self::sentinel_path(&path));
+                    let _ = fs::remove_file(Self::sentinel_path(path));
                     return result;
                 }
                 Err(Error::AlreadyOpen)
@@ -1797,7 +1954,7 @@ impl DirectoryLock {
         }
     }
 
-    fn try_create(path: &Path) -> Result<Self> {
+    fn try_create(path: &Path) -> Result<File> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         let mut file = match options.open(path) {
@@ -1817,10 +1974,7 @@ impl DirectoryLock {
             return Err(Error::Io(error));
         }
 
-        Ok(Self {
-            path: path.to_path_buf(),
-            _file: file,
-        })
+        Ok(file)
     }
 
     fn sentinel_path(path: &Path) -> PathBuf {
@@ -1865,8 +2019,12 @@ impl DirectoryLock {
     }
 
     /// True only when the lock file names a PID that verifiably no longer
-    /// exists. Unreadable or malformed lock files are treated as live: false
-    /// negatives merely keep the conservative rejection, never corrupt data.
+    /// exists. Unreadable or malformed lock files are treated as live, and so
+    /// is an owner whose liveness nothing here can decide: false negatives
+    /// merely keep the conservative rejection, never corrupt data.
+    ///
+    /// Only for [`Self::create_or_reclaim`], whose caller has established
+    /// that this process does not hold the directory.
     fn owner_is_dead(path: &Path) -> bool {
         let Ok(contents) = fs::read_to_string(path) else {
             return false;
@@ -1875,30 +2033,95 @@ impl DirectoryLock {
             return false;
         };
         if pid == std::process::id() {
-            return false;
+            // No other live process can have our PID, and this process does
+            // not hold the directory (see above), so the file was left by an
+            // earlier process that had it — a container's PID 1 restarted
+            // after an unclean stop. The same holds for a reclaim sentinel:
+            // acquisitions here are serialized, so none of ours is in flight.
+            return true;
         }
-        // Signal 0 probes existence without delivering anything. EPERM means
-        // the process exists but belongs to someone else — still live.
-        match std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .output()
-        {
-            Ok(output) => {
-                !output.status.success() && {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    !stderr.contains("not permitted") && !stderr.contains("Operation not permitted")
-                }
-            }
-            Err(_) => false,
-        }
+        process_exists(pid) == Some(false)
     }
 }
 
 impl Drop for DirectoryLock {
     fn drop(&mut self) {
+        // Under the registry's lock, so an acquisition in this process never
+        // finds the file still naming us after the set has let it go: it
+        // would take that for a predecessor's stale lock and reclaim it, and
+        // this unlink would then delete its fresh one.
+        let mut held = held_directories();
         let _ = fs::remove_file(&self.path);
+        held.remove(&self.directory);
     }
+}
+
+/// Whether process `pid` exists, or `None` when nothing available can tell.
+fn process_exists(pid: u32) -> Option<bool> {
+    process_exists_with(Path::new("/proc"), "kill", pid)
+}
+
+/// [`process_exists`] with both of its probes named, so a test can take
+/// either away.
+///
+/// procfs first on Linux: the release image is `FROM scratch` and has no
+/// `kill` to run, while a container always mounts `/proc`. Elsewhere — and
+/// on a Linux without a usable procfs — `kill -0`.
+fn process_exists_with(proc_root: &Path, kill: &str, pid: u32) -> Option<bool> {
+    let procfs = if cfg!(target_os = "linux") {
+        process_exists_in_procfs(proc_root, pid)
+    } else {
+        None
+    };
+    procfs.or_else(|| process_exists_by_signal(kill, pid))
+}
+
+/// Answers from procfs's directory per process, or `None` when the answer
+/// would not be proof.
+///
+/// `self` tells a mounted procfs from the empty directory an unmounted
+/// `/proc` is. A directory present proves a process; an absent one proves
+/// none only when the mount lists every process, which `hidepid=invisible`
+/// (`2`) and `hidepid=ptraceable` (`4`) do not — they hide other users'.
+fn process_exists_in_procfs(proc_root: &Path, pid: u32) -> Option<bool> {
+    if !proc_root.join("self").is_dir() {
+        return None;
+    }
+    if proc_root.join(pid.to_string()).exists() {
+        return Some(true);
+    }
+    // Conservative across mounts: hiding on any procfs leaves this one's
+    // absence unproven, and a false "maybe" costs only the fallback.
+    let mounts = fs::read_to_string(proc_root.join("self/mounts")).ok()?;
+    let hides = mounts.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let fstype = fields.nth(2);
+        let options = fields.next().unwrap_or_default();
+        fstype == Some("proc")
+            && options.split(',').any(|option| {
+                matches!(
+                    option,
+                    "hidepid=2" | "hidepid=invisible" | "hidepid=4" | "hidepid=ptraceable"
+                )
+            })
+    });
+    (!hides).then_some(false)
+}
+
+/// `kill -0`: signal 0 probes existence without delivering anything. `None`
+/// when the command cannot run at all.
+fn process_exists_by_signal(kill: &str, pid: u32) -> Option<bool> {
+    let output = std::process::Command::new(kill)
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if output.status.success() {
+        return Some(true);
+    }
+    // EPERM means the process exists but belongs to someone else — still
+    // live.
+    Some(String::from_utf8_lossy(&output.stderr).contains("not permitted"))
 }
 
 /// A cached rollup, together with the identity of the segment it was built
@@ -2028,15 +2251,20 @@ impl ExpiryCutoffs {
     /// The configured policy as absolute cutoffs, or `None` when no window
     /// is configured anywhere (retention wholly disabled). A zero GLOBAL
     /// TTL is documented as "disabled"; a zero PER-TENANT TTL is that
-    /// tenant's exemption from the global window.
-    fn from_config(config: &Config, now_ns: u64) -> Option<Self> {
+    /// tenant's exemption from the global window. `tenant_ttl_seconds` is
+    /// the configured map with runtime overrides already laid over it
+    /// ([`Store::tenant_ttl_policy`]).
+    fn from_policy(
+        ttl_seconds: Option<u64>,
+        tenant_ttl_seconds: &std::collections::HashMap<String, u64>,
+        now_ns: u64,
+    ) -> Option<Self> {
         let cutoff = |ttl_seconds: u64| {
             (ttl_seconds > 0)
                 .then(|| now_ns.saturating_sub(ttl_seconds.saturating_mul(1_000_000_000)))
         };
-        let default = config.ttl_seconds.and_then(cutoff);
-        let tenants: std::collections::HashMap<String, Option<u64>> = config
-            .tenant_ttl_seconds
+        let default = ttl_seconds.and_then(cutoff);
+        let tenants: std::collections::HashMap<String, Option<u64>> = tenant_ttl_seconds
             .iter()
             .map(|(tenant, ttl)| (tenant.clone(), cutoff(*ttl)))
             .collect();
@@ -2186,6 +2414,12 @@ pub struct Store {
     /// astride it. Outermost in the lock order: taken before writer,
     /// erasures, or annotations, and never while holding any of them.
     erasure_gate: std::sync::RwLock<()>,
+    /// The hash chain over published generations and erasures, outside
+    /// every generation. See [`ledger`]. Its locks are leaf-level but one:
+    /// the lock serializing evidence packs' chain walks, which a pack takes
+    /// BEFORE `maintenance` and holds while it walks after releasing
+    /// `maintenance`, and which nothing takes while holding an engine lock.
+    ledger: ledger::Ledger,
     next_segment: AtomicU64,
     /// Present unless durability is [`Durability::Buffered`]. Guards the gap
     /// between acknowledging a write and sealing it into a segment.
@@ -2201,6 +2435,20 @@ pub struct Store {
     /// futility backoff. See [`Store::finish_shadow_pass`].
     shadow_pass: Mutex<ShadowPassClock>,
     metrics: metrics::Metrics,
+    /// Credentials, tenant limits and usage counters — the hosting state,
+    /// kept outside generations (see [`platform`]). Each part's lock is
+    /// leaf-level.
+    platform: platform::State,
+    /// The run guard, fed by every acknowledged batch; `None` when
+    /// [`Config::fuses`] disables it. Its locks are leaf-level: never held
+    /// while an engine lock is taken.
+    guard: Option<guard::Guard>,
+    /// Cached Fate Map builds. Its lock is leaf-level and never held while
+    /// the store is read; every erasure empties it.
+    fate: fate::FateCache,
+    /// Nudges and live-stream slots, beside the guard; `None` when the
+    /// guard is. Its lock is leaf-level.
+    steer: Option<steer::Steer>,
     _directory_lock: DirectoryLock,
 }
 
@@ -2331,16 +2579,25 @@ impl Store {
                 .map_or(0, |number| number.saturating_add(1));
             let tail_ring_spans = config.tail_ring_spans;
             let tail_ring_bytes = config.tail_ring_bytes;
+            // Replayed before serving: a pending erasure — one whose purge a
+            // crash interrupted — masks its subject from the first query this
+            // store answers, and stays masked until the resumed purge settles
+            // it (see [`Store::resume_erasures`]).
+            let erasures = erasure::ErasureLog::open(&directory)?;
+            // After the erasure log, because the ledger's reconcile ledgers
+            // every settled erasure a crash left unledgered.
+            let ledger = ledger::open_reconciled(&directory, live_generation, &erasures)?;
 
             Ok(Self {
+                guard: guard::Guard::open(&directory, &config.fuses)?,
+                fate: fate::FateCache::new(&config.fate),
+                steer: steer::Steer::open(&directory, config.fuses.enabled)?,
                 annotations: annotations::AnnotationLog::open(&directory)?,
                 evals: evals::EvalLog::open(&directory)?,
-                // Replayed before serving: a pending erasure — one whose purge
-                // a crash interrupted — masks its subject from the first query
-                // this store answers, and stays masked until the resumed purge
-                // settles it (see [`Store::resume_erasures`]).
-                erasures: erasure::ErasureLog::open(&directory)?,
+                erasures,
+                platform: platform::State::open(&directory)?,
                 erasure_gate: std::sync::RwLock::new(()),
+                ledger,
                 directory,
                 live_generation: AtomicU64::new(live_generation),
                 config,
@@ -2385,6 +2642,10 @@ impl Store {
         for span in &spans {
             validate_span(span)?;
         }
+        // Admission policy refuses here: the batch is known valid, and
+        // nothing about it has been decided yet — no gate, no offload, no
+        // log append — so a refusal is batch-atomic and leaves no trace.
+        let mut admitting = self.admission_check(&spans)?;
         let sent = spans.len();
         let mut spans = spans;
 
@@ -2410,7 +2671,9 @@ impl Store {
         if let Some(mask) = &mask {
             // Covered spans are dropped BEFORE payload offloading, so a
             // suppressed span's oversized values never reach the filesystem.
-            spans.retain(|span| !mask.covers_for_drop(span));
+            // Their measurements are dropped with them, in the same pass, so
+            // usage charges every survivor its own size.
+            admitting.retain(&mut spans, |span| !mask.covers_for_drop(span));
         }
         if let Some(threshold) = self.config.payload_threshold {
             // Offloading consults the mask too: content whose hash IS a
@@ -2441,11 +2704,12 @@ impl Store {
                 return Ok(Admission {
                     accepted: 0,
                     suppressed: sent,
+                    signals: Vec::new(),
                 });
             }
         }
 
-        self.admit(spans, sent, gate)
+        self.admit(spans, sent, gate, &admitting)
     }
 
     /// The acknowledgement path shared by both ingest surfaces.
@@ -2474,6 +2738,7 @@ impl Store {
         spans: Vec<Span>,
         sent: usize,
         gate: std::sync::RwLockReadGuard<'_, ()>,
+        admitting: &caps::Admitting,
     ) -> Result<Admission> {
         // The caller holds the erasure gate in read mode and already applied
         // the mask it loaded under it — drops, masked offloading, redaction.
@@ -2488,6 +2753,7 @@ impl Store {
         let seal_must_wait;
         let admitted;
         let admitted_handles;
+        let first_revision;
         // Encode the log frame BEFORE taking the writer lock. Serializing a
         // batch is pure CPU proportional to its size, and doing it under the
         // lock made every concurrent ingest wait for it. Only the file write
@@ -2508,6 +2774,10 @@ impl Store {
                 );
             }
             admitted = spans.len() as u64;
+            // Span `i` of the batch is stored at `first_revision + i`: the
+            // order observers need to tell a newer version from an older one
+            // whose observer happens to run after it.
+            first_revision = writer.revision() + 1;
             admitted_handles = self.metrics.buffer_upsert.time(|| {
                 spans
                     .into_iter()
@@ -2561,6 +2831,12 @@ impl Store {
         // The cursor only needs the numbers to be monotonic and gapless, which
         // assigning them at push guarantees however threads interleave.
         self.tail.publish(&admitted_handles);
+        // Observers see the same acknowledged batch the tail just did, for
+        // the same reason: what they react to must be what the store kept.
+        let observed = self.observe_admitted(&admitted_handles, first_revision);
+        // Usage is charged for the same acknowledged batch, at the sizes
+        // admission measured before the offload rewrote the large values.
+        self.record_usage(&admitted_handles, admitting);
 
         self.metrics.spans_admitted.add(admitted);
         self.metrics.batches_admitted.increment();
@@ -2571,6 +2847,7 @@ impl Store {
         Ok(Admission {
             accepted: admitted as usize,
             suppressed,
+            signals: observed.fuses,
         })
     }
 
@@ -2677,8 +2954,12 @@ impl Store {
     /// was called are in a segment on disk. Spans ingested by other threads
     /// WHILE it runs may still be buffered afterwards — they arrived after the
     /// snapshot this call sealed, and the next seal takes them.
+    ///
+    /// The usage counters are written too ([`Store::persist_usage`]): a flush
+    /// is the embedder's "make it durable" verb.
     pub fn flush(&self) -> Result<()> {
-        self.seal(SealWait::ForPermit).map(|_| ())
+        self.seal(SealWait::ForPermit)?;
+        self.persist_usage()
     }
 
     /// Returns all spans belonging to `trace_id`, ordered by start time.
@@ -2716,9 +2997,25 @@ impl Store {
         trace_id: &str,
         deadline: Option<Deadline>,
     ) -> Result<Vec<Span>> {
+        self.trace_spans_at(tenant, trace_id, deadline)
+            .map(|(spans, _)| spans)
+    }
+
+    /// [`Self::trace_spans_in`], plus the write revision it read the store
+    /// at (see [`Store::observe_admitted`]). Taken under the writer lock the
+    /// whole walk holds, so the walk sees the store exactly as it stood at
+    /// that revision: every version stored at or below it, as later ones at
+    /// or below it replaced them, and nothing stored after it.
+    pub(crate) fn trace_spans_at(
+        &self,
+        tenant: Option<&str>,
+        trace_id: &str,
+        deadline: Option<Deadline>,
+    ) -> Result<(Vec<Span>, u64)> {
         let mask = self.erasure_mask();
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
+        let revision = writer.revision();
         let mut result = Vec::new();
 
         let in_scope = |span: &Span| tenant.map_or(true, |tenant| span.tenant.as_str() == tenant);
@@ -2775,7 +3072,7 @@ impl Store {
         sort_spans(&mut result);
         // Final check before a complete trace leaves; see `query_view_costed`.
         Deadline::check(deadline, segments_examined)?;
-        Ok(result)
+        Ok((result, revision))
     }
 
     /// Returns spans matching `filter`, ordered by Traza's stable span order.
@@ -2801,17 +3098,22 @@ impl Store {
     /// `values` lists the accepted encodings of one logical value (a session
     /// id may arrive as the string `"42"` or the number `42`), so the caller
     /// does not have to guess which JSON type a producer used.
+    ///
+    /// Returned with the write revision it read the store at, exactly as
+    /// [`Self::trace_spans_at`] reports one.
     pub(crate) fn query_attribute_union(
         &self,
         keys: &[&str],
         values: &[Value],
         deadline: Option<Deadline>,
-    ) -> Result<Vec<Span>> {
+    ) -> Result<(Vec<Span>, u64)> {
         let mask = self.erasure_mask();
         // Lock order: writer before segments (see Store field docs).
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
+        let revision = writer.revision();
         attribute_union_view(&writer, &segments, keys, values, mask.as_deref(), deadline)
+            .map(|spans| (spans, revision))
     }
 
     /// The configured compute budget anchored at `started`, or `None` when
@@ -3642,6 +3944,36 @@ pub(crate) fn fold_view(
     cost: &mut QueryCost,
     visit: &mut impl FnMut(&Span),
 ) -> Result<()> {
+    fold_view_while(
+        writer,
+        segments,
+        metrics,
+        pricing,
+        filter,
+        mask,
+        deadline,
+        cost,
+        &mut |span| {
+            visit(span);
+            true
+        },
+    )
+}
+
+/// [`fold_view`] that stops — decoding nothing more — as soon as `visit`
+/// returns `false`, for a search that has seen enough (a candidate cap).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_view_while(
+    writer: &WriteBuffer,
+    segments: &[std::sync::Arc<Segment>],
+    metrics: &metrics::Metrics,
+    pricing: &crate::pricing::Pricing,
+    filter: &SpanFilter,
+    mask: Option<&erasure::Mask>,
+    deadline: Option<Deadline>,
+    cost: &mut QueryCost,
+    visit: &mut impl FnMut(&Span) -> bool,
+) -> Result<()> {
     // Same rule as the query path: a pending erasure's subject never reaches
     // an aggregation, even before its bytes are rewritten away.
     let visible = |span: &Span| mask.map_or(true, |mask| !mask.covers(span));
@@ -3696,8 +4028,9 @@ pub(crate) fn fold_view(
                 pricing,
                 deadline,
                 cost.segments_examined,
-            )? {
-                visit(&span);
+            )? && !visit(&span)
+            {
+                return Ok(());
             }
         }
     }
@@ -3709,8 +4042,8 @@ pub(crate) fn fold_view(
             decoded_since_check = 0;
             Deadline::check(deadline, cost.segments_examined)?;
         }
-        if visible(span) && span_matches(span, filter, content.as_ref()) {
-            visit(span);
+        if visible(span) && span_matches(span, filter, content.as_ref()) && !visit(span) {
+            return Ok(());
         }
     }
     // Final check before the fold reports completion: a fold past its
@@ -3734,13 +4067,20 @@ impl Store {
     /// [`SnapshotView`], whose cost is one copy of the bounded write buffer
     /// and one `Arc` clone per segment. That also makes the answer coherent:
     /// a fold sees one instant of the store rather than a moving one.
-    pub fn fold_spans(
+    pub fn fold_spans(&self, filter: &SpanFilter, visit: impl FnMut(&Span)) -> Result<QueryCost> {
+        self.fold_spans_under(filter, self.query_deadline(Instant::now()), visit)
+    }
+
+    /// [`Self::fold_spans`] under a budget the caller anchored — for a
+    /// request whose fold is one step of several sharing one budget (an
+    /// evidence pack), so the fold gets what is left, not a fresh one.
+    pub(crate) fn fold_spans_under(
         &self,
         filter: &SpanFilter,
+        deadline: Option<Deadline>,
         mut visit: impl FnMut(&Span),
     ) -> Result<QueryCost> {
         let started = std::time::Instant::now();
-        let deadline = self.query_deadline(started);
         let mut cost = QueryCost::default();
         if let Some(session_id) = &filter.session {
             // A session unions several attribute keys, which no single index
@@ -3757,6 +4097,44 @@ impl Store {
         } else {
             let view = self.snapshot()?; // takes both locks, then releases them
             view.fold(filter, deadline, &mut cost, &mut visit)?;
+        }
+        cost.elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        Ok(cost)
+    }
+
+    /// [`Self::fold_spans_under`] that stops as soon as `visit` returns
+    /// `false`: nothing past that span is decoded, so a search that caps how
+    /// many candidates it verifies costs the cap, not the corpus.
+    pub(crate) fn fold_spans_while(
+        &self,
+        filter: &SpanFilter,
+        deadline: Option<Deadline>,
+        mut visit: impl FnMut(&Span) -> bool,
+    ) -> Result<QueryCost> {
+        let started = std::time::Instant::now();
+        let mut cost = QueryCost::default();
+        if let Some(session_id) = &filter.session {
+            let content = filter.content.as_deref().map(content::Query::new);
+            for span in
+                self.resolve_session_spans(filter.tenant.as_deref(), session_id, deadline)?
+            {
+                if span_matches(&span, filter, content.as_ref()) && !visit(&span) {
+                    break;
+                }
+            }
+        } else {
+            let view = self.snapshot()?;
+            fold_view_while(
+                &view.buffer,
+                &view.segments,
+                view.metrics,
+                &view.pricing,
+                filter,
+                view.mask.as_deref(),
+                deadline,
+                &mut cost,
+                &mut visit,
+            )?;
         }
         cost.elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         Ok(cost)
@@ -3859,16 +4237,38 @@ impl Store {
 
     /// Annotations matching `narrow`, newest first, across every trace unless
     /// one is named. See [`annotations::AnnotationQuery`].
+    ///
+    /// The walk spends the configured [`Config::query_deadline`]: past it the
+    /// answer is [`Error::DeadlineExceeded`] and nothing. With a `limit` it
+    /// holds no more than that many annotations at once, however many match.
     pub fn search_annotations(
         &self,
         narrow: &annotations::AnnotationQuery<'_>,
     ) -> Result<Vec<annotations::Annotation>> {
-        let mut found = self.annotations.search(narrow)?;
-        // Same rule as [`Self::annotations`], for the same reason.
-        if let Some(mask) = self.erasure_mask() {
-            found.retain(|annotation| !mask.covers_annotation(annotation));
-        }
-        Ok(found)
+        self.search_annotations_under(narrow, self.query_deadline(Instant::now()))
+            .map(|searched| searched.found)
+    }
+
+    /// [`Self::search_annotations`] under a caller-anchored budget, with how
+    /// many annotations matched — so a listing built on it spends its
+    /// request's one budget and can say what its limit left out.
+    pub(crate) fn search_annotations_under(
+        &self,
+        narrow: &annotations::AnnotationQuery<'_>,
+        deadline: Option<Deadline>,
+    ) -> Result<annotations::Searched> {
+        // Same rule as [`Self::annotations`], for the same reason — applied
+        // inside the walk, so a withheld annotation takes no place within
+        // the limit.
+        let mask = self.erasure_mask();
+        self.annotations.search(
+            narrow,
+            |annotation| {
+                mask.as_deref()
+                    .is_some_and(|mask| mask.covers_annotation(annotation))
+            },
+            deadline,
+        )
     }
 
     // ------------------------------------------------------------- evals
@@ -4276,40 +4676,58 @@ impl Store {
     /// reference sets, then the tenant posting), paid only by bound
     /// callers on a fetch-shaped request.
     pub fn payload_in(&self, tenant: Option<&str>, reference: &str) -> Result<Option<Vec<u8>>> {
-        // A payload a pending erasure is due to account for is withheld
-        // while it is pending — the bytes may be seconds from deletion, and
-        // serving them from under an erasure in progress is the same failure
-        // as serving the span. A shared reference that survives (retained
-        // for live spans outside the subject) resurfaces at settle.
-        if let Some(mask) = self.erasure_mask() {
-            if mask.covers_payload_file(reference) {
-                return Ok(None);
-            }
-            // A whole-tenant erasure discovers its span-held references only
-            // as its purge walks them, so `payload_files` is still filling
-            // while the mask already hides the tenant. A scoped fetch must
-            // not race that gap: the tenant is being erased, so nothing of
-            // its is served, whether or not this exact reference has been
-            // enumerated yet. The operator (unscoped) fetch is governed by
-            // `payload_files` alone, as it was — its capability is the hash.
-            if let Some(tenant) = tenant {
-                if mask.covers_tenant(tenant) {
-                    return Ok(None);
-                }
-            }
+        self.payload_in_under(tenant, reference, self.query_deadline(Instant::now()))
+    }
+
+    /// [`Self::payload_in`] under the calling request's compute budget, for
+    /// a request that reads many payloads (a resolved tape) and must spend
+    /// ONE budget across them rather than a fresh one per reference.
+    pub(crate) fn payload_in_under(
+        &self,
+        tenant: Option<&str>,
+        reference: &str,
+        deadline: Option<Deadline>,
+    ) -> Result<Option<Vec<u8>>> {
+        if self.payload_withheld(tenant, reference) {
+            return Ok(None);
         }
         if let Some(tenant) = tenant {
             // The reachability probe can decode a tenant's every record in a
-            // sidecar-less segment, per request, so it runs under the same
-            // budget as any other query — anchored here, at the public
-            // entry. Erasure work never reaches this probe: its accounting
-            // reads mask-free through `tenant_span_payload_refs`.
-            let deadline = self.query_deadline(Instant::now());
+            // sidecar-less segment, per request, so it runs under the
+            // request's budget like any other query. Erasure work never
+            // reaches this probe: its accounting reads mask-free through
+            // `tenant_span_payload_refs`.
             if !self.tenant_holds_reference(tenant, reference, deadline)? {
                 return Ok(None);
             }
         }
         payload::load_payload(&self.directory, reference)
+    }
+
+    /// Whether a pending erasure withholds `reference` from a read under
+    /// `tenant` — the cheap, probe-free half of [`Self::payload_in`], which a
+    /// caller that has already proven reachability re-checks before every
+    /// re-read.
+    pub(crate) fn payload_withheld(&self, tenant: Option<&str>, reference: &str) -> bool {
+        // A payload a pending erasure is due to account for is withheld
+        // while it is pending — the bytes may be seconds from deletion, and
+        // serving them from under an erasure in progress is the same failure
+        // as serving the span. A shared reference that survives (retained
+        // for live spans outside the subject) resurfaces at settle.
+        let Some(mask) = self.erasure_mask() else {
+            return false;
+        };
+        if mask.covers_payload_file(reference) {
+            return true;
+        }
+        // A whole-tenant erasure discovers its span-held references only as
+        // its purge walks them, so `payload_files` is still filling while the
+        // mask already hides the tenant. A scoped fetch must not race that
+        // gap: the tenant is being erased, so nothing of its is served,
+        // whether or not this exact reference has been enumerated yet. The
+        // operator (unscoped) fetch is governed by `payload_files` alone, as
+        // it was — its capability is the hash.
+        tenant.is_some_and(|tenant| mask.covers_tenant(tenant))
     }
 
     /// The eval log's payload references, for the liveness union in
@@ -4461,7 +4879,8 @@ impl Store {
 
     /// Expires spans, annotations, and payload files older than their
     /// tenant's retention window (no-op when no TTL is configured at all).
-    /// Every tenant expires on its own cutoff: its override if listed in
+    /// Every tenant expires on its own cutoff: its runtime override
+    /// ([`limits::TenantLimits::ttl_seconds`]), else its entry in
     /// [`Config::tenant_ttl_seconds`], else the global TTL, else never.
     pub fn compact_expired(&self) -> Result<usize> {
         let now_ns = SystemTime::now()
@@ -4469,7 +4888,9 @@ impl Store {
             .unwrap_or_default()
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
-        let Some(cutoffs) = ExpiryCutoffs::from_config(&self.config, now_ns) else {
+        let policy = self.tenant_ttl_policy()?;
+        let Some(cutoffs) = ExpiryCutoffs::from_policy(self.config.ttl_seconds, &policy, now_ns)
+        else {
             return Ok(0);
         };
         let _maintenance = self.lock_maintenance()?;
@@ -5729,6 +6150,13 @@ impl Store {
             }
         }
         let _ = generation::sweep_generations(&self.directory, next);
+        // Ledgered last, once the generation is durable: a crash before this
+        // leaves a generation without an entry, which the next open's
+        // reconcile appends — never an entry for a generation that is not.
+        // Housekeeping like the sweep: a failed append is kept for
+        // verification and caught up later, never reported as a failed
+        // checkpoint (the generation is committed).
+        self.ledger_checkpoint(next);
         Ok(next)
     }
 
@@ -5821,6 +6249,10 @@ impl Store {
                 }
             }
             generation::write_pin_manifest(&staged, &manifest)?;
+            // The ledger as of this pin, ending on the checkpoint entry
+            // naming the pinned manifest — evidence that travels with the
+            // backup. Never installed by a restore: it is not manifested.
+            self.ledger_copy_into(&staged, generation)?;
             Ok(())
         })();
         if let Err(error) = build {
@@ -6147,6 +6579,9 @@ impl Store {
     fn complete_erasure(&self, record: &erasure::EraseRecord) -> Result<erasure::SettleRecord> {
         let erasing = Instant::now();
         let subject = &record.subject;
+        // The mask is up: new Fate Map builds cannot see the subject, and
+        // cached ones (and any in flight) must not keep serving it.
+        self.forget_fate();
 
         let (purge, annotations_removed, eval_records_removed, payloads_removed, payloads_retained) = {
             // One rewriter at a time, same as compaction and expiry.
@@ -6300,6 +6735,9 @@ impl Store {
         // admitted later are new data and flow normally. A tenant subject
         // resolves no keys — its veil is the tenant predicate itself.
         self.veil_tail(subject, &purge.keys);
+        self.forget_fuse_subject(subject, &purge.keys)?;
+        self.forget_fate();
+        self.forget_steer_subject(subject)?;
 
         // ---- confirm: everything mutable, BEFORE the checkpoint ----------
         // The admission barrier suppresses covered spans (and the annotate
@@ -6342,6 +6780,8 @@ impl Store {
         };
         if !confirm.keys.is_empty() {
             self.veil_tail(subject, &confirm.keys);
+            self.forget_fuse_subject(subject, &confirm.keys)?;
+            self.forget_fate();
         }
         // Annotations that arrived before the annotate barrier went up get
         // the same confirm treatment; a no-op rewrite costs nothing (the
@@ -6390,6 +6830,10 @@ impl Store {
             payloads_retained,
             eval_records_removed,
         };
+        // From before the settle is written until its entry is appended, a
+        // live ledger verification that finds the settle without the entry
+        // knows the entry is on its way rather than missing.
+        let settling = self.ledger_settling(record.id);
         {
             let _gate = self
                 .erasure_gate
@@ -6397,6 +6841,13 @@ impl Store {
                 .map_err(|_| Error::LockPoisoned("erasure gate"))?;
             self.erasures.record_settle(settle.clone())?;
         }
+        #[cfg(test)]
+        self.ledger_after_settle_hook();
+        // Ledgered once the settle is durable; a crash in between is healed
+        // by the next open's reconcile. Never fails the erasure: it is
+        // settled and its barrier lifted, whatever the ledger does.
+        self.ledger_erasure(record.id, subject, generation);
+        drop(settling);
         self.metrics.erasures_settled.increment();
         self.metrics.erasure_spans_removed.add(spans_removed as u64);
         self.metrics.erasure.record(elapsed_nanos(&erasing));
@@ -6959,9 +7410,12 @@ impl Store {
 
         // ---- annotation log -------------------------------------------------
         {
+            // Erasure work is exempt from the query budget, and reads every
+            // record, withheld or not: it reports what the log still holds.
             let all = self
                 .annotations
-                .search(&annotations::AnnotationQuery::default())?;
+                .search(&annotations::AnnotationQuery::default(), |_| false, None)?
+                .found;
             // Matched against the annotation's own typed subject, tenant
             // included: a session-subject annotation carries no span address
             // for the key set to catch, and a tenant subject dooms by
@@ -7322,6 +7776,18 @@ impl Store {
                 "retains the subject's identifiers and resolved keys as the record \
                  of this erasure — that record is what this receipt verifies against; \
                  erasing the record of erasure means deleting the store"
+                    .to_owned(),
+            );
+            report.result = "retained-by-design".to_owned();
+            domains.push(report);
+        }
+        {
+            let mut report = erasure::DomainReport::clear(
+                "ledger",
+                "the erasure's ledger entry, appended once it settles, carries its id, \
+                 subject kind, tenant, publishing generation and a SHA-256 of the subject \
+                 — never a trace, span or session id or a payload reference (a tenant \
+                 subject's name is its tenant field)"
                     .to_owned(),
             );
             report.result = "retained-by-design".to_owned();
@@ -8680,6 +9146,111 @@ mod planner_tests {
             select_probe(&seg, &absent, None, &metrics::Metrics::default())
                 .expect("plan")
                 .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod directory_lock_tests {
+    use super::*;
+
+    /// Above every PID a kernel hands out: Linux caps PIDs below 2^22 and the
+    /// BSDs (macOS included) below 100,000.
+    const NO_SUCH_PID: u32 = 1 << 22;
+
+    fn scratch(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "traza-lock-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch directory");
+        dir
+    }
+
+    fn mount_proc(proc_root: &Path, options: &str) {
+        fs::write(
+            proc_root.join("self/mounts"),
+            format!(
+                "sysfs /sys sysfs ro,nosuid 0 0\nproc /proc proc rw,nosuid,nodev,noexec,{options} 0 0\n"
+            ),
+        )
+        .expect("mounts");
+    }
+
+    #[test]
+    fn procfs_answers_from_the_pid_directory() {
+        let proc_root = scratch("procfs");
+        // An unmounted /proc is an empty directory; only a mounted procfs has
+        // `self`, and without it absence proves nothing.
+        assert_eq!(process_exists_in_procfs(&proc_root, 42), None);
+        fs::create_dir_all(proc_root.join("self")).expect("self");
+        fs::create_dir_all(proc_root.join("42")).expect("pid directory");
+        mount_proc(&proc_root, "relatime");
+        assert_eq!(process_exists_in_procfs(&proc_root, 42), Some(true));
+        assert_eq!(process_exists_in_procfs(&proc_root, 43), Some(false));
+        // `noaccess` locks other users' directories but still lists them.
+        mount_proc(&proc_root, "relatime,hidepid=noaccess");
+        assert_eq!(process_exists_in_procfs(&proc_root, 43), Some(false));
+        // `invisible` (and `ptraceable`) hide them: a directory present still
+        // proves a process, an absent one no longer proves anything.
+        for hiding in [
+            "hidepid=invisible",
+            "hidepid=2",
+            "hidepid=ptraceable",
+            "hidepid=4",
+        ] {
+            mount_proc(&proc_root, hiding);
+            assert_eq!(
+                process_exists_in_procfs(&proc_root, 42),
+                Some(true),
+                "{hiding}"
+            );
+            assert_eq!(process_exists_in_procfs(&proc_root, 43), None, "{hiding}");
+        }
+        // Mount options that cannot be read cannot rule hiding out either.
+        fs::remove_file(proc_root.join("self/mounts")).expect("unmount");
+        assert_eq!(process_exists_in_procfs(&proc_root, 43), None);
+        let _ = fs::remove_dir_all(&proc_root);
+    }
+
+    #[test]
+    fn with_neither_procfs_nor_kill_liveness_is_undecided() {
+        // The FROM scratch release image on a host without procfs: nothing can
+        // tell, and an undecided owner must be kept, never reclaimed.
+        let empty = scratch("no-procfs");
+        assert_eq!(
+            process_exists_with(&empty, "/nonexistent/kill", NO_SUCH_PID),
+            None
+        );
+        let _ = fs::remove_dir_all(&empty);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_decides_where_it_can_run() {
+        assert_eq!(
+            process_exists_by_signal("kill", std::process::id()),
+            Some(true)
+        );
+        assert_eq!(process_exists_by_signal("kill", NO_SUCH_PID), Some(false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_decides_from_proc_without_kill() {
+        // The release image is FROM scratch, so it has no `kill` to run; a
+        // container always mounts /proc, which must decide on its own.
+        let proc_root = Path::new("/proc");
+        assert_eq!(
+            process_exists_with(proc_root, "/nonexistent/kill", std::process::id()),
+            Some(true)
+        );
+        assert_eq!(
+            process_exists_with(proc_root, "/nonexistent/kill", NO_SUCH_PID),
+            Some(false)
         );
     }
 }

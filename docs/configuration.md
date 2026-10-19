@@ -159,7 +159,7 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | Flag | Default | What it does, and what it costs |
 |---|---|---|
 | `--data-dir DIR` | `./data` | Directory for all state; created if missing. One writer process per directory. |
-| `--host ADDR` | `127.0.0.1` | Bind address. A non-loopback bind requires `TRAZA_TOKENS` or `--allow-unauthenticated-non-loopback`. |
+| `--host ADDR` | `127.0.0.1` | Bind address. A non-loopback bind requires configured authentication — `TRAZA_TOKENS`, or a runtime credential already in the data directory's `credentials.jsonl` — or `--allow-unauthenticated-non-loopback`. |
 | `--port PORT` | `8080` | Bind port. `0` binds an ephemeral port and announces it on stderr. |
 | `--profile NAME` | `balanced` | Sets `--flush-spans` and `--wal-commit-window-us` as a group. Never changes durability. See [Profiles](#profiles). |
 | `--durability MODE` | `wal` | What a `200` guarantees. `buffered` is fastest and **loses acknowledged writes on a crash**; `wal` fsyncs to the log; `flushed` seals a segment per call. Costs: see the table below. |
@@ -169,13 +169,18 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `--no-shadow-seal` | off (corrective pass is on) | Stops the store answering **observed segment-key shadowing** with a bounded deduplicating merge. Left on, an aggregation that had to decode instead of using a rollup — because the same `(trace_id, span_id)` exists in two segments — latches a flag; the maintenance tick converts it into a merge of the shadowed tail run, bounded by `--compaction-max-segment-bytes`, cooled down for 15 minutes after a successful merge, and backed off exponentially (to hourly) when nothing mergeable is in reach. `traza_shadow_merges_total` counts the merges. The trigger is the observed mechanism, never a latency threshold, and it stops firing the moment the duplicates are merged away. Buffer-caused shadowing — a buffered upsert of a persisted key — deliberately does not latch: a merge cannot retire it, and `--max-buffer-age-seconds` is what bounds it. Inert when compaction is disabled, which owns all merging. |
 | `--wal-commit-window-us N` | `0` (off) | Delays each fsync by up to this long so more batches join it. Costs every acknowledgement in the window up to that delay. Buys nothing on an idle store and a lot on a busy one with small batches. Never weakens the guarantee: the ack still follows the fsync. |
 | `--ttl-seconds N` | off | Rolling retention window. A background pass compacts expired spans every minute; annotations and payload files age out on the same window. Costs a periodic compaction pass. |
-| `--tenant-ttl TENANT=SECONDS` | off | Per-tenant retention override, repeatable. A tenant's cutoff is its override, else `--ttl-seconds`, else **never** — an unlisted tenant on a server with no global TTL keeps everything. `0` disables that tenant's window; an invalid tenant name refuses startup. Scores (experiment-example annotations) are exempt from TTL regardless. See [administration § Per-tenant retention](operations/administration.md#per-tenant-retention). |
+| `--tenant-ttl TENANT=SECONDS` | off | Per-tenant retention override, repeatable. A tenant's cutoff is its runtime limits document's `ttl_seconds` if set, else this override, else `--ttl-seconds`, else **never** — an unlisted tenant on a server with no global TTL keeps everything. `0` disables that tenant's window; an invalid tenant name refuses startup. Scores (experiment-example annotations) are exempt from TTL regardless. See [administration § Per-tenant retention](operations/administration.md#per-tenant-retention). |
 | `--max-connections N` | `1024` | Concurrent connections served; past it clients get `503` rather than being queued. Costs one thread per live connection. |
-| `--query-deadline-ms N` | `30000` | Wall-clock budget one query or aggregation may spend inside the engine. Past it the request answers `400 {"error": "query deadline exceeded: ..."}` and **no rows** — never a partial aggregate, which would be a wrong answer that looks like a right one. Costs a clock read per segment, per merge step on the limited query path, per few thousand decoded **or buffered** records — a rollup sidecar rebuilt on a query path included — and once more before a completed answer is returned. *(Amended with the v0.24.1 external-review fixes: buffered-span sweeps and sidecar rebuilds used to run outside the budget, so an unflushed corpus or a sidecar-less segment could answer in full under an exhausted budget.)* The worst measured legitimate query in this repo is ~3 s (a whole-corpus `/v1/stats/duration` over 1M spans, `examples/needle`), so 30 s bounds a runaway scan without touching measured use. **What it does not protect**: [`GET /v1/export`](guide/http-api.md#get-v1export) and [`GET /v1/tail`](guide/http-api.md#get-v1tail) are documented unbounded and exempt (the socket timeout bounds abandonment), and erasure work is exempt — a partial receipt is worse than a slow one. `traza_query_deadline_exceeded_total` counts the HTTP refusals; an MCP tool's refusal surfaces in the tool result instead, uncounted. `0` disables. |
+| `--query-deadline-ms N` | `30000` | Wall-clock budget one query or aggregation may spend inside the engine. Past it the request answers `400 {"error": "query deadline exceeded: ..."}` and **no rows** — never a partial aggregate, which would be a wrong answer that looks like a right one. Costs a clock read per segment, per merge step on the limited query path, per few thousand decoded **or buffered** records — a rollup sidecar rebuilt on a query path included — per 16 spans of step extraction and per alignment row when a run is read as a tape, replayed or diffed, per few thousand annotations an annotation search (`GET /v1/annotations`, an experiment's scores, a golden listing) walks, and once more before a completed answer is returned. *(Amended with the v0.24.1 external-review fixes: buffered-span sweeps and sidecar rebuilds used to run outside the budget, so an unflushed corpus or a sidecar-less segment could answer in full under an exhausted budget.)* The worst measured legitimate query in this repo is ~3 s (a whole-corpus `/v1/stats/duration` over 1M spans, `examples/needle`), so 30 s bounds a runaway scan without touching measured use. **What it does not protect**: [`GET /v1/export`](guide/http-api.md#get-v1export) and [`GET /v1/tail`](guide/http-api.md#get-v1tail) are documented unbounded and exempt (the socket timeout bounds abandonment), and erasure work is exempt — a partial receipt is worse than a slow one. An [evidence pack](guide/ledger.md#evidence-packs) shares one budget across all its steps (taking in settled erasures, the chain walk, the erasure cross-check, a new generation's manifest, the file check, activity, receipts); a walk, cross-check, manifest read or file check it cuts short keeps its progress for the retry. `traza_query_deadline_exceeded_total` counts the HTTP refusals; an MCP tool's refusal surfaces in the tool result instead, uncounted. `0` disables. |
 | `--payload-threshold-bytes N` | `262144` | String attribute values longer than this are offloaded to the content-addressed payload store and replaced by a reference. `0` disables. Costs an extra file write per offloaded value; saves segment size and buffer memory. **Also bounds content search**: offloading happens at ingest, before anything indexes the span, so an offloaded value is searchable only within its 256-character preview. Since segment v4 this stopped being a lever on *index* memory, so set it on record width and disk alone — and raise it, not lower it, if `?content=` matters. It does still cap how wide a single span can be, which is what `--tail-ring-bytes` is measured against. |
 | `--no-content-index` | off (index is built) | Stops writing the per-segment word filters that make `?content=` fast. **Content search still works** — a segment without the index is scanned rather than skipped, so the same rows come back at the cost of a scan. Saves seal-time tokenization and ~0.1% of segment size. Exposed mainly so the index's value can be measured rather than assumed; see [capacity](operations/capacity.md#content-search). |
 | `--tail-ring-spans N` | `8192` | Recent admissions retained in memory for [`GET /v1/tail`](guide/http-api.md#get-v1tail), as a count. Bounds replay depth: a subscriber further behind than this is told it gapped rather than being silently skipped. **Not a memory bound** — use `--tail-ring-bytes` for that. |
 | `--tail-ring-bytes N` | `33554432` (32 MiB) | Ceiling on the span text the tail's ring holds, and **what actually bounds its memory**. Whichever of the two bounds binds first evicts. The ring becomes the sole owner of a span once a seal drops it from the write buffer, and span size varies by orders of magnitude: on narrow spans the count binds first, while on LLM spans carrying prompts this one does. The newest span is never evicted, so residency can exceed this by at most one span. Observable at [`GET /v1/metrics.json`](guide/http-api.md#get-v1metricsjson) under `tail_ring`. |
+| `--max-span-attributes N` | `1024` | Admission cap: top-level attributes one span may carry. A batch with a span over it is refused whole with `400`, naming the cap and the span. `0` disables. |
+| `--max-attribute-key-bytes N` | `256` | Admission cap: bytes one attribute key may have, in the span's own attributes and in its events' and links' — keys are indexed, so an enormous key is an index cost, not just bytes. `0` disables. |
+| `--max-span-events N` | `1024` | Admission cap: events one span may carry. `0` disables. |
+| `--max-span-bytes N` | `4194304` (4 MiB) | Admission cap: one span's serialized size **as stored** — after values over `--payload-threshold-bytes` become payload references — so a span carrying one huge prompt is fine and a span of thousands of mid-sized inline values is not. Decided before the offload writes anything, so a refused span leaves no payload file. Costs one serialization pass per span on ingest, shared with usage accounting. `0` disables. |
+| `--max-batch-spans N` | `100000` | Admission cap: spans one ingest request may carry. `0` disables. |
 | `--compaction-fanout N` | `4` | Same-size segments merged into one. `0` or `1` disables compaction entirely. Lower merges more often (fewer segments, faster search, more ingest cost); higher merges less often. |
 | `--compaction-max-segment-bytes N` | `268435456` (256 MiB) | Ceiling on a merged segment. Bounds the memory a merge needs, since it materializes its inputs; the cost is a floor on how far the segment count can fall. A merge holds no engine lock, so this does not bound a stall. |
 | `--ui-dir DIR` | discovered | Built dashboard to serve at `/`. Unset ⇒ `$TRAZA_UI_DIR`, `<binary dir>/ui`, `<binary dir>/../share/traza/ui`, `./ui/dist`, first containing `index.html`. None found ⇒ the API runs and `/` 404s with build instructions. |
@@ -184,8 +189,28 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `--mcp-allowed-origin ORIGIN` | none | A browser origin permitted to drive `/v1/mcp`, including the scheme (`https://traza.example.com`). Repeatable, and implies `--mcp`. Loopback origins are always allowed; every other one needs naming here. This is the DNS-rebinding defence, and it is operator-supplied because nothing in the request can validate an origin — a rebinding request controls the `Host` header too. Needed when the dashboard is served behind a hostname, since its MCP screen is a browser page. |
 | `--mcp-max-result-bytes N` | `32768` | Ceiling on one MCP tool result or resource read, counting the **whole serialized result** — text block, `structuredContent`, and the JSON envelope around them — in UTF-8 bytes, which is what goes on the wire. **Refused below 1,024**: beneath that there is no result that both fits and conforms to the `outputSchema` its tool advertises, and failing at startup beats answering every request with something a validating client rejects. Past it, rows are dropped and the truncation is stated with the argument that would have narrowed it. Raise for a client with a large context window; lower to make an agent narrow its own queries. |
 | `--mcp-max-payload-bytes N` | `262144` | Ceiling on one `get_payload` fetch, whatever the call asks for. This is what stops a single offloaded prompt filling a context window. The **effective** cap is the smaller of this and `--mcp-max-result-bytes`, so that the byte count the tool reports is the one it returns. |
+| `--tape-max-bytes N` | `8388608` (8 MiB) | Offloaded payload content one tape inlines when asked to resolve `$payload` references ([`GET /v1/tapes/{run}?resolve=true`](guide/http-api.md#get-v1tapesrun)), and one replay holds when it snapshots a run ([`POST /v1/replays`](guide/http-api.md#post-v1replays)). For a tape the cut is a prefix — the first reference that does not fit, and every one after it, stays a reference and the tape says `resolved_partial: true` — and every occurrence is charged. For a replay only what it keeps is charged: model answers, and tool arguments and results. Recorded requests are resolved one at a time to be digested for strict matching, then dropped, and cost none of it. A replay whose model answers cannot all be held is refused with `409`, naming the step and saying this limit is why; a tool step past it is listed in `unreadable_tool_steps` and refused by `tools/next`. This bounds bytes, not time: resolution runs inside the request's one [`--query-deadline-ms`](#server-flags) budget, checked before every payload read, and a payload referenced from many steps is probed for tenant reachability once per request. `0` resolves nothing. See the [replay guide](guide/replay.md). |
+| `--xray-stale-steps N` | `20` | Steps after which a tool result in a [context X-Ray](guide/xray.md) is reported `stale` when no model output since has drawn on it (a heuristic; see the guide). A per-request `stale_steps=` overrides it. Read-side only: nothing on the ingest path consults it. At least 1 — `0` refuses startup. |
+| `--radar-max-runs N` | `20000` | The most agent runs one [change analysis](guide/radar.md) (`GET /v1/changes`, MCP `what_changed`) analyses, keeping the newest by the start of their first step. Past it, the answer says `truncated: true` and `covered_since_ns` gives the time from which runs are analysed in full; runs whose first step started before it are not analysed at all. Only agent runs count: the read never holds a plain request trace, so those cannot crowd agent runs out, and no store is too big to ask about. This bounds memory: a run held costs typically about a kilobyte and at most about 6 KB (ids, names and outcomes clipped; its first 32 step tokens, up to 64 tool counts and 4 values per dimension), and the read's first pass notes at most twice the cap, so the default holds at most about 120 MB of runs, and under 200 MB in all with the bounded name tables. It does not bound time. Reading the window runs under [`--query-deadline-ms`](#server-flags). At least `1`. |
 | `--pricing FILE` | none | Per-model rates used to derive a cost for LLM spans that did not meter one. Nothing is derived without it, which is the behaviour every store had before it existed. A malformed file refuses startup rather than being ignored — silently reporting `$0.00` is the symptom the file was supplied to fix. Changing the rates invalidates rollups folded under the old ones, which costs a rebuild of the affected sidecars. See [Model pricing](#model-pricing). |
-| `--allow-unauthenticated-non-loopback` | off | Explicitly permit an unauthenticated non-loopback bind. |
+| `--fuse-max-cost-usd F` | off | The **global** [run fuse](guide/guard.md) policy's cost limit, in USD: the policy every run gets whose tenant has no service-matching or `default` policy. Priced cost — metered, else derived from `--pricing`. `0` removes the limit. |
+| `--fuse-max-tokens N` | off | The global policy's token limit. `0` removes it. |
+| `--fuse-max-steps N` | off | The global policy's step limit (LLM, tool and agent spans). `0` removes it. |
+| `--fuse-max-duration-seconds N` | off | The global policy's duration limit, first span start to last span end by the spans' clocks. `0` removes it. |
+| `--fuse-max-repeats N` | `12` | The global policy's repeat limit: how often one step fingerprint — the same call with the same input — may occur among the run's last `--fuse-repeat-window-steps` steps before the run reaches it. At least 2; `0` removes it. |
+| `--fuse-repeat-window-steps N` | `50` | The steps the global policy's repeat limit counts over: a fingerprint repeats when it occurs `--fuse-max-repeats` times among the run's latest N steps, so a long session that repeats a call now and then never reaches it while a tight loop does. 1 to 1000, and at least `--fuse-max-repeats`. See [run fuses § Repeats](guide/guard.md#repeats-count-within-a-window). |
+| `--fuse-max-error-streak N` | off | The global policy's limit on consecutive failed steps. `0` removes it. |
+| `--fuse-max-handoff-cycles N` | off | The global policy's limit on [handoff cycles](guide/steer.md#handoff-cycles-as-a-fuse-limit): how often control may return to a named agent straight from the agent it handed off to (`A → B → A`), for the pair that does it most, since the run's last reset. `0` removes it. |
+| `--fuse-action stop\|warn` | `warn` | What the global policy does at a limit. `warn` reports; `stop` makes the run's verdict `stop` until it is reset. Every policy warns at 80% of a limit either way. The default warns, because a default that stopped someone's agent would be a decision nobody made. |
+| `--fuse-max-runs N` | `100000` | Live runs the fuse observer keeps in memory, least recently active evicted first, shared by every tenant; independently, at most 1,000,000 span contributions are held across them, the steps of the runs' behaviour paths (at most 192 per run, for foresight) included. An evicted run is rebuilt from the store when next asked about, but until then ingest verdicts for it see only the spans that arrive after the eviction. A run evicted while **stopped** is parked instead — its stop kept, its per-span state dropped — and up to this many runs are parked; past that the oldest parked runs are dropped, and a policy stop dropped that way is recomputed by the next rebuild under the policy then in force (a kill switch is durable and is never lost, only its place in the stopped listing). See [run fuses § What is durable](guide/guard.md#what-is-durable-and-what-is-rebuilt). |
+| `--no-fuses` | off (fuses on) | Turns the run-fuse observer off entirely: ingest does no fuse work, `fuses.jsonl` is neither read nor written (so a damaged one cannot keep the server from starting), responses carry no `fuses` field or `Traza-Fuse` header, and every `/v1/fuses/*` route answers `409`. [Live runs and nudges](guide/steer.md) are guard state too: their routes answer `409` and `steer.jsonl` is neither read nor written; run topology still answers. |
+| `--fate-max-runs N` | `20000` | Completed runs one [Fate Map](guide/foresight.md) cohort is built from, the newest first; older ones are dropped and counted (`bounds.runs_dropped`). A build's fold tracks at most four times this many runs across all its cohorts — a window holding more is narrowed to its most recent part that fits (`bounds.window_narrowed`), for every agent of the build alike — and holds at most 2,097,152 step records (32 bytes each, 64 MiB) whatever this says. Values below 1 are raised to 1. |
+| `--fate-max-nodes N` | `50000` | Tree nodes one Fate Map build holds across its cohorts. Nodes are created level by level across every cohort — each depth, most visited first, before any cohort's next depth — so the bound cuts the long tail of deep, rare paths and no agent's tree can starve another's; a cut is reported (`bounds.node_cap`, `nodes_capped` on a map whose cohort it cut, and `cut` on the nodes below which it cut). Values below 1 are raised to 1. |
+| `--fate-cache-seconds N` | `300` | How long a Fate Map build is served before the next request rebuilds it. The predictive fuses (`min_success_odds`) and the [live view's foresight](guide/steer.md#foresight-on-live-runs) read only cached maps — up to twice this old while a background thread rebuilds — and never build on the check or listing path. `0` disables the cache: every map request builds, the predictive fuses never act, live runs carry no foresight, and the guard stops keeping live runs' behaviour paths (`FuseConfig::live_paths`). Any erasure drops every cached build. |
+| `--fate-tenant-maps N` | `32` | Tenants whose default-window Fate Map — the one their predictive fuses read, and that `/v1/fate/runs` and a default `/v1/fate/map` answer from — stays cached at once. These live in a pool no other request can evict from; past this many tenants the least recently used one's is rebuilt when next asked for. Other builds (a task, an explicit window, the operator view) share 8 slots of their own. At most 2 builds run at once. Values below 1 are raised to 1. |
+| `--fate-build-seconds N` | `120` | Budget of a Fate Map build the background warmer makes for the predictive fuses; never less than `--query-deadline-ms`. A build that runs out is retried, after a minute or a cache lifetime, over half its window (down to under two days), widening again a step once a build finishes in under a quarter of its budget; meanwhile the fuses' foresight says why it has no map, and `traza_fate_builds_total{result="failed"}` counts it. `0` gives the warmer the query deadline alone, and no bound at all when `--query-deadline-ms 0` turns that off too. |
+| `--live-window-seconds N` | `900` | How recent a run's last activity — a span arriving, or a pre-call check (one naming its `next` step) — must be for [`GET /v1/runs/live`](guide/http-api.md#get-v1runslive) and its stream to list it. At least 1. Only changes which runs are listed: live state is kept and evicted by the guard's own rules (`--fuse-max-runs`). |
+| `--allow-unauthenticated-non-loopback` | off | Explicitly permit an unauthenticated non-loopback bind. **Every client that reaches the port is then an unbound admin**, and the first to call `POST /v1/admin/credentials` mints the store's first admin credential — closing the store to everyone else, persistently (a later restart with `TRAZA_TOKENS` keeps it alongside). See [the non-loopback refusal](operations/administration.md#the-non-loopback-refusal). |
 | `--version`, `-V` | — | Print `traza-server <version>` and exit. |
 | `--restore DIR` | — | Install a backup from `DIR` into `--data-dir`, then serve it. The backup is verified before anything is swapped and the swap commits at one `CURRENT` rename, so a failed restore leaves the prior store. See [backup and restore](operations/backup.md). |
 
@@ -212,6 +237,63 @@ write; a `kill -9`, a panic, or an OS crash cannot. On Linux `fsync` carries
 the usual guarantee. See the README's durability section for the full
 discussion.
 
+## `traza-server import` and `traza-server blame`
+
+Two client subcommands of the same binary. Neither opens a data directory a
+server is using; both speak plain HTTP to the server named by `--url` (TLS
+belongs in front of the server), presenting `--token` or `TRAZA_TOKEN`. See
+the [recorders guide](guide/recorders.md).
+
+**`traza-server import claude-code|codex`** records coding-agent transcripts as
+runs.
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--path DIR` | `~/.claude/projects` / `~/.codex/sessions` | Where the transcripts are. Searched recursively (eight levels) for `*.jsonl`, and for Codex also `*.jsonl.zst`. |
+| `--url URL` | `http://127.0.0.1:8080` | The server to `POST /v1/spans` to; needs `rw`. Before reading anything the import asks [`GET /v1/whoami`](guide/http-api.md#get-v1whoami): a refused or read-only credential, or a `--tenant` other than a bound credential's own, stops it there. A bound credential stamps its tenant on every span. |
+| `--token TOKEN` | `$TRAZA_TOKEN` | Bearer token for `--url`. |
+| `--data-dir DIR` | — | Ingest straight into a data directory instead (refused while a server holds it), with the server's default 256 KiB payload threshold. |
+| `--dry-run` | off | Convert and count; send and record nothing. |
+| `--tenant TENANT` | none | Tenant to stamp on spans (for an unbound credential or `--data-dir`). Refused with a bound credential bound elsewhere. |
+| `--since DURATION` | all | Only sessions active within `30m`/`12h`/`7d`/`2w`: a Claude Code file counts when its newest timestamped record is that recent (Claude Code appends untimestamped bookkeeping to transcripts it has not run for months, which moves their modification time), a Codex rollout when it was modified that recently. A selected session is read whole: a Claude Code transcript with its sub-agents' files, a Codex rollout with the rollouts of its parent threads (as far as the rollouts on disk tell). |
+| `--project-filter SUBSTR` | all | Only sessions whose file path or working directory contains `SUBSTR`. |
+| `--watch` | off | Keep polling for appended lines and new files. Only files written to in the last 10 minutes keep their converters in memory, at most 64 at any moment (the first pass over a whole history included; past it, the file modified longest ago gives its up). An unreachable or failing server is waited out — progress is kept and the pass retried, the wait doubling from the poll interval up to 30 s — instead of ending the watch; a refused credential still ends it. |
+| `--interval-ms N` | `1000` | Watch poll interval (50–60000). |
+| `--state FILE` | `~/.traza/import-state.json` | Per-destination progress, so a re-run or restart sends only what is new. A destination is the server URL plus the tenant written to (a bound credential's own, else `--tenant`), or a data directory plus `--tenant`; the token itself is never stored. Written atomically. |
+| `--no-state` | off | Ignore and do not write the state file: send everything (idempotent — derived ids, last write wins). |
+| `--json` | off | Print the final counts as JSON instead of a summary line. |
+
+Exit status `0`; `3` when some spans or files were refused (named in the
+output); `2`, with the reason on stderr, when the import could not run — an
+unreadable state file, a refused or read-only credential, a `--tenant` the
+credential is not bound to, an unreachable server (a batch import only: a
+`--watch` waits for it, at start-up too).
+
+**`traza-server blame FILE:LINE`** reads line `LINE` (from 1) of `FILE` and asks
+[`GET /v1/blame`](guide/http-api.md#get-v1blame) which agent step introduced
+it. Inside a git repository (the nearest directory holding `.git`) it sends the
+path relative to the repository root and scopes the search to this repository:
+the root, the main checkout, the directories of checkouts nested inside it
+(`<repo>/.claude/worktrees/*` — where Claude Code puts its worktrees — and the
+parent of any listed worktree inside the repository, so a worktree removed
+since still counts), and every other linked worktree git lists for it (read
+from git's own files; at most 64 in all), each as a `project`. A line some
+other repository's session wrote into its own file of the same name is not an
+answer. Outside a repository it sends the absolute path.
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--url URL` | `http://127.0.0.1:8080` | The server to ask. |
+| `--token TOKEN` | `$TRAZA_TOKEN` | Bearer token (`ro` suffices). |
+| `--tenant TENANT` | none | Tenant scope for an unbound credential. |
+| `--limit N` | `5` | Introductions to show, earliest first, any whose result was never recorded after the applied ones (at most 50). |
+| `--anywhere` | off | Search every project the store holds, not only this repository and its worktrees (sessions recorded at another path, or on another machine). Each answer then names its `project`. |
+| `--json` | off | Print the route's JSON instead of the human rendering. |
+
+Exit status `0` when an introduction was found (applied, or unconfirmed: its
+result was never recorded), `1` when no recorded edit introduced the line (a
+failed edit is none), `2` (reason on stderr) when it could not ask.
+
 ## Model pricing
 
 OpenTelemetry defines no cost attribute, so a span carries one only if the
@@ -224,27 +306,58 @@ surface, which reads as *this was free* rather than *nobody told me the rates*.
 ```json
 {
   "models": {
-    "gpt-5.6-sol":   {"input_per_mtok": 1.25, "output_per_mtok": 10.00},
-    "gpt-4o-mini*":  {"input_per_mtok": 0.15, "output_per_mtok": 0.60},
-    "gpt-4o*":       {"input_per_mtok": 2.50, "output_per_mtok": 10.00}
+    "gpt-6.1-sol":       {"input_per_mtok": 2.00, "output_per_mtok": 10.00,
+                          "cache_read_per_mtok": 0.10, "cache_write_per_mtok": 2.50},
+    "gpt-6-luna":        {"input_per_mtok": 0.10, "output_per_mtok": 0.50,
+                          "cache_read_per_mtok": 0.01, "cache_write_per_mtok": 0.125},
+    "claude-opus-5-5":   {"input_per_mtok": 4.00, "output_per_mtok": 20.00,
+                          "cache_read_per_mtok": 0.20, "cache_write_per_mtok": 5.00},
+    "claude-sonnet-5-5": {"input_per_mtok": 2.00, "output_per_mtok": 10.00,
+                          "cache_read_per_mtok": 0.10, "cache_write_per_mtok": 2.50}
   }
 }
 ```
 
 Rates are **USD per million tokens**, the unit vendors quote, so the file can
-be checked against a price page without arithmetic. A key ending in `*` is a
-prefix pattern; the longest match wins regardless of the order the file lists
-them in, and an exact name beats every pattern. A bare `"*"` is a default rate
-for everything unnamed.
+be checked against a price page without arithmetic; the ones above are the
+vendors' list prices on 2026-10-18. A key ending in `*` is a prefix pattern;
+the longest match wins regardless of the order the file lists them in, and an
+exact name beats every pattern. A bare `"*"` is a default rate for everything
+unnamed. Prefer exact names: a family pattern such as `claude-sonnet-*` also
+matches every later model of that family, which is often priced differently,
+and silently prices it at the older model's rate.
 
 There is no built-in table, and there will not be one: prices change on the
 vendor's schedule rather than Traza's, and self-hosted models have no public
 rate at all.
 
 **What derived cost is.** Arithmetic over the tokens the span reported, at the
-rates you configured. It is not a bill — it knows nothing about cached-prompt
-discounts, batch tiers, reasoning tokens billed at a third rate, or negotiated
+rates you configured. It is not a bill — it knows nothing about batch tiers,
+long-prompt tiers, reasoning tokens billed at a third rate, or negotiated
 pricing.
+
+**Cached prompt tokens** are priced only when the model's entry names their
+rates: `cache_read_per_mtok` and `cache_write_per_mtok`, both optional, both
+USD per million tokens. Providers count them differently, and the provider a
+span names decides how they are applied (the table in
+[Prompt caching](llm-semantics.md#prompt-caching-and-what-prompt-tokens-means)):
+
+| Provider (`gen_ai.provider.name`) | The prompt count is | Derived cost |
+|---|---|---|
+| `anthropic`, `aws.bedrock`; `gcp.vertex_ai` for a model whose name contains `claude` | the uncached remainder | prompt × input rate + cache reads × read rate + cache writes × write rate + output |
+| `openai`, `azure.ai.openai`; `gcp.vertex_ai` for a model whose name contains `gemini` | inclusive of the cached tokens | (prompt − cached) × input rate + cache reads × read rate + cache writes × write rate + output |
+| anything else | unknown | prompt × input rate + output, as before |
+
+Without the cache rates — or for a reported cache counter whose rate is
+missing, a provider whose convention is not known, or cache counters larger
+than the inclusive prompt count they are part of — the old arithmetic stands:
+prompt and output at the two base rates. That **under-counts** an
+Anthropic-style call (its cached tokens are never priced) and **over-counts** an
+OpenAI-style one (its cached tokens are priced at the full input rate), which
+is why the cache rates exist. A table without them digests exactly as before,
+so upgrading invalidates no rollups; adding one invalidates those folded under
+the old arithmetic, as any rate change does. The same rates price the
+[cache autopsy](guide/xray.md#cache-autopsy)'s lost-cache estimate.
 
 Three rules keep it from being mistaken for one:
 
@@ -290,11 +403,11 @@ metered-cost-only rather than leaving derived figures behind.
 
 | Variable | Used by | Effect |
 |---|---|---|
-| `TRAZA_TOKENS` | `traza-server` | Bearer auth: comma-separated `scope[@tenant]:token` entries with `ro`, `rw`, and `admin` scopes. The optional `@tenant` binds the credential to one tenant — it then reads and writes only that tenant's data, on every surface. Set-but-invalid (including an invalid binding) refuses startup rather than running open. Required for a non-loopback bind unless explicitly overridden. |
+| `TRAZA_TOKENS` | `traza-server` | Bearer auth: comma-separated `scope[@tenant]:token` entries with `ro`, `rw`, and `admin` scopes. The optional `@tenant` binds the credential to one tenant — it then reads and writes only that tenant's data, on every surface. Set-but-invalid (including an invalid binding, or a token already registered as a runtime credential) refuses startup rather than running open. These coexist with runtime credentials minted over [`POST /v1/admin/credentials`](guide/http-api.md#post-v1admincredentials), listed as `source: "env"`. A non-loopback bind needs this or a runtime credential, unless explicitly overridden. |
 | `TRAZA_UI_DIR` | `traza-server` | First place searched for the built dashboard when `--ui-dir` is unset. |
 | `TRAZA_SOCKET_TIMEOUT_MS` | `traza-server` | Per-read/write socket deadline; default 30,000. Primarily for tests. |
 | `TRAZA_TEST_PANIC` | `traza-server` | Latched once at startup; set to anything but empty or `0`, `GET /v1/test-panic` exists and panics its handler — the reachable panic the slot-guard tests need. Unset, empty, or `0` — the same "`0` disables" convention as every other knob — the route 404s as always. Primarily for tests. |
-| `TRAZA_TOKEN` | `seed` | Bearer token the seeder presents. |
+| `TRAZA_TOKEN` | `seed`, `traza-server mcp`, `traza-server import`, `traza-server blame` | Bearer token the client presents when no `--token` is given. |
 | `TRAZA_BENCH_SERVER` | `ingest-bench` | Path to a different `traza-server` build, so a before/after comparison runs through one client. |
 | `TRAZA_BENCH_SPANS` | `bench` | Corpus size, so other sizes can be run without overwriting the published figures. |
 | `TRAZA_BENCH_COMPACTION_FANOUT`, `TRAZA_BENCH_COMPACTION_MAX_SEGMENT_BYTES` | `bench` | Compaction settings for the read-path benchmark. |
@@ -311,7 +424,7 @@ same values a `--profile` would give the server.
 | `max_buffer_age` | `Option<Duration>` | `Some(300 s)` | As `--max-buffer-age-seconds`. Enforced opportunistically on the ingest path and by `Store::maintain_buffer`, whose scheduling — like TTL's — is the embedder's job; `traza-server` calls it from its maintenance tick. |
 | `shadow_seal` | `bool` | `true` | As `--no-shadow-seal` inverted. The corrective merge runs inside `Store::maintain_buffer`, so it too needs the caller to own a clock; inert when `compaction` is `None`. |
 | `ttl_seconds` | `Option<u64>` | `None` | As `--ttl-seconds`. The engine implements it; scheduling the pass is the caller's job. |
-| `tenant_ttl_seconds` | `HashMap<String, u64>` | empty | As `--tenant-ttl`, keyed by tenant name. A listed tenant expires on its own window; an unlisted one falls back to `ttl_seconds` — and if that is `None`, never expires, whatever other tenants are configured with. |
+| `tenant_ttl_seconds` | `HashMap<String, u64>` | empty | As `--tenant-ttl`, keyed by tenant name. A listed tenant expires on its own window; an unlisted one falls back to `ttl_seconds` — and if that is `None`, never expires, whatever other tenants are configured with. A runtime override set with `Store::set_tenant_limits` takes precedence over this map; `Store::effective_ttl` reports which layer decides a tenant's window. |
 | `payload_threshold` | `Option<usize>` | `None` | As `--payload-threshold-bytes`. **The library default differs from the server's**: the library offloads nothing unless asked, while `traza-server` defaults to 262,144 bytes. |
 | `durability` | `Durability` | `Wal` | As `--durability`. |
 | `compaction` | `Option<CompactionConfig>` | `Some(default)` | `None` disables compaction. |
@@ -321,6 +434,15 @@ same values a `--profile` would give the server.
 | `tail_ring_spans` | `usize` | `8_192` | As `--tail-ring-spans`: the live tail's replay depth, as a count. Not a memory bound. |
 | `tail_ring_bytes` | `usize` | `33_554_432` (32 MiB) | As `--tail-ring-bytes`: what actually bounds the tail's memory. Whichever of the two binds first evicts. `Store::tail_usage` reports current residency against both. |
 | `pricing` | `Arc<Pricing>` | empty | As `--pricing`, already parsed. Empty derives nothing. `Pricing::parse` reads the documented JSON; see [Model pricing](#model-pricing). |
+| `max_span_attributes` | `Option<usize>` | `Some(1024)` | As `--max-span-attributes`; `None` disables. **The admission caps apply to embedders too**: a violating batch is `Error::Invalid` naming the cap and the span, and nothing from it is stored. |
+| `max_attribute_key_bytes` | `Option<usize>` | `Some(256)` | As `--max-attribute-key-bytes`. |
+| `max_span_events` | `Option<usize>` | `Some(1024)` | As `--max-span-events`. |
+| `max_span_bytes` | `Option<usize>` | `Some(4 MiB)` | As `--max-span-bytes`: measured as stored, after offload under `payload_threshold`. |
+| `max_batch_spans` | `Option<usize>` | `Some(100_000)` | As `--max-batch-spans`: one `ingest_batch` call may carry at most this many spans. |
+| `fuses` | `guard::FuseConfig` | on, warn at 12 repeats | The [run fuses](guide/guard.md): see `FuseConfig` below. On by default for embedders too — every acknowledged batch feeds the observer, which follows runs from their first step. |
+| `fate` | `fate::FateConfig` | see below | The [Fate Map](guide/foresight.md)'s bounds and cache: see `FateConfig` below. |
+| `steer` | `steer::SteerConfig` | 900 s window | [Steering](guide/steer.md): `live_window: Duration`, as `--live-window-seconds`. Live runs and nudges exist exactly when `fuses.enabled` does; `steer.jsonl` is opened only then. |
+| `xray_stale_steps` | `usize` | `20` | As `--xray-stale-steps`: the default stale threshold of `Store::xray` callers that take it from `Store::xray_stale_steps` (the HTTP route and the MCP tool do). A value of `0` reads as `1`. |
 
 `CompactionConfig`:
 
@@ -329,6 +451,26 @@ same values a `--profile` would give the server.
 | `fanout` | `usize` | `4` | Same-tier segments that trigger a merge. |
 | `base_bytes` | `u64` | 8 MiB | Tier-0 size ceiling; each tier is `fanout` times larger. |
 | `max_segment_bytes` | `u64` | 256 MiB | Never merge into a segment larger than this. |
+
+`guard::FuseConfig`:
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | `bool` | `true` | As `--no-fuses` inverted. `false` skips the observer and never opens `fuses.jsonl`; the `Store::fuse_*` methods then return `Error::Conflict`. |
+| `limits` | `guard::Limits` | `max_repeats: Some(12)` | The global policy's limits, as the `--fuse-max-*` flags (and `repeat_window_steps`, as `--fuse-repeat-window-steps`; `None` is 50 steps). `None` is unbounded. |
+| `action` | `guard::Action` | `Warn` | As `--fuse-action`. |
+| `max_runs` | `usize` | `100_000` | As `--fuse-max-runs`. |
+| `live_paths` | `bool` | `true` | Whether every live run keeps its behaviour path (earliest 192 steps, 48 bytes each, inside the span budget) for foresight on the live view and the predictive fuses. `false`: only runs a policy with `min_success_odds` could govern keep one. `traza-server` sets it to `false` under `--fate-cache-seconds 0`. |
+
+`fate::FateConfig`:
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `max_runs` | `usize` | `20_000` | As `--fate-max-runs`. |
+| `max_nodes` | `usize` | `50_000` | As `--fate-max-nodes`. |
+| `cache_ttl` | `Duration` | 300 s | As `--fate-cache-seconds`. The predictive fuses read only cached maps, which `traza-server` builds on a background thread; an embedder that sets `min_success_odds` on a policy calls `Store::maintain_fate` on its own cadence, or its fuses never see a map. |
+| `tenant_maps` | `usize` | `32` | As `--fate-tenant-maps`. |
+| `build_budget` | `Duration` | 120 s | As `--fate-build-seconds`: the budget `Store::maintain_fate` gives each build. |
 
 `Profile` exposes `parse`, `as_str`, `flush_spans`, `wal_commit_window`, and
 `config`. There is deliberately no `Profile` → `Durability` mapping.
@@ -396,6 +538,11 @@ The consequence: **relative comparisons between rows are sound; absolute rates
 are pessimistic.** Where a row's spread is wide, it is wide because rounds
 executed under materially different load, and the median mixes those
 conditions.
+
+These runs also predate the admission measurement pass, which serializes each
+span once more before admitting it; see
+[capacity](operations/capacity.md#capacity-and-performance) for what is and is
+not known about its cost.
 
 ### The two knobs interact — the measured grid
 

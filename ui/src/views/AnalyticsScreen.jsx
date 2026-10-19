@@ -78,7 +78,7 @@ export function AnalyticsScreen({ go }) {
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
       <Eyebrow style={{ fontSize: 11 }}>group by</Eyebrow>
       {GROUPS.map((group) => <Chip key={group} active={groupBy === group} onClick={() => setGroupBy(group)}>{group}</Chip>)}
-      <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+      <span style={{ marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
         {RANGES.map((r) => <Chip key={r.id} mono active={range === r.id} onClick={() => setRange(r.id)}>{r.label}</Chip>)}
       </span>
     </div>
@@ -93,7 +93,7 @@ export function AnalyticsScreen({ go }) {
     {stats.data && !rows.length ? <EmptyState
       message={<span>No LLM calls in this window. Traza recognizes the OpenLLMetry / OTel GenAI
         conventions (<code>gen_ai.*</code>, <code>llm.usage.*</code>) and its native <code>llm.*</code> shorthand:</span>}
-      command={'"attributes": {"gen_ai.system": "openai", "gen_ai.request.model": "gpt-4o",\n               "gen_ai.usage.prompt_tokens": 412, "gen_ai.usage.completion_tokens": 88}'} /> : null}
+      command={'"attributes": {"gen_ai.system": "openai", "gen_ai.request.model": "gpt-6.1-sol",\n               "gen_ai.usage.prompt_tokens": 412, "gen_ai.usage.completion_tokens": 88}'} /> : null}
 
     {rows.length ? <>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6,1fr)', gap: 12 }}>

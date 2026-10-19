@@ -27,7 +27,11 @@ data/
   annotations.jsonl          the annotation log,
   payloads/                  and offloaded payload bytes
   generations/<id>/state-manifest.json
+  ledger.jsonl               the hash chain over published generations (outside every generation)
   pins/<label>/              a pin: hard links to one manifest's files
+  credentials.jsonl          runtime credential digests  -- outside generations
+  limits.json                tenant limits               -- outside generations
+  usage.json                 tenant usage counters       -- outside generations
 ```
 
 Existing data directories are adopted at first open — nothing moves, and
@@ -36,7 +40,8 @@ adopted directory is not readable by a pre-generation binary.
 
 ## Taking a backup
 
-Against a running server, with ingest continuing throughout:
+Against a running server, with ingest continuing throughout (with auth on,
+this needs an unbound `admin` credential):
 
 ```sh
 curl -X POST http://localhost:8080/v1/backups/nightly
@@ -75,6 +80,22 @@ The copy carries **spans, annotations, and payload bytes together**. That is
 the part a span export never could: an export pinned spans and nothing else, so
 a dataset export meant only part of a session's state.
 
+A pin also carries `ledger.jsonl`: the store's [ledger](../guide/ledger.md)
+as of the pin, ending with the checkpoint entry whose `manifest_sha256` is the
+SHA-256 of the pin's `state-manifest.json` — an erasure or anchor appended
+while the pin was being built is left out. It is evidence that travels with
+the backup, not state: it is not manifested, pin verification ignores it, and
+a restore does not install it — the restored store keeps the ledger already in
+its data directory, or starts a new chain in an empty one, and ledgers the
+installed generation either way. If the ledger could not record the pinned
+generation (a failed append, which `GET /v1/ledger/verify` reports), the pin
+is still taken and carries no `ledger.jsonl`.
+
+Restoring a pin taken before an erasure **undoes that erasure**: the
+subject's data comes back with the pre-erasure tombstone log. The ledger
+still records the erasure, and its verification names the entry until the
+erasure is applied again.
+
 ## Verifying
 
 ```sh
@@ -110,6 +131,14 @@ The library equivalent is [`Store::restore`](../../src/lib.rs).
 
 A restored store starts with an empty write-ahead log: its state is entirely in
 the installed files, and any prior log belonged to a different lineage.
+
+**What a backup does not contain.** `credentials.jsonl` (runtime credential
+digests), `limits.json` (tenant limits) and `usage.json` (usage counters) are
+outside generations, so no pin carries them and `--restore` leaves the live
+copies untouched: a restore never resurrects a revoked credential, rolls back
+a tenant's limits, or rewinds its usage. Restoring into an empty directory
+therefore starts with no runtime credentials — open on loopback, unless
+`TRAZA_TOKENS` is set.
 
 ## Checkpoints
 

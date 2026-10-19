@@ -5,6 +5,1161 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] - 2026-10-18
+
+The foresight release. 0.27.0 let the recording act on one run at a time;
+this release reads every run together. Traza now **learns from every run an
+agent made which paths end well, and sees failure coming**: the **Fate Map**
+counts each path an agent's completed runs took and how often it ended in
+success, with an interval and the number of runs behind it, and **foresight**
+walks a live run's path down that map, so a run that has started down a path
+that has mostly failed is called `likely_failure` before it has failed. A
+**predictive fuse** can stop it there, at the pre-call check, before the next
+step is paid for. Around that: **steering** (the runs live now, a person's
+nudge or veto delivered at the agent's next check, how a run's agents handed
+work around), **zero-setup recorders** for Claude Code and Codex with **Agent
+Blame** for the lines their edits introduced, a **context X-Ray** of what a model saw at
+one step and a **Cache Autopsy** of why its prompt cache broke, a **change
+radar** for what changed in an agent and whether it hurt, **TQL**, a
+regular-expression language over a run's steps with nine built-in detectors,
+and **fork and rewind** for any recorded run, with tape tests on top. Six new
+dashboard screens and three new demos (twelve in all) show it. Traza still
+never calls or embeds a model: every verdict here is counting and textbook
+statistics over stored spans, and every answer says how much history it
+stands on. There is no storage-format change. The Claude Code hook moved, the
+run guard's memory budget now also holds behaviour paths, OTLP ingest keeps
+five resource attributes it used to drop, and a rollback to 0.27.0 after
+using a new fuse limit needs a step first: read **Changed** and **Upgrade**
+before deploying over an existing setup.
+
+### Added
+
+- **Foresight: the Fate Map and predictive fuses.**
+  [docs/guide/foresight.md](docs/guide/foresight.md).
+  - A run's steps become **behaviour tokens** `kind:name` (the step
+    signature without its input hash), consecutive repeats folded into one
+    token by bucket (`x`, `x×2`, `x×3-5`, `x×6+`) so a loop is one shape. A
+    path holds at most 64 tokens. Runs are compared only with runs of the
+    same agent in the same tenant; `traza.task` (else `session.goal`) splits
+    an agent into task cohorts.
+  - `GET /v1/fate/cohorts` lists agents and tasks with outcome counts and
+    base rate. `GET /v1/fate/map?agent=` is the tree: every node with its
+    visits, outcomes, success rate and 95% **Wilson** interval, lift against
+    the base rate, entropy of what runs did next, summed cost and duration,
+    and the newest run of each outcome ready for `/v1/diff`. **Fatal forks**
+    are children at least 25 points below their siblings' pooled rate, both
+    sides with at least `min_support` runs, at Fisher exact p < 0.05 —
+    judged on the exact gap, never the four-place figure shown;
+    **hotspots** are nodes with at least one bit of entropy. Pruning is
+    always reported. The same spans make the same path on every surface:
+    steps that start at the same instant are ordered by span id, then
+    signature, then agent, in the map, the run route and the live view
+    alike. Building and rendering a map, cached or not, is linear in its
+    tree and spends the query budget, answering `400` when it runs out. Every map scores itself: each completed run predicted at
+    several depths from the half of the cohort it is not in (two-fold
+    cross-validation), with Brier skill against the base rate and a
+    reliability table, in `calibration`.
+  - `GET /v1/fate/runs/{run}` is **foresight for one run**: its path walked
+    down its agent's map over the last 30 days, a verdict (`on_track`,
+    `at_risk`, `likely_failure`, `novel`, `insufficient_history`), the
+    sentence behind it, what earlier runs did next with their rates, and the
+    best of them as `recommended_next`. A live run's last step is still
+    open, so it is pooled with every run that repeated that step at least as
+    often; a completed run is left out of the statistics it is judged by.
+  - **Predictive fuses**: a fuse policy may set `min_success_odds`, with
+    `foresight_min_support` (default 30) and `foresight_after_steps`
+    (default 3). When the **upper** bound of the run's interval — computed
+    from the counts, not the rounded figure — is below the odds, the
+    policy's action applies, with the reason
+    `foresight: runs that took this path succeeded 5 of 50 times (≤21.4%)`.
+    A check that names its next tool is judged with that step appended. It
+    is evaluated on the pre-call check and verdict queries only — never on
+    ingest, and not in the `GET /v1/fuses/runs` listing — reads only a
+    cached map and never builds one there, and is not latched: a prediction
+    made again at every question, lifted by a reset with a grant of lower
+    odds. `traza-server` builds requested maps on a background thread, two
+    at a time, each under `--fate-build-seconds` (default 120), halving a
+    window that runs out of time and saying so. New flags `--fate-max-runs`,
+    `--fate-max-nodes`, `--fate-cache-seconds`, `--fate-tenant-maps` and
+    `--fate-build-seconds`; metrics `traza_fate_builds_total` and
+    `traza_fate_cached_builds`. Any erasure drops every cached map.
+  - MCP tool `foresee_run`, which fits `--mcp-max-result-bytes` whole: past
+    it, it drops fields in a fixed order (next steps first, the path's end
+    last), says which in its headline and in `truncated`, and refuses with a
+    short error, quoting nothing recorded, when even the run's identity will
+    not fit. And `seed --behaviours`, a corpus whose ground truth is known
+    exactly.
+  - What it cannot do: a fatal fork is correlation, not cause; paths ignore
+    inputs; undeclared outcomes are inferred from the last span; the fork
+    tests are not corrected for how many nodes were tested; maps are per
+    process. See [limitations](docs/guide/foresight.md#limitations).
+
+- **Steer: live runs, nudges and run topology.**
+  [docs/guide/steer.md](docs/guide/steer.md).
+  - `GET /v1/runs/live` lists the runs with activity in the last
+    `--live-window-seconds` (default 900) — current step, steps, tokens,
+    cost, errors, the guard's verdict, pending nudges and the run's
+    foresight — from the run guard's memory and the cached Fate Map.
+    `GET /v1/runs/live/stream` is the same view as server-sent events: a
+    snapshot, then a row each time a run changes (coalesced to one batch per
+    250 ms), `event: removed` when a run the client holds leaves the view
+    (`evicted` by the guard, or `expired` out of the window), a heartbeat
+    after 15 quiet seconds, at most 64 streams per server and 8 per scope. A
+    listing, or a stream update, reads its runs' foresight under one query
+    budget: rows it did not reach say `foresight_deferred`, and a run whose
+    read failed rests for 60 seconds.
+  - **Nudges**: `POST /v1/runs/{run}/nudges` (`rw`) queues `advice` (words
+    for the agent) or `block` (a veto of its next step) for the run's next
+    pre-call check, which delivers it **at most once** in a new `nudges`
+    field. A `block` answers `stop` for that check and every check of the
+    run in the two seconds after, without tripping the fuse. A check naming
+    no `next` step, the verdict route and the MCP tools never consume
+    nudges. Nudges are durable in `steer.jsonl`, 1 to 4,096 bytes, expire
+    after `ttl_seconds` (default an hour, at most seven days), 32 pending per
+    run, bounded per tenant and in all, and erased with their run's session,
+    trace or tenant. A `block` whose two-second hold is in force is never
+    evicted to make room (at most 32 holding per run); a budget full of them
+    refuses a new nudge with `409` for those two seconds. `GET /v1/runs/{run}/nudges` lists them with their
+    status. There is deliberately no MCP tool to read or queue one.
+  - `GET /v1/runs/{run}/topology`: a run's agents, the delegations between
+    them, the handoff sequence and its **cycles** — control returning to an
+    agent straight from the agent it handed off to. A new fuse limit,
+    `max_handoff_cycles` (global: `--fuse-max-handoff-cycles`), stops agents
+    bouncing a task between them, counted exactly as the topology counts it,
+    since the last reset. Agents and services are told apart by their whole
+    names; one longer than 160 characters is shown as its first 160, `…#`
+    and 16 hex digits of a digest of the whole.
+  - MCP tools `list_live_runs` and `run_topology`, whose headline is the
+    server's own counts, with run ids and tenants inside the telemetry
+    frame.
+  - **The Claude Code hook pack**, [`examples/claude-code/`](examples/claude-code/README.md):
+    one standard-library script and an installer that merges it into
+    `.claude/settings.json`. `PreToolUse` asks the pre-call check, denies on
+    a stop or a `block` nudge, and relays `advice` as `additionalContext`
+    without ever answering `allow`, so the user's own permission prompt is
+    untouched; a stop's recorded reasons reach Claude inside the
+    untrusted-telemetry block, cut whole rows at a time; `SessionStart` adds a summary of earlier runs from
+    `/v1/recall` inside the untrusted-telemetry block; an optional
+    `PostToolUse` recorder. It fails open unless `TRAZA_FAIL_CLOSED=1`. The
+    hook contract was checked against Claude Code 2.1.263's reference.
+  - What it cannot do: a lost check answer loses its nudge; an agent that
+    never checks never hears one; a veto covers two seconds, not a turn; a
+    nudge's author is a credential, not a person; the live view is per
+    process. See [limitations](docs/guide/steer.md#limitations).
+
+- **Recorders for Claude Code and Codex, and Agent Blame.**
+  [docs/guide/recorders.md](docs/guide/recorders.md).
+  - `traza-server import claude-code` and `traza-server import codex` turn
+    the transcripts those tools already write (`~/.claude/projects`,
+    `~/.codex/sessions`, including Codex's `.jsonl.zst`) into runs: every
+    session a run, every model response an llm step with its usage, every
+    tool call a tool step, every sub-agent an agent span. No SDK, exporter
+    or proxy. Ids derive from the transcript's own identity, so importing
+    twice leaves one copy. Unknown records are counted and skipped, never
+    fatal. Over `--url` (with `--tenant`, checked against `/v1/whoami`
+    before anything is read) or straight into a `--data-dir`; `--since`,
+    `--project-filter`, `--dry-run`, `--json`.
+  - `--watch` follows live sessions within about a second, resuming from a
+    per-destination state file (`~/.traza/import-state.json`) so a restart
+    sends nothing twice, and outlives an unreachable server. A file is
+    skipped only when its size and its stamp (modification time, and device
+    and inode on Unix) are both unchanged, so a transcript rewritten to the
+    same length is read again; a sub-agent's `.meta.json` that appears or
+    changes later re-sends its transcript, placed under its parent call. A
+    Codex rollout found while its first line is still being written waits
+    for the next poll, so a sub-agent keeps its parent's session. What an
+    importer remembers is bounded: 16,384 response digests, 4,096 closed
+    turns, 256 MiB of a turn's held lines.
+  - A tool step's status stays unset until its result arrives; an importer
+    no longer calls a call `ok` that may not have finished.
+  - Compressed rollouts are read by Traza's own Zstandard decoder (RFC
+    8878, no new dependency), checksum verified, capped at 2 GiB compressed
+    and decompressed; a sub-agent meta file at 64 KiB. A file over its cap
+    is refused, named and counted in `files_failed`.
+  - **Agent Blame**: `GET /v1/blame?path=&line=`, `traza-server blame
+    FILE:LINE` and the MCP tool `blame_line` name the earliest tool step
+    whose edit introduced a line — its run, the prompt that started the
+    turn, the model, the step on the tape — read from `Edit`, `MultiEdit`,
+    `Write`, `NotebookEdit`, Anthropic's text-editor tool and Codex patches,
+    whitespace-normalised. An edit whose step failed (`old_string` not
+    found, a patch that did not apply) wrote nothing and is never a match;
+    each match says `outcome` — `applied`, or `unconfirmed` for a call with
+    no recorded result, listed after every applied one and printed as
+    "attempted". The CLI scopes itself to the repository and its
+    worktrees (`--anywhere` lifts that). Measured on one developer's real
+    history, before failed edits stopped counting (so an upper bound): 0.33 s
+    to answer that no agent wrote a line, and a median of 0.44 s for a line
+    it found, over 77,002 spans; 3.2 s and 2.9 s over 970,972 spans with a
+    Codex history added.
+  - What it cannot do: the formats are undocumented and change with their
+    tools; a transcript records no system prompt or tool definitions; blame
+    cannot see lines a shell command wrote. See
+    [limits](docs/guide/recorders.md#limits-honestly).
+
+- **Context X-Ray and Cache Autopsy.**
+  [docs/guide/xray.md](docs/guide/xray.md).
+  - `GET /v1/xray/{trace_id}/{span_id}`: one model call's context window as
+    chunks (system, user, assistant, tool call, tool result, tool
+    definition) with estimated tokens, each traced to the step that
+    introduced it; stale tool results (unreferenced for
+    `--xray-stale-steps`, default 20 — a heuristic); duplicates; and what
+    the conversation's previous call had that this one lost
+    (`dropped_since_previous`, instructions first) — the compaction-loss
+    detector.
+  - `GET /v1/cache/{run}`: every model call against its predecessor in the
+    same conversation, with a cause (`stable`, `volatile_content`,
+    `reordered`, `ttl_expired`, `new_context`, `unknown`), the first chunk
+    that changed and the bytes that changed in it — usually one volatile
+    token, a timestamp or an id — the tokens the cache could have served and
+    did not, priced, and culprits with advice from a lookup table.
+    Disagreements with the provider's own cache counters are listed.
+  - Conversations recorded as deltas (`gen_ai.conversation.id` and
+    `traza.input.delta`, which the recorders set) are rebuilt call by call,
+    so an imported session's X-Ray shows the whole conversation. A
+    conversation is identified by a SHA-256 of its whole id.
+  - What could not be read is never evidence. A context past 2,000 chunks
+    is cut (`chunks_truncated`, on each cache verdict and on the autopsy),
+    and a verdict the unread part could change is `unknown` with nothing
+    counted lost; a chunk missing from a context that was cut, or that held
+    an offloaded value left unresolved (a request, tool definitions, an
+    earlier answer), is `unverified` — not proven lost — rather than a lost
+    instruction.
+  - MCP tool `xray_step`.
+  - What it cannot do: per-chunk tokens are estimates; the provider's cache
+    rules (minimum length, breakpoints, TTL refresh) are not modelled; byte
+    exactness is the instrumentation's. See
+    [limits](docs/guide/xray.md#limits-stated-plainly).
+
+- **Cache rates in the pricing file.** A derived cost knew nothing about
+  cached-prompt discounts. A model's entry may now name
+  `cache_read_per_mtok` and `cache_write_per_mtok`, and every derived cost
+  then counts cache reads and writes at their own rates under the
+  provider's convention — on top of the prompt for Anthropic, Bedrock and
+  Claude on Vertex, carved out of it for OpenAI, Azure OpenAI and Gemini on
+  Vertex — instead of understating a cache-heavy Anthropic call and
+  overstating a cache-heavy OpenAI one. Without the keys nothing changes.
+  See [model pricing](docs/configuration.md#model-pricing).
+
+- **Change radar: what changed?** [docs/guide/radar.md](docs/guide/radar.md).
+  `GET /v1/changes?agent=` (and the MCP tool `what_changed`) returns a
+  ranked timeline of change points in an agent's system prompt, tool
+  catalog, requested and returned model, sampling parameters, service and
+  SDK versions, and in its behaviour with no configuration change (a shift
+  in its top-level paths, chosen on half the runs and tested on the other
+  half). A value is a change point when it takes over and runs it played no
+  part in proposing confirm it, found in one pass linear in the runs and
+  under the query deadline. Sampling parameters are identified by their
+  typed JSON (`1` is not `"1"`), and a run carrying more than four values of
+  a dimension is left out of that dimension's detection rather than
+  mistaken for a change. Each change carries error rate, success rate,
+  cost, steps, duration and tool mix on both sides, with two-proportion
+  z-tests (Fisher's exact test when a rate's table is sparse) and Welch
+  t-tests under Holm's correction, and a verdict (`regression`,
+  `improvement`, `neutral`, `insufficient_data` below 10 runs a side) in
+  which a metric takes part only when its own test had 10 observations a
+  side; regressions come first. `?run=` places one run on the
+  timeline, `?environment=` filters by `deployment.environment`, and
+  `--radar-max-runs` (default 20,000) bounds an analysis. What it cannot do:
+  correlation in time, not cause; it lists co-changes it cannot separate,
+  assumes independent runs, and is noisier below about 200 runs. See
+  [limitations](docs/guide/radar.md#limitations).
+
+- **TQL and the detector library.** [docs/guide/tql.md](docs/guide/tql.md).
+  A pattern language over a run's steps: atoms (`tool(bash)`, `llm(gpt-4o)`,
+  `agent(...)`, `step`, and derived `edit` and `test`), predicates in
+  brackets (`[status=error]`, `[cost>0.5]`, `[args~"pytest"]`,
+  `[file~"test_"]`, …), quantifiers, adjacency `->`, eventually `..>`,
+  alternation, grouping and captures that must match (`@f`), compiled to an
+  NFA run by a Pike VM, with a linear-time, std-only regex subset for `~`.
+  Parse errors name the column, and compiling is bounded in work as well as
+  size. `GET /v1/trajectories/search?q=` (newest runs first, under the query
+  deadline, continued exactly — runs tied on time included — with the
+  opaque `cursor` an answer's `next_cursor` gives),
+  `GET /v1/trajectories/explain`, `GET /v1/detectors`,
+  `GET /v1/detectors/findings`, and the MCP tool `find_behavior`. An answer
+  where a matcher cap may have hidden a match counts those runs in
+  `runs_inexact` and is `truncated`, never an exact "no match". Nine
+  detectors: `test_tampering`, `give_up_loop`, `hallucinated_tool`,
+  `edit_thrash`, `ping_pong`, `retry_without_change`, `context_blowup`,
+  `tool_error_streak` and `unverified_finish`; findings compare how the
+  matching runs ended against the rest. What it cannot do: `edit` and
+  `test` are heuristics over tool names and arguments, failure means span
+  status, there is no index, and "never" over a whole run cannot be
+  written. See [limits](docs/guide/tql.md#limits-stated-plainly).
+
+- **Fork and rewind, tape tests and golden runs.**
+  [docs/guide/fork.md](docs/guide/fork.md).
+  - `POST /v1/replays` takes `edits` (up to 64: a different model answer or
+    tool result at a step) and `live_after` (after that step every call
+    answers `409 replay_live`, so the harness switches to the real
+    provider). Strict matching holds up to the first edit and is off after
+    it. A fork answers `fork_id` and the `traza.fork.*` attributes its spans
+    carry; a live point alone is a **rewind**, and a run past 20,000 spans
+    can still be rewound within what was read. A repeated divergence is
+    answered from the difference already worked out.
+  - `GET /v1/forks?run=` lists a run's forks, each diffed against its
+    parent; `GET /v1/goldens` the runs marked as baselines, decided from the
+    newest 10,000 golden markers under one query budget, with
+    `annotations_examined` counting every one in scope. MCP tool
+    `list_forks`.
+  - What it cannot do: Traza never goes live itself — your harness does; an
+    edited answer has an invented id and zero usage; a fork is a replay, in
+    memory for an hour. See [limits](docs/guide/fork.md#limits-stated-plainly).
+
+- **Client libraries.** [docs/guide/clients.md](docs/guide/clients.md).
+  Python: `traza.fork(run, at_step, response=… | tool_result=…)`, a context
+  manager that points the provider SDKs at a loopback switch which forwards
+  to the replay until it answers `replay_live` and to the real provider
+  after, and tags the spans started in its context; `forks`, `goldens`,
+  `mark_golden`; `traza.testing` tape tests; the **pytest-traza** plugin
+  (`@pytest.mark.traza_tape("run")`, a `pytest11` entry point; the package
+  still depends on nothing); and a **`traza`** command — `traza test`
+  replays every golden run into JUnit XML, keeping the last 64 KiB of an
+  agent's output as it is written, never the whole, plus `traza golden add`,
+  `traza forks` and `traza fork`. A tool the recording lacks running live
+  moves no model call off the recording: only the model endpoint's own
+  `replay_live` does, in both libraries.
+- **`traza forward`**, in the Python package, lets the tools that speak
+  plain HTTP only — `traza-server import --watch`, `traza-server blame`,
+  the MCP bridge — reach a server over TLS, Traza Cloud included:
+  `traza forward --upstream https://api.trazadb.com`, then
+  `--url http://127.0.0.1:8089`. It listens on loopback only, verifies the
+  upstream's certificate against the system's authorities with no way to
+  turn that off, passes method, path, query and end-to-end headers through,
+  streams bodies both ways, caps a request body at 64 MiB, refuses
+  redirects, and bounds every wait. Standard library only. The importer's
+  and the bridge's refusal of an `https://` URL now name it. See
+  [the recorders guide](docs/guide/recorders.md#a-server-over-tls). TypeScript: `client.fork()` returning a
+  `Fork` with a switching `fetch` for the provider SDKs and a span
+  processor, `forks`, `goldens`, `markGolden`, and `replayTest()` for
+  vitest, jest or `node:test`. Both hand the nudges a check delivered to the
+  caller (`Verdict.nudges` and `on_nudges`, `verdict.nudges` and
+  `onNudges`).
+
+- **Dashboard: six screens, and steering from the Run view.**
+  [docs/guide/trace-browser.md](docs/guide/trace-browser.md).
+  - **Live** (`#/live`): the runs working now over the live stream, read
+    with `fetch` so the token never enters a URL — current step with its
+    elapsed time, spend counting up, the guard chip and foresight against
+    the base rate — ranked so runs that need a person come first, with
+    nudge, kill-switch and approve controls (a grant can lower
+    `min_success_odds`, the only way to lift a foresight stop). It
+    reconnects with backoff and rebuilds from a fresh snapshot, drops a row
+    the moment the server says its run left the view, says `foresight
+    deferred` for a row whose read the listing's budget did not reach, says
+    so when the server has no live view, and marks a run whose named step
+    has waited as **held** only after reading that run's verdict, which
+    never takes its nudges. An address naming no screen now opens Live when runs
+    are working, the Overview otherwise.
+  - **Foresight** (`#/foresight`): the Fate Map drawn as a tree with ribbons
+    sized by runs and coloured against the base rate, fatal forks and
+    hotspots labelled in words, intervals on hover, example runs and a
+    success-versus-failure diff, the map's calibration in words, and a run
+    lit on its map with its verdict — only where it was judged.
+  - **X-Ray** (`#/xray/<run>`): the Cache Autopsy timeline and culprits, and
+    one call's context as a stacked bar by kind and introducing step, with
+    what was dropped since the previous call — a loss from a context not
+    read whole marked "not proven lost", never counted.
+  - **Changes** (parameters shown as typed JSON; a delta marked only when
+    its own test had 10 observations a side), **Behaviors** (a TQL box
+    checked by the server as you type, pages continued by the server's
+    cursor, and the detectors with their intervals) and **Blame** (an edit
+    with no recorded result shown as an attempt, after the applied ones).
+  - The Run view gains a Foresight panel, an **Agents** card with the
+    topology drawn, a **Nudges** card with the composer, **Fork from here**
+    on any model or tool step — an editor on the recorded answer, then the
+    environment as shell-safe lines with the key as `TRAZA_REPLAY_KEY`, a
+    `traza.fork` snippet and a `traza fork` command — and a **Forks** card
+    with each fork's deltas and its diff.
+  - Stored text is rendered as text everywhere; every new screen reflows
+    at phone width without a horizontal page scroll.
+
+- **Three demos: `foresight`, `coding-agents` and `mission-control`**,
+  twelve in the [tour](examples/README.md) now. `foresight` draws the Fate
+  Map with every interval, recomputes the fatal fork's Wilson interval and
+  Fisher test from its counts, calls a live run `likely_failure` before it
+  has an outcome and stops it at the check while a healthy run goes through.
+  `coding-agents` imports four synthetic Claude Code and Codex sessions,
+  prices each sub-agent, finds a cache that expired and a `/compact` that
+  dropped an instruction, catches a test edited to pass, blames three lines
+  and follows a live transcript with `--watch`. `mission-control` runs
+  simulated agents that check before every step and obey nudges, checks
+  seven claims (a run held by its history, a nudge heard after an
+  approval, the kill switch, a ping-pong stopped at three cycles, a fork),
+  then keeps them running for the Live screen until Ctrl-C. Each asserts
+  its own claims, and `ci.sh` runs all twelve, pointing the three new ones
+  at the binary it just built (and `foresight` at the `seed` built beside
+  it).
+
+### Changed
+
+- **The Claude Code hook moved.** `examples/guard/claude-code-hook.sh` is
+  gone; the [hook pack](examples/claude-code/README.md) replaces it, with an
+  installer, nudges and a `SessionStart` recall. Its fail-closed switch is
+  `TRAZA_FAIL_CLOSED=1` (it was `TRAZA_FUSE_FAIL_CLOSED`), and it never
+  answers `allow`. The `guard` demo runs the pack in its seventh beat.
+- **OTLP ingest keeps five resource attributes.** `service.version`,
+  `deployment.environment.name`, `deployment.environment`,
+  `telemetry.sdk.name` and `telemetry.sdk.version` on a resource are copied
+  onto each of its spans as attributes, beneath any the span sets itself,
+  never pushing a span over its admission caps. They are stored, searchable
+  and what the change radar reads. Every other resource attribute is still
+  dropped. See [ingest](docs/guide/ingest.md#which-resource-attributes-reach-the-span).
+- **The run guard keeps every live run's behaviour path** — its earliest
+  192 steps, 48 bytes each — for live foresight and the predictive fuses,
+  counted against the same 1,000,000-record budget as span contributions.
+  Step-heavy runs are therefore evicted somewhat sooner than in 0.27.0 (they
+  rebuild from the store when next asked about). `--fate-cache-seconds 0`
+  stops keeping paths; an embedder sets `FuseConfig::live_paths = false`,
+  after which only runs a predictive policy could govern keep one.
+- **`POST /v1/fuses/check` answers carry `nudges`** (an empty list when
+  none), and `foresight` when the policy sets `min_success_odds`; the
+  verdict document of `GET /v1/fuses/runs/{run}` carries `foresight` too. A
+  check that names its `next` step now delivers pending nudges and counts as
+  activity for the live view: give that credential only to the agent, and
+  leave `next` out of monitoring checks.
+- **The MCP surface grows from sixteen tools to twenty-four**: eight reads
+  (`foresee_run`, `list_live_runs`, `run_topology`, `blame_line`,
+  `xray_step`, `what_changed`, `find_behavior`, `list_forks`), so an `ro`
+  token is offered twenty-two. See [the MCP guide](docs/guide/mcp.md#the-tools).
+- **`max_repeats` counts within a window of the run's latest steps.** A
+  step fingerprint repeats when it occurs that often among the run's last
+  `repeat_window_steps` steps (default 50, at most 1,000; a policy field, a
+  grant field and `--fuse-repeat-window-steps` for the global policy), not
+  over the whole run — so the global default no longer warns on every long
+  interactive session (one real session took the same screenshot 32 times
+  over three days), while a tight loop still trips. A warning clears once
+  the loop leaves the window; a stop latches where a window first filled,
+  live and in a rebuild alike, whatever order the spans arrived in. The
+  reason now reads `… repeated 4 times in the last 50 steps`, and
+  `usage.top_repeat` carries `window_steps`. Each span contribution the
+  guard holds grew from 40 to 48 bytes (its start, to rebuild the window in
+  step order), and each run keeps at most its latest 1,000 steps, 24 bytes
+  each, for the count. See [run fuses](docs/guide/guard.md#repeats-count-within-a-window).
+- **TQL's `edit_thrash` means thrash, and `context_blowup` stays inside one
+  conversation.** On coding agents `edit_thrash` fired on any five edits of
+  a file in ten steps — what writing a feature looks like (24 of 57 real
+  runs, 23 of them successful) — and `context_blowup` compared a
+  sub-agent's small first call with the main thread's next one (half of
+  905 real hits). `edit_thrash` now needs, within 30 steps, one file's edits
+  undoing and redoing each other (text written, removed, written again), the
+  file rewritten whole back to an earlier version, or three edits each
+  followed by a failing test with no pass between; it is `medium`, `low` in
+  a run that succeeded (`severity_if_succeeded` in `GET /v1/detectors`;
+  findings rate a detector's row by its runs and give each example its own
+  `severity`). `context_blowup` compares calls of one
+  `gen_ai.conversation.id`, else of one agent, and only calls naming
+  neither with each other. Three TQL fields say so: `conversation`, and an
+  edit's `added` and `removed` text, read as Agent Blame reads edits and
+  whitespace-normalised. See [TQL](docs/guide/tql.md#the-detector-library).
+- **A session's turns are its prompts where a recorder marks them.**
+  `GET /v1/sessions` and `/v1/sessions/{id}` carry `turn_count` — the turn
+  spans `traza-server import` writes, one per user prompt, else the
+  session's traces — and `turns_from` (`prompts` or `traces`). The rollup
+  sidecars carry the prompt count, so they move to format 6 and are rebuilt
+  once from their segments.
+- **A tape step's tokens carry `context`**: the context the engine reads
+  (input plus cache read and write for a provider whose input leaves the
+  cache out, input alone for one whose input includes it, `null` when that
+  cannot be told), so a cached Anthropic call no longer reads as an input of
+  2. Both client libraries read it.
+- **The Cache Autopsy gains a cause, `partial_hit`**, and `by_cause` lists
+  it. A call past the assumed TTL whose provider read only part of the
+  predecessor's reported context — a long-lived system prompt kept warm
+  while the conversation after it expired — was `stable` with nothing lost
+  when it read at least half. It now counts what was not served as lost;
+  only a read of all of it is `stable`. See
+  [the X-Ray guide](docs/guide/xray.md#causes).
+- **Library surface.** `Config` gains `fate: fate::FateConfig`,
+  `steer: steer::SteerConfig` and `xray_stale_steps: usize`;
+  `guard::FuseConfig` gains `live_paths: bool`; `guard::Limits` gains
+  `min_success_odds`, `foresight_min_support`, `foresight_after_steps`,
+  `max_handoff_cycles` and `repeat_window_steps`; `guard::TopRepeat` gains
+  `window_steps`; `tql::Detector` gains `severity_if_succeeded` and
+  `tql::RunMatch` `severity`; `tape::StepTokens` gains `context`;
+  `analytics::SessionSummary` gains `turn_count` and `turns_from`;
+  `xray::Cause` gains `PartialHit`; `pricing::Rate` gains
+  `cache_read_per_mtok` and `cache_write_per_mtok`. A struct literal must
+  add them, and a `match` on `Cause` the new variant;
+  `..Default::default()` need not. New public modules: `blame`, `fate`,
+  `fork`, `import`, `radar`, `steer`, `tql`, `xray`, `zstd`.
+- **`GET /v1/annotations` and experiment scores spend the query budget.**
+  Their walk of the annotation index is checked against
+  `--query-deadline-ms` and answers `400` past it, like every other read;
+  it could not run out before. With a `limit` the walk holds at most that
+  many annotations, the newest, and annotations a pending erasure withholds
+  no longer take places within it.
+- **`traza-server --help`** lists fifty-six flags, ten of them new:
+  `--fate-max-runs`, `--fate-max-nodes`, `--fate-cache-seconds`,
+  `--fate-tenant-maps`, `--fate-build-seconds`, `--fuse-max-handoff-cycles`,
+  `--fuse-repeat-window-steps`, `--live-window-seconds`,
+  `--xray-stale-steps` and `--radar-max-runs`; and
+  two subcommands, `import` and `blame`. See
+  [configuration](docs/configuration.md).
+- **Docs**: the ingest guide said other resource attributes were "merged
+  beneath span attributes". They never were; it now says which reach the
+  span.
+- Version metadata: the crate, the UI and both client libraries move to
+  0.28.0. The MSRV stays 1.81, and a default build still has three direct
+  dependencies. No performance figure in this release is new; the published
+  ingest throughput predates both 0.27.0's admission pass and the behaviour
+  path above.
+
+### Fixed
+
+- **An evidence pack finishes on a busy store.** A manifest too long for
+  one request's budget never finished when the store checkpointed between
+  retries: each retry started over on the new generation, met the next
+  checkpoint and started over again — and a store with any damaged file
+  never got its pack, because confirming the damage let the pack move on to
+  the newest generation and begin again. A pack now pins the snapshot and
+  generation its manifest load began on and answers for that pair until it
+  is whole (its `ledger.head` says which), and a problem stands while the
+  path still holds the file the digest read, with the length and
+  modification time the pinned manifest records. Confirming file problems
+  takes at most 256 per hold of the maintenance lock, with the budget
+  checked between holds, and replaced file checks are freed 4,096 files at
+  a time between budget checks, never under the lock. See
+  [the ledger guide](docs/guide/ledger.md).
+- **A replay call is judged from when its request arrived.** Time spent
+  reading, parsing and digesting a request before the replay registry saw
+  it did not count toward the replay's expiry, so a request that arrived a
+  moment before expiry could be served after it. The expiry clock now
+  starts as soon as the request head is read.
+- **A diff explanation quotes a long configuration value in bounded
+  time.** Quoting eighty characters of a differing parameter scanned the
+  whole value first, so one long string held the explanation past the
+  deadline (600 ms for 32 MiB in a debug build). The quote is now written a
+  character at a time and stops at the cap.
+- **An annotation query naming both an experiment and a trace** returned
+  the experiment's annotations from every trace: the trace was ignored when
+  the experiment's index was walked. Every filter now applies whichever
+  index is walked.
+- **`@trazadb/sdk` writes JSON the way `JSON.stringify` does.** It re-read
+  an array's length on every element, so a `toJSON` hook that grew its own
+  array ran until the heap was exhausted, before any request timer existed;
+  and it read every member up front, so a hook's change to a later member
+  went out differently. Both now match `JSON.stringify`.
+- **Dashboard.** A credential minted while the tab switched to another
+  token (a handoff link followed before the mint answered) no longer shows
+  its secret over the new session, and a secret on display no longer
+  outlives the switch. Leaving the Live tail (or any streaming screen) no
+  longer throws an unhandled "signal is aborted" error. A session nothing
+  priced — a coding-agent transcript, with no pricing table — shows "—"
+  for its cost per turn, as for its cost, not `0.00000`.
+- **Foresight on a long session keeps its outcome.** `GET /v1/fate/runs/{run}`
+  (and MCP `foresee_run`) read a run of more than 20,000 spans from its
+  earliest 20,000 only, so a finished coding-agent session that long came
+  back `"outcome": "unknown"` with a step count capped at what was read —
+  while the same answer said the run had been left out of its map as a
+  completed one. The run is now read whole: its path still comes from its
+  earliest 20,000 spans (`partial`), but its outcome and `steps` cover every
+  span, as the map's fold always did.
+- **`import --since` selects sessions that ran recently, not files that
+  were touched.** Claude Code appends untimestamped bookkeeping (the last
+  prompt, a title, a mode) to transcripts it has not run for months, which
+  moves their modification time: on one real machine a third of the
+  transcripts modified in the last two weeks had not recorded a turn in five
+  to thirteen weeks, so `--since 14d` imported 57 sessions of which 49 had
+  no span in the last 30 days — and every 30-day surface (the Fate Map,
+  TQL, findings) then saw only the 8 that did. A Claude Code file now counts
+  as recent by its newest timestamped record, found by reading backwards
+  from its end (at most 8 MiB, past bookkeeping and an unfinished line); a
+  file whose records cannot tell, and a Codex rollout (which timestamps
+  every record it writes), are still judged by when they were modified.
+- **TQL searches, detector findings and recall stop hashing every step.**
+  Each read every candidate run's steps with their request and response
+  SHA-256s — over a coding agent's runs, a digest of every model call's
+  whole conversation — though only a pattern naming `digest` or
+  `fingerprint` reads one, and recall reads neither. On a real store of 57
+  coding-agent sessions (89,777 spans) that was most of the time: a search
+  took 4.8–12.5 s and the whole detector library 9.6 s. A step's digest is
+  now computed when a pattern first reads it, and recall summarises runs
+  from their step signatures alone: searches take 2.4–3.6 s, findings 4.1 s
+  and recall 1.2–3.4 s on the same store (release build, a laptop).
+- **The Cache Autopsy believes a provider that served the prefix.** An
+  intact prefix past the assumed five-minute TTL was always `ttl_expired`,
+  its whole prefix counted lost, even when the provider reported reading it
+  from cache — counted as a disagreement but kept in every total. Claude
+  Code runs longer caches: on one real session 24 of its 25 expired
+  verdicts reported a cache read, 15 of them of the whole prefix, and its
+  "9.2 million tokens lost" were two-thirds served. A call that reports
+  reading at least half of what its predecessor reported as its context is
+  now `stable`, nothing lost, its explanation saying the cache outlived the
+  assumed TTL; a smaller read (a long-lived system prompt alone) leaves the
+  verdict standing, and no structural verdict yields to a reported count.
+- **The X-Ray reads a long session's latest calls.** A run read its first
+  20,000 spans, and a call past them was X-rayed alone — no step index, no
+  predecessor and, for Claude Code and Codex transcripts (recorded as
+  deltas), no context at all: exactly the latest calls of the sessions
+  worth X-raying. Such a call is now read with the 20,000 spans that end at
+  it: its indices count the whole run, and a conversation already under way
+  before those spans is rebuilt from its first compaction inside them (a
+  delta call before that says its conversation began before the read).
+  `xray_step` reaches any step of a run, not only those in its first read.
+- **An imported session's goal is what the person asked.** A harness that
+  opens a Claude Code session's first prompt with a `<system-reminder>`
+  block (a worktree launcher, a workflow) made that boilerplate the
+  session's `session.goal` — the text every run surface shows, and the
+  value the Fate Map hashes into a task, so every such session joined one
+  task. The goal now skips leading reminder blocks, and a prompt that is
+  nothing else sets none.
+- **Dashboard: a fork stays in the tenant it was drafted in.** Back and
+  forward to the same run in another tenant kept the fork editor open, and
+  creating it applied the first tenant's edited answer to the second
+  tenant's step of that index. The editor now closes when the tape's scope
+  changes, and a creation still pending never lands in a later draft.
+- **Dashboard: Live's clock and figures.** A run frame for a run the page
+  did not hold — left out of a cut snapshot, or let go past the page's
+  1,000 rows, and sent again because a nudge or a verdict moved it — was
+  read as the server's clock, which could move it back by minutes and
+  suppress waiting runs and held-run probes; it now only bounds the
+  estimate. Letting runs go past 1,000 now marks every figure partial
+  (`1,000+`), as a cut snapshot does, until the server drops those runs or
+  a snapshot covers every run. The held-run probe forgets runs that left
+  the view, cancels reads about them, and keeps at most four reads in
+  flight.
+- **Dashboard: Find these runs finds the node's runs.** Its query matched
+  later repeats and other cases of a name (`×3-5` found runs that searched
+  six times; `Search` found `search`). It now matches exact step
+  signatures and holds the last token to its repeat bucket, and is not
+  offered where two branches of the map read the same (a tool literally
+  named `x×2` beside `x` called twice).
+- **Dashboard: Foresight, Changes and X-Ray.** Naming another run kept the
+  last run's verdict, odds and path in the banner under the new name until
+  its own answer arrived, and a map still drawn from another window lent
+  the banner its skill; both wait for their own answers now. A Changes
+  timeline marker jumped to another tenant's card when two tenants' agents
+  share a name. A context of thousands of chunks no longer clips its last
+  chunks off the X-Ray's bar: the bar scrolls.
+- **The Mission Control demo abandons a run whose step the check keeps
+  refusing.** A stop on the next step alone left the verdict read saying
+  continue, which the agent took for a release, so it never abandoned and
+  could fill the fleet. One deadline now covers the refused step, and a
+  release counts only when the check lets the step go.
+- **Foresight for one run answers to the query deadline.** `foresee` read
+  every span of a run, computed its outcome over all of them and judged it
+  without consulting the deadline after the read, so a long run could
+  answer well past `--query-deadline-ms`. The read now checks the deadline
+  every 1,024 spans and around the outcome, and the answer is checked once
+  more before it is returned; a predictive fuse's read that runs out of time
+  says so instead of judging.
+- **Dashboard: a session's turns are its prompts.** The Sessions list and a
+  session's page counted traces as turns, so every imported Claude Code or
+  Codex session — one trace however many prompts it held — showed one turn
+  and a cost per turn equal to its whole cost, and the "longest" and "worst
+  cost/turn" sorts ranked by the same count. Both now read `turn_count`, and
+  each count says on hover which it is; a session's per-trace table heads its
+  rows "trace" when its turns are prompts.
+- **Dashboard: a tape step's input counts what it read from the cache.** The
+  run tape showed Anthropic's `input_tokens`, which leaves cached tokens out,
+  so a call that read 40,000 tokens from the cache read "2 / 555". A step now
+  shows its whole input — the server's `context` figure, under the engine's
+  provider rule — with its parts on hover. Where the provider's convention is
+  not known the reported input stands, and the hover says why.
+- **Dashboard: the Fate Map tells apart two branches that read the same.**
+  Siblings with one text (a tool literally named `x×2` beside `x` called
+  twice) shared a React key: React warned of duplicate keys, clicking the
+  second opened the first, and folding one folded both. Each branch is now
+  keyed by its place among its siblings; a fatal fork or hotspot entry opens
+  the branch whose figures it gives, and a link naming a path by its text
+  still opens the first.
+- **Dashboard: the Run screen's foresight waits for its own run.** Moving to
+  the same run in another tenant kept the other tenant's verdict, odds and
+  path in the foresight panel until the new answer arrived. Each answer is
+  now kept with the run, tenant and credential it was asked for and shown
+  only beside that run; a late answer for the earlier scope changes nothing.
+- **Dashboard: a Fate Map still drawn opens its own tenant's runs.**
+  Switching Foresight to another tenant kept the first tenant's map on screen
+  while the second's loaded, but its example runs and "Diff success vs
+  failure" opened the first tenant's run ids under the second tenant. They
+  now carry the tenant the drawn map was read in.
+
+### Upgrade
+
+- **No migration.** Segments, the write-ahead log, generation manifests and
+  every file 0.27.0 wrote are read as they are; the derived analytics
+  sidecars (`*.rollup`) move to format 6 and are rebuilt once, from their
+  segments, on first read. One new file appears beside
+  them when it is first needed: `steer.jsonl`, the nudge log, which like
+  `fuses.jsonl` lives outside generations, so a backup does not carry it.
+  `traza-server import` keeps its progress on the importing machine, in
+  `~/.traza/import-state.json`.
+- **Move a 0.27.0 Claude Code hook to the pack**: remove the old
+  `claude-code-hook.sh` entries from `.claude/settings.json` and run
+  `python3 examples/claude-code/install.py`, renaming
+  `TRAZA_FUSE_FAIL_CLOSED` to `TRAZA_FAIL_CLOSED` if you set it.
+- **Leave `next` out of checks that are not the agent's own.** A monitoring
+  script that sends `next` to `POST /v1/fuses/check` would take the run's
+  nudges; without it the check is a verdict read and takes nothing.
+- **Repeat limits count within 50 steps.** A policy that relied on
+  `max_repeats` counting a fingerprint over the whole run sets
+  `repeat_window_steps` (up to 1,000); a monitor that matched the reason
+  text exactly sees `… repeated N times in the last W steps`. `edit_thrash`
+  and `context_blowup` find fewer, better runs, and the Cache Autopsy may
+  report `partial_hit` where it said `stable`: findings and saved queries
+  compared across the upgrade will differ.
+- **Expect five more attributes on OTLP spans** whose resource sets them. A
+  consumer that compares a span's attribute set exactly will see them.
+- **Embedders** must add the new `Config`, `FuseConfig`, `Limits` and
+  `Rate` fields to struct literals.
+- **Rolling back to 0.27.0** reads the same data, ignores `steer.jsonl` and
+  the import state, and stops delivering nudges. But it **refuses to start**
+  on a `fuses.jsonl` that holds any policy, reset or grant naming
+  `min_success_odds`, `foresight_min_support`, `foresight_after_steps`,
+  `max_handoff_cycles` or `repeat_window_steps` — deleting the policy is not enough, since the log
+  keeps the record until it is next rewritten. Either remove the lines
+  that name them from `fuses.jsonl` while no server holds the directory, or
+  start 0.27.0 with `--no-fuses`, under which it neither reads nor writes
+  the file and no policy, kill switch or grant applies.
+
+## [0.27.0] - 2026-10-17
+
+The flight recorder release. Traza already kept what an agent did; this
+release lets the recording act, while a run is going and after it is over.
+A **run fuse** holds a run to limits on cost, tokens, steps, repeated calls
+and failure streaks, answers every ingest acknowledgement with a verdict, and
+offers a pre-call check that refuses a step before it starts. A recorded run
+**replays** through the agent's own OpenAI or Anthropic SDK with zero model
+calls, and two runs **diff** to the step where they parted. A hash-chained
+**ledger** over every published generation and erasure makes committed
+history tamper-evident against an anchor kept outside the store, and an
+evidence pack puts it in one digest for a notary. Underneath is what a shared,
+multi-tenant deployment needs: runtime credentials, tenant quotas and usage
+counters, admission caps, gzip bodies and health probes. Python and TypeScript
+clients, three new demos (nine in all), and five new dashboard screens round
+it out. There is no storage-format change. Several authorization defaults
+tighten, and the data-directory lock behaves differently in containers: read
+**Changed** and **Upgrade** before deploying over an existing setup.
+
+### Added
+
+- **Steps and runs.** Every span is now also read as a *step* of a *run*: its
+  step kind (`llm`, `tool`, `agent`, `retrieval`, `embedding`, `other`, from
+  `gen_ai.operation.name`, `openinference.span.kind` or `traceloop.span.kind`),
+  its tool, agent and tool-call id, its request and response as stored with a
+  canonical-JSON SHA-256 digest of each, and a `kind:name#hash` fingerprint
+  that two steps share exactly when they made the same call with the same
+  input. A run is the span's session id (`session.id`, then
+  `gen_ai.conversation.id`, then OpenLLMetry's association properties), else
+  `trace:<trace_id>`, within its tenant. Only `llm`, `tool` and `agent` spans
+  count as steps. The OpenInference keys Arize Phoenix emits
+  (`llm.model_name`, `llm.provider`, `llm.system`, `llm.token_count.*`,
+  `openinference.span.kind`) are recognized for analytics too, ranked after
+  every existing spelling so no span's previous answer changes; OpenInference
+  cache counters are deliberately not read, since its prompt count already
+  includes them. See
+  [LLM semantics § Steps and runs](docs/llm-semantics.md#steps-and-runs).
+
+- **Guard: run fuses.** [docs/guide/guard.md](docs/guide/guard.md). Eight
+  optional limits per run (`max_cost_usd`, `max_tokens`, `max_steps`,
+  `max_llm_calls`, `max_tool_calls`, `max_duration_seconds`, `max_repeats`,
+  `max_error_streak`) give it a verdict: `continue`, `warn` at 80% of any
+  limit, and at 100% the policy's action, where `stop` is sticky until reset.
+  A fuse is arithmetic over recorded spans; nothing calls a model.
+  - **Policies** per tenant (`POST /v1/fuses/policies`, `GET`, and
+    `POST /v1/fuses/policies/{id}/delete`): matched by the service of the
+    run's earliest-starting span, else the tenant's `default`, else the global
+    policy set by `--fuse-max-cost-usd`, `--fuse-max-tokens`,
+    `--fuse-max-steps`, `--fuse-max-duration-seconds`, `--fuse-max-repeats`
+    (default 12), `--fuse-max-error-streak` and `--fuse-action` (default
+    `warn`). Limits do not inherit between policies. Out of the box the global
+    policy warns at 12 repeats and stops nothing.
+  - **The acknowledgement carries the verdict.** `POST /v1/spans` answers a
+    `fuses` field and a `Traza-Fuse: stop; run=…` header naming the most
+    severe verdict in the batch; `POST /v1/traces` carries the header alone,
+    since OTLP's response has no place for it. The spans are stored either
+    way: a verdict is about the run's next step, never a refusal of the batch.
+  - **`POST /v1/fuses/check` is the pre-call gate**, and the only surface that
+    can refuse a step before it runs: the run's recorded usage plus one
+    hypothetical step with an optional `est_cost_usd`, `est_tokens` and
+    `tool`. It changes nothing and needs only the `ro` scope.
+  - The kill switch (`POST /v1/fuses/runs/{run}/trip`), reset with an
+    optional grant of absolute higher limits (`POST …/reset`; a reset never
+    refills cumulative usage), a run's verdict document
+    (`GET /v1/fuses/runs/{run}`), runs by verdict (`GET /v1/fuses/runs`), and
+    every transition — `warn`, `stop`, `manual_stop`, `reset` — by cursor from
+    a 4,096-event ring with a long-poll of up to 30 s
+    (`GET /v1/fuses/events`).
+  - Live state is a bounded cache folded on the ingest path —
+    `--fuse-max-runs` (default 100,000) runs, 1,000,000 span contributions,
+    six-hour idle eviction, stopped runs parked rather than forgotten — and a
+    run this process did not follow from its first step is rebuilt from the
+    store on the first question about it. Policies, kill switches, resets and
+    grants persist in `fuses.jsonl`, outside generations: a backup does not
+    carry it and a restore does not touch it. `--no-fuses` turns the observer
+    off entirely. Metrics: `traza_fuse_trips_total`,
+    `traza_fuse_warnings_total`, `traza_fuse_live_runs`.
+  - [`examples/guard/claude-code-hook.sh`](examples/guard/README.md#the-claude-code-hook):
+    a Claude Code PreToolUse gate that exits 2 with the reasons on a stop,
+    and an optional PostToolUse recorder that gives the step and repeat limits
+    something to count. It fails open unless `TRAZA_FUSE_FAIL_CLOSED=1`.
+  - What it cannot do, stated in the guide: a post-ack stop is at least one
+    step late, more with exporter batching; a step in flight is never
+    interrupted; the check sees recorded usage only, so parallel steps can all
+    pass it; across batches, arrival order counts; and concurrent re-sends
+    that move usage between steps of one run can latch a stop on a total the
+    store never held. See [limitations](docs/guide/guard.md#limitations).
+
+- **Replay: tapes, the replay proxy, diffs and recall.**
+  [docs/guide/replay.md](docs/guide/replay.md).
+  - `GET /v1/tapes/{run}`: a run's steps in start order with requests,
+    responses, digests, fingerprints and token counts, read from OTel GenAI,
+    OpenLLMetry, OpenInference and native layouts into one message shape.
+    `?resolve=true` inlines offloaded payloads up to `--tape-max-bytes`
+    (default 8 MiB) as a prefix, and says `resolved_partial` when it stops.
+  - `POST /v1/replays` snapshots a run (in memory, for one hour) and returns
+    base URLs for an OpenAI-compatible `…/openai/v1/chat/completions` and an
+    Anthropic-compatible `…/anthropic/v1/messages`. Set `OPENAI_BASE_URL` or
+    `ANTHROPIC_BASE_URL` to one and the agent's own code runs again with every
+    model answer served from the recording: zero model calls, and no outbound
+    request of any kind. `"stream": true` answers as server-sent events
+    rebuilt from the stored text. **Strict** mode, the default, refuses a
+    request whose normalised messages are not the recorded step's with
+    `409 replay_divergence`, naming the step, without consuming it, and with
+    `x-should-retry: false` so the SDKs do not retry; **loose** mode serves in
+    order and records whether each call matched. `GET /v1/replays/{id}` says
+    what was served. Any valid credential, `ro` included, may create and use
+    a replay, and on the routes under `/v1/replays/` only, the token may
+    arrive as `x-api-key`, so `ANTHROPIC_API_KEY` can hold it.
+  - `POST /v1/replays/{id}/tools/next` hands a harness the next recorded tool
+    result; otherwise tools run live, with their real side effects.
+  - `GET /v1/diff?a=&b=` aligns two runs by longest common subsequence over
+    `kind:name` signatures, classifies each aligned pair as `same` or changed
+    by `input`, `decision` or `config` (unaligned steps are `structure`), and
+    explains the first divergence, with cost, token, duration and error
+    deltas.
+  - `GET /v1/recall?q=` finds earlier runs whose recorded text holds every
+    word of the query, successful runs first, each with a skeleton of what it
+    did.
+  - Bounds: a run of more than 20,000 spans is refused for replay (`409`)
+    rather than replayed as its beginning; each tenant's share of the registry
+    holds 64 live replays and 64 MiB, the registry 1,024 and 512 MiB, past
+    which creation is `429` with `Retry-After`; a served response is at most
+    64 MiB. An erasure withdraws any replay holding what it covers
+    (`410 replay_erased`). Only chat completions and messages are replayed,
+    streams are not the provider's bytes, and strict mode compares messages
+    only, not the model or parameters. See
+    [limits](docs/guide/replay.md#limits-stated-plainly).
+
+- **Prove: the ledger and evidence packs.**
+  [docs/guide/ledger.md](docs/guide/ledger.md).
+  - `ledger.jsonl` in the data directory: an append-only SHA-256 hash chain
+    with one entry per published generation (`checkpoint`, carrying the
+    manifest's SHA-256), per settled erasure (`erasure`, carrying a SHA-256 of
+    the subject, never a trace, span or session id or a payload reference —
+    though a tenant subject's `tenant` field is the tenant's name — and a
+    random salt, so another tenant shown a stub of the entry cannot recompute
+    its head), and per external `anchor`, each head committing to the one
+    before:
+    `sha256("traza-ledger/1\n" + prev + "\n" + canonical_json(entry without head))`.
+    The guide's ten-line standard-library Python script recomputes every
+    head, and `tests/ledger.rs` runs it verbatim from the guide.
+  - `GET /v1/ledger` (paged; unbound credentials), `GET /v1/ledger/head` (any
+    `ro`, bound included), `GET /v1/ledger/verify` (unbound: recomputes every
+    head and link, checks the latest checkpoint names the live manifest,
+    re-digests every manifested file, and checks ledgered erasures against the
+    tombstone log in both directions), `POST /v1/ledger/anchors` (unbound
+    `admin`: stores a notary's countersignature over an earlier head, `409`
+    unless `target_head` is the head recorded at `target_seq`), and
+    `GET /v1/evidence` (any `ro`; a bound credential gets its own tenant's
+    pack, with other tenants' erasure entries as stubs it cannot recompute).
+  - `traza-server verify --ledger [--data-dir DIR] [--json]`: the same
+    verification offline and read-only, against a directory no live server
+    owns. Exits `0` intact, `2` broken, `1` when it cannot verify.
+  - A backup pin carries `pins/<label>/ledger.jsonl`, ending on the pinned
+    checkpoint. The erasure receipt gains a `ledger` domain, reported
+    `retained-by-design`.
+  - What it does not prove, stated before anything else in the guide: the
+    chain has no secret, so history is tamper-evident only against an anchor
+    you keep outside the store; anchor signatures are stored, never checked;
+    `at_ns` is the server's clock; restoring a pin taken before an erasure
+    undoes it, and verification then names the entry. The ledger never
+    rotates: a checkpoint entry is about 305 bytes, about 88 KB a day at the
+    five-minute checkpoint cadence. See
+    [limitations](docs/guide/ledger.md#limitations).
+
+- **Platform.**
+  - **Runtime credentials**: `POST /v1/admin/credentials` mints a token
+    (`trz_` and 64 hex digits, shown once) or registers a supplied
+    high-entropy one, with an optional label, tenant binding and expiry;
+    `GET /v1/admin/credentials` lists them and
+    `POST /v1/admin/credentials/{id}/revoke` revokes one, durably, from the
+    next request. Kept as SHA-256 digests in `credentials.jsonl` (mode
+    `0600`, fsynced per write, outside generations and pins), beside
+    `TRAZA_TOKENS` entries, which list as `source: "env"`. An open store is
+    closed by minting its first credential — which must be an unbound
+    `admin` — and stays closed across restarts; revoking every credential
+    locks the store rather than reopening it. See
+    [administration § Runtime credentials](docs/operations/administration.md#runtime-credentials).
+  - **Tenant limits**: `POST /v1/admin/tenants/{tenant}/limits` (and `GET`;
+    `_default` names the default tenant) replaces a tenant's
+    `monthly_spans`, `monthly_bytes`, `ingest_paused` and `ttl_seconds`,
+    durable in `limits.json`. The runtime TTL outranks `--tenant-ttl` and
+    `--ttl-seconds` and applies at the next minutely retention pass, with no
+    restart.
+  - **Usage counters**: per tenant, lifetime and current-UTC-month spans,
+    bytes (each span's native JSON before payload offload), batches and
+    refused spans, at `GET /v1/usage` in O(tenants); a bound credential sees
+    its own row. They are written to `usage.json` every five seconds by a
+    thread of their own and on every flush, so a crash undercounts by about
+    five seconds' worth and never overcounts. `/v1/metrics` gains
+    `traza_tenant_spans_ingested_total{tenant}` and
+    `traza_quota_rejected_total{tenant}`.
+  - **Quota enforcement**: a batch that would take its tenant past a monthly
+    limit, or any batch of a paused tenant, is refused whole with `429`,
+    `Retry-After` (the seconds to next month, `60` for a pause) and a body
+    naming the limit, the month's usage and when it resets — on native and
+    OTLP ingest alike. Reads, exports and erasure are never blocked. The
+    check reserves nothing, so batches admitted concurrently can overshoot a
+    limit by what was in flight. See
+    [administration § Quotas and usage](docs/operations/administration.md#quotas-and-usage).
+  - **Admission caps**, on by default: `--max-span-attributes` (1024),
+    `--max-attribute-key-bytes` (256), `--max-span-events` (1024),
+    `--max-span-bytes` (4 MiB, measured as stored, after payload offload) and
+    `--max-batch-spans` (100,000). A violating batch is refused whole with
+    `400` naming the cap and the span, before anything — a payload file
+    included — is written. `0` disables each.
+  - **Gzip request bodies**: `Content-Encoding: gzip` (or `x-gzip`) on
+    `POST /v1/spans` and `POST /v1/traces`, what an OTLP exporter sends with
+    compression on. The inflate is the crate's own, so this adds no
+    dependency; every member's CRC-32 and length are checked, and the
+    decompressed size is held to the 64 MiB body cap (`413` past it). Any
+    other coding, or gzip on another route, is `415`.
+  - **`GET /healthz`** (`{"status":"ok","version":"0.27.0"}`) and
+    **`GET /readyz`**, answered before the auth gate and left out of the
+    request metrics; **`GET /v1/whoami`** tells any caller what its own
+    credential is.
+  - **Operator hardening**: in open mode, admin operations refuse cross-site
+    browser requests (see Changed); a request admitted in open mode whose
+    body arrives after the first credential was minted is authenticated again
+    and answered `401`; of two bootstraps racing, exactly one creates a
+    credential; a failed append to the credential or fuse log is truncated
+    back out instead of being left for the next record to merge with; and a
+    non-loopback bind counts a runtime credential already in the data
+    directory as configured authentication.
+
+- **MCP: four read tools over runs.** `check_run_guard` (not listed under
+  `--no-fuses`), `get_run_tape`, `compare_runs` and `recall_runs`, with stored
+  text kept inside the untrusted-telemetry block as everywhere on that
+  surface. There is deliberately no replay tool: letting the model under test
+  create one would let stored telemetry choose which recording its next run
+  is fed. Sixteen tools in all: fourteen reads and the two gated writers. See
+  [the MCP guide](docs/guide/mcp.md#the-tools).
+
+- **Dashboard: five screens, and a tenant-aware page.**
+  [docs/guide/trace-browser.md](docs/guide/trace-browser.md).
+  - **Guard** (runs by verdict, usage against limits, reasons and evidence,
+    the kill switch, reset with a grant, policies and the global default),
+    **Run** (the tape with request and response previews and payload loading,
+    a replay with both SDKs' environment lines, compare-with), **Diff**
+    (aligned steps, the first divergence explained, totals and delta),
+    **Ledger** (head, verification, entries, anchors, and an evidence pack
+    saved as the server's exact bytes) and **Credentials** (mint with the
+    token shown once, list, revoke). Sessions and traces link to their run.
+  - The page asks `GET /v1/whoami` before anything that depends on it. A
+    tenant-bound credential never calls an operator surface — the API client
+    refuses those paths in the browser — reads its pulse and counts from its
+    own `GET /v1/usage` row, and is not offered Server, Store or Credentials.
+    After a `401` every poll stands down until a token is set, and a `403`
+    names the grant the server said was missing.
+  - A token can be handed over in the URL fragment (`#token=…`, or a route's
+    `token=` parameter), taken before the first render and on fragment
+    navigation, and removed from history with `history.replaceState`.
+  - `<meta name="traza-api-base">` in the built `index.html` prefixes every
+    request, stream, MCP call and copyable snippet, for a proxy that mounts
+    the store under a path; see
+    [deployment](docs/operations/deployment.md#serving-the-dashboard).
+
+- **Client libraries** in [`sdk/`](sdk/): `traza` for Python 3.9+ (standard
+  library only, typed dataclasses with `py.typed`, clean under
+  `mypy --strict`) and `@trazadb/sdk` for TypeScript (Node 20+, Deno, Bun,
+  edge runtimes and same-origin pages; no runtime dependencies; a lossless
+  JSON reader, so every `*_ns` arrives as a `bigint`). Both cover `whoami`
+  and `usage`; the fuse check and a `guard` that raises `FuseTripped` before
+  a stopped step starts; the other fuse routes and the event feed; tapes;
+  replays with absolute base URLs and an `env()` for the provider SDKs; diff;
+  recall; the ledger head; and evidence packs with digest verification —
+  plus the OTLP exporter environment. They are not instrumentation, they
+  refuse redirects rather than carry a token wherever a `3xx` points, and
+  they install from this repository; neither is published to a package
+  registry. Both carry the engine's version, and
+  `scripts/check-sdk-metadata.py` fails the gate on a mismatch. See
+  [docs/guide/clients.md](docs/guide/clients.md).
+
+- **Three demos: `guard`, `replay` and `prove`**, nine in the
+  [tour](examples/README.md) now. `guard` stops a looping agent between
+  steps, refuses its next step at the gate, trips a healthy run, approves
+  more budget with a grant and runs the Claude Code hook; `replay` records a
+  run, replays it through OpenAI-wire agent code with the stand-in model
+  switched off, has a changed prompt refused at step 0, and diffs it;
+  `prove` recomputes every ledger head with `hashlib`, records an anchor,
+  ledgers an erasure by digest, and has `verify --ledger` name one flipped
+  byte and exit `2`. Each runs in seconds and asserts its own claims.
+  `ci.sh` runs all nine from a checkout path containing a space, and points
+  the three new ones at the binary it just built rather than one inherited
+  from the caller's shell.
+
+### Changed
+
+- **`/v1/backups/*` needs an unbound `admin` credential.** A pin holds every
+  byte of its generation on disk until it is released, so taking one is a
+  capacity decision rather than a write. An `rw` token now gets
+  `403 {"error":"forbidden","required":"admin"}`, a bound one
+  `"required":"unbound"`. The pin still carries no `credentials.jsonl`,
+  `limits.json` or `usage.json`, and a restore leaves them as they are.
+- **Everything under `/v1/admin/` is unbound-admin only, by prefix.** The
+  gate refuses a bound or non-admin credential there before any route is
+  consulted, including paths that do not exist yet, so a route added under
+  the prefix later is denied before anyone remembers to list it. The new
+  `GET /v1/ledger`, `GET /v1/ledger/verify` and `POST /v1/ledger/anchors`
+  join the store-global operator surfaces a bound credential is refused.
+- **Every `403` from the auth gate carries `"required"`** — `"rw"`,
+  `"admin"` or `"unbound"`, the capability the credential lacked:
+  `{"error":"forbidden","required":"rw"}` where the body used to be
+  `{"error":"forbidden"}`, and the foreign-tenant refusal gains
+  `"required":"unbound"`. The `error` strings are unchanged. A `401` now also
+  covers expired and revoked tokens, with the same body as an unknown one.
+- **In open mode, admin operations refuse cross-site browser requests.**
+  With no credential configured, `POST /v1/erasures`, eval version
+  tombstones, `/v1/backups/*`, `POST /v1/ledger/anchors` and every path under
+  `/v1/admin/` answer a request whose `Origin` is not a loopback page with
+  `403 {"error":"origin not allowed: …","next":"…"}`; without that, any page
+  the operator visited could mint itself an admin credential with a plain
+  cross-site `POST`. Requests with no `Origin` (`curl`, scripts) and pages
+  served from loopback — the dashboard on its default bind — are unaffected,
+  and once a credential exists the rule no longer applies. A dashboard served
+  to a browser under another hostname cannot mint credentials on an open
+  store; configure one first.
+- **A `POST` with a body under `/v1/admin/` must declare
+  `Content-Type: application/json`**, or it is `415`. An HTML form cannot send
+  that type, and a cross-site script cannot without a CORS preflight this
+  server never approves.
+- **Admission caps are on by default**, for embedders too (`Config` defaults
+  to `Some` for each). A span with more than 1,024 attributes or events, a
+  key over 256 bytes, a stored size over 4 MiB, or a batch of more than
+  100,000 spans — all accepted before — is refused with `400`, and nothing
+  from its batch is stored.
+- **Run fuses are on by default.** Every acknowledged batch feeds the
+  observer, which follows runs from their first step and holds no state for
+  ordinary tracing traffic. The default global policy only warns (12
+  repeats), so no run is stopped unless someone configures a stop; ingest
+  responses can now carry a `fuses` field and a `Traza-Fuse` header.
+  `--no-fuses` (for an embedder, `config.fuses.enabled = false`) restores
+  ingest that does no fuse work.
+- **The retention pass runs every minute whether or not a flag configured a
+  window**, returning at once when none applies, so a runtime `ttl_seconds`
+  takes effect without a restart.
+- **The data-directory lock reclaims a lock left by an earlier process with
+  the opener's PID.** A lock naming the opening process's own PID is now
+  stale unless this process already holds the directory (a process-wide
+  registry of canonical paths decides, so a second open within one process
+  is still refused under any spelling of the path). On Linux, liveness is
+  read from `/proc/<pid>`, so it works in the `FROM scratch` release image,
+  which has no `kill`; elsewhere `kill -0`; an owner neither can check is
+  still treated as live. **This changes what two containers sharing one
+  volume do**: each is PID 1 in its own namespace, and where the second used
+  to refuse the first's lock — it named PID 1, its own PID, which read as
+  live — it now reclaims it, and both write one directory. Stop the old
+  container before the new one starts (in Kubernetes, `strategy: Recreate`,
+  not a rolling update). See
+  [deployment § One writer per data directory](docs/operations/deployment.md#one-writer-per-data-directory).
+- **Library surface.** `Admission` is no longer `Copy` and gains
+  `signals: Vec<guard::Signal>`, one per run in the batch whose verdict is
+  not `continue`. `Config` gains `max_span_attributes`,
+  `max_attribute_key_bytes`, `max_span_events`, `max_span_bytes`,
+  `max_batch_spans` (each `Option<usize>`) and `fuses: guard::FuseConfig`; a
+  `Config` built by struct literal must add them, `..Config::default()` need
+  not. `Error` gains `QuotaExceeded(usage::QuotaRefusal)` and
+  `Unauthenticated`, so an exhaustive `match` needs two more arms. New public
+  modules: `caps`, `credentials`, `diff`, `guard`, `gzip`, `ledger`,
+  `limits`, `platform`, `recall`, `replay`, `run`, `tape`, `usage`.
+- **The MCP surface grows from twelve tools to sixteen.** An `ro` token is
+  now offered fourteen read tools where it was offered ten; the two writers
+  are still listed only to an `rw` token on a server started with their
+  flag.
+- **The non-loopback refusal** names the new way out:
+  `configure TRAZA_TOKENS, create a runtime credential (POST /v1/admin/credentials on a loopback start), or pass --allow-unauthenticated-non-loopback explicitly`.
+  Running open on a network is now documented for what it is: the first
+  client to mint a credential owns the store, persistently.
+- **Ingest serializes every span once more before admitting it**, to
+  enforce the admission caps and to charge usage bytes, on the request's own
+  thread and outside every engine lock. The published ingest throughput
+  records predate this pass and have not been re-run; an interleaved
+  before/after run on a heavily loaded host could not separate its cost from
+  run-to-run noise, which is not the same as showing it costs nothing. See
+  [capacity](docs/operations/capacity.md). No performance figure in this
+  release is new.
+- Version metadata: the crate, the UI and both client libraries move to
+  0.27.0. The MSRV stays 1.81, and a default build still has three direct
+  dependencies.
+
+### Fixed
+
+- **A restarted container opens its store again.** The release image runs
+  the server as PID 1, which ignores the SIGTERM of `docker stop` and
+  `docker restart`, so SIGKILL left the lock behind naming PID 1 — the PID
+  the restarted server had again, which read as a live owner — and the store
+  refused to open on every start until the lock was removed by hand. Stale
+  locks of other PIDs were not reclaimed in that image either, because
+  liveness shelled out to a `kill` binary the `FROM scratch` image does not
+  have. Both are covered by the lock change above.
+- **Requests answered before the auth gate are consumed before they are
+  answered.** The dashboard shell and assets, the missing-build `404` and
+  the new probes never drained their request from the connection's buffer,
+  so on a kept-alive connection the same request was parsed and answered
+  again and again, up to the 100,000-requests-per-connection limit, and the
+  client's next request on that connection read a stale copy of the last
+  answer. A `HEAD` response also carried its body, which a client reads as
+  the start of the next response; it now sends the head only.
+- **Dashboard.** The theme follows the operating system's light or dark
+  preference until the toggle is used: the pre-paint script compared the
+  stored `"dark"` with `dark` and never matched, and the first visit stored
+  `light`, overruling the preference for good. Dialogs close on Escape, keep
+  `Tab` inside and return focus to what opened them; the rail and header
+  controls are real buttons; the time ruler fits its ticks to its width, so
+  labels no longer overprint; the hardcoded "1 node" is gone. Below 900px
+  the rail becomes a drawer, and below 700px grids reflow and wide tables
+  scroll inside their cards rather than widening the page.
+- **`tests/object_storage_transfer.rs` gives each test its own source
+  directory.** The name was the process id and the clock, which ticks in
+  microseconds on macOS, so two parallel tests could open the same directory
+  and one failed `AlreadyOpen` — 4 runs in 40, enough to break the
+  object-storage leg of `ci.sh`.
+- **Links to storage-comparison's removed projection section** in
+  `docs/segment-format.md` and `docs/internals/dependencies.md` point at
+  [where the savings come from](docs/storage-comparison.md#where-the-savings-come-from),
+  and the sentences around them say the projection lived on that page
+  before `94e7f86` rather than that it still does.
+
+### Upgrade
+
+- **No migration.** Segments, the write-ahead log and generation manifests
+  are written exactly as 0.26.0-preview.1 wrote them, so its data directory
+  opens as it is. New files appear beside them as they are first needed:
+  `ledger.jsonl` (at the first open, with a genesis entry and the live
+  generation's checkpoint), `fuses.jsonl`, `credentials.jsonl`,
+  `limits.json` and `usage.json`. All of them live outside generations; a
+  pin carries only the ledger's copy.
+- **Move backup jobs to an unbound `admin` token**, and anything that calls
+  `/v1/admin/*` with a bound or non-admin one. A client that compares a
+  `403` body exactly must accept the `required` key.
+- **Check producers against the admission caps.** A batch that used to land
+  and now gets `400` names the cap and the span; raise that cap, or set it to
+  `0` to disable it.
+- **Embedders** must add the new `Config` fields to struct literals, two
+  arms to exhaustive `Error` matches, and stop relying on `Admission` being
+  `Copy`.
+- **Containers**: a `docker restart` no longer needs the lock removed by
+  hand, but two containers must not mount one data volume at the same time —
+  nothing refuses the second any more.
+- **Rolling back to 0.26.0-preview.1** reads the same data, but that binary
+  knows nothing of the new files. It ignores `credentials.jsonl`, so a store
+  closed only by runtime credentials serves open again on loopback (and
+  refuses a non-loopback bind); keep `TRAZA_TOKENS` set if you may roll back.
+  Fuse policies, tenant limits and quotas likewise stop applying until 0.27.0
+  runs again.
+
 ## [0.26.0-preview.1] - 2026-09-06
 
 Preview: an object-storage snapshot archive behind the new, default-off

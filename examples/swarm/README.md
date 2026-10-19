@@ -40,7 +40,7 @@ Three services with distinct trace shapes, batched to `/v1/spans` every
 
 | Service | Shape |
 |---|---|
-| `support-agent` | A dozen concurrent multi-turn chats, a stable `session.id` per conversation. Each turn: an `agent.turn` root, a short tool-choice model call, one to three tool calls (`kb.search`, `memory.recall`, `crm.lookup`), and an answering model call (`gpt-4o-mini` / `claude-sonnet-4-5` / `gemini-2.0-flash`, some streaming) carrying `gen_ai.input.messages` / `gen_ai.output.messages`, so the conversation view renders a readable chat |
+| `support-agent` | A dozen concurrent multi-turn chats, a stable `session.id` per conversation. Each turn: an `agent.turn` root, a short tool-choice model call, one to three tool calls (`kb.search`, `memory.recall`, `crm.lookup`), and an answering model call (`gpt-6-luna` / `claude-sonnet-5-5` / `gemini-3.8-flash`, some streaming) carrying `gen_ai.input.messages` / `gen_ai.output.messages`, so the conversation view renders a readable chat |
 | `research-swarm` | Every 6-9 s, one fan-out: a planner model call, then 5-10 **genuinely concurrent** workers doing `web.fetch` (with the occasional 503 and retry) plus a per-worker summarize call, then a reduce call. The waterfall showpiece and the burst in the span rate — its `#/trace/…` link prints when it lands |
 | `code-agent` | Tool-heavy, longer traces every second or two, so several are in flight at once: `fs.read`, a model call, `patch.apply`, `tests.run` (which sometimes fails), `git.diff` |
 

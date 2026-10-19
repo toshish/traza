@@ -30,12 +30,12 @@ fn test_dir(label: &str) -> PathBuf {
 }
 
 const TABLE: &str = r#"{"models": {
-    "gpt-5.6-sol": {"input_per_mtok": 1.0, "output_per_mtok": 10.0}
+    "sim-model": {"input_per_mtok": 1.0, "output_per_mtok": 10.0}
 }}"#;
 
 /// Rates doubled, so the same spans must produce exactly twice the cost.
 const REPRICED: &str = r#"{"models": {
-    "gpt-5.6-sol": {"input_per_mtok": 2.0, "output_per_mtok": 20.0}
+    "sim-model": {"input_per_mtok": 2.0, "output_per_mtok": 20.0}
 }}"#;
 
 fn config(table: Option<&str>) -> Config {
@@ -94,7 +94,7 @@ fn model_cost(store: &Store) -> (f64, f64) {
 #[test]
 fn an_unpriced_store_reports_nothing_and_a_priced_one_reports_the_arithmetic() {
     // 1M in at $1/Mtok + 1M out at $10/Mtok = $11.
-    let spans = vec![span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, None)];
+    let spans = vec![span("a", "sim-model", 1_000_000, 1_000_000, None)];
 
     let bare = test_dir("bare");
     let store = Store::open(&bare, config(None)).expect("opens");
@@ -124,7 +124,7 @@ fn a_metered_cost_is_never_replaced_by_the_table() {
     store
         .ingest_batch(vec![span(
             "a",
-            "gpt-5.6-sol",
+            "sim-model",
             1_000_000,
             1_000_000,
             Some(0.42),
@@ -142,8 +142,8 @@ fn a_mixed_total_reports_how_much_of_it_is_an_estimate() {
     let store = Store::open(&dir, config(Some(TABLE))).expect("opens");
     store
         .ingest_batch(vec![
-            span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, Some(0.42)),
-            span("b", "gpt-5.6-sol", 1_000_000, 1_000_000, None),
+            span("a", "sim-model", 1_000_000, 1_000_000, Some(0.42)),
+            span("b", "sim-model", 1_000_000, 1_000_000, None),
             // No rate for this model: it contributes tokens and no cost,
             // rather than a zero that would read as "this one was free".
             span("c", "some-private-model", 1_000_000, 1_000_000, None),
@@ -178,7 +178,7 @@ fn a_sealed_rollup_is_not_believed_after_the_rates_change() {
     {
         let store = Store::open(&dir, config(Some(TABLE))).expect("opens");
         store
-            .ingest_batch(vec![span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, None)])
+            .ingest_batch(vec![span("a", "sim-model", 1_000_000, 1_000_000, None)])
             .expect("append");
         // Seal, so the counters are written to a sidecar rather than living
         // in the write buffer where nothing is cached.
@@ -220,7 +220,7 @@ fn removing_the_table_returns_the_store_to_metered_cost_only() {
     {
         let store = Store::open(&dir, config(Some(TABLE))).expect("opens");
         store
-            .ingest_batch(vec![span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, None)])
+            .ingest_batch(vec![span("a", "sim-model", 1_000_000, 1_000_000, None)])
             .expect("append");
         store.flush().expect("flush");
         assert!((model_cost(&store).0 - 11.0).abs() < 1e-9);
@@ -242,7 +242,7 @@ fn sessions_report_derived_cost_too() {
     let dir = test_dir("sessions");
     let store = Store::open(&dir, config(Some(TABLE))).expect("opens");
     store
-        .ingest_batch(vec![span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, None)])
+        .ingest_batch(vec![span("a", "sim-model", 1_000_000, 1_000_000, None)])
         .expect("append");
 
     let sessions = store
@@ -265,7 +265,7 @@ fn an_unpriced_call_is_not_reported_as_a_metered_zero() {
     let dir = test_dir("unpriced-provenance");
     let store = Store::open(&dir, config(None)).expect("opens");
     store
-        .ingest_batch(vec![span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, None)])
+        .ingest_batch(vec![span("a", "sim-model", 1_000_000, 1_000_000, None)])
         .expect("append");
 
     assert_eq!(model_cost(&store), (0.0, 0.0));
@@ -284,11 +284,11 @@ fn a_zero_rate_model_is_derived_rather_than_metered() {
     // apart.
     let dir = test_dir("zero-rate");
     let free = r#"{"models": {
-        "gpt-5.6-sol": {"input_per_mtok": 0.0, "output_per_mtok": 0.0}
+        "sim-model": {"input_per_mtok": 0.0, "output_per_mtok": 0.0}
     }}"#;
     let store = Store::open(&dir, config(Some(free))).expect("opens");
     store
-        .ingest_batch(vec![span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, None)])
+        .ingest_batch(vec![span("a", "sim-model", 1_000_000, 1_000_000, None)])
         .expect("append");
 
     assert_eq!(model_cost(&store), (0.0, 0.0), "zero rates cost zero");
@@ -305,8 +305,8 @@ fn provenance_counts_separate_the_three_kinds_of_call() {
     let store = Store::open(&dir, config(Some(TABLE))).expect("opens");
     store
         .ingest_batch(vec![
-            span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, Some(0.42)),
-            span("b", "gpt-5.6-sol", 1_000_000, 1_000_000, None),
+            span("a", "sim-model", 1_000_000, 1_000_000, Some(0.42)),
+            span("b", "sim-model", 1_000_000, 1_000_000, None),
             span("c", "some-private-model", 1_000_000, 1_000_000, None),
         ])
         .expect("append");
@@ -323,8 +323,8 @@ fn provenance_counts_survive_a_seal_and_reopen() {
         let store = Store::open(&dir, config(Some(TABLE))).expect("opens");
         store
             .ingest_batch(vec![
-                span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, Some(0.42)),
-                span("b", "gpt-5.6-sol", 1_000_000, 1_000_000, None),
+                span("a", "sim-model", 1_000_000, 1_000_000, Some(0.42)),
+                span("b", "sim-model", 1_000_000, 1_000_000, None),
                 span("c", "some-private-model", 1_000_000, 1_000_000, None),
             ])
             .expect("append");
@@ -381,8 +381,8 @@ fn the_series_carries_provenance_alongside_the_money() {
     let store = Store::open(&dir, config(Some(TABLE))).expect("opens");
     store
         .ingest_batch(vec![
-            span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, None),
-            span("b", "gpt-5.6-sol", 1_000_000, 1_000_000, Some(0.42)),
+            span("a", "sim-model", 1_000_000, 1_000_000, None),
+            span("b", "sim-model", 1_000_000, 1_000_000, Some(0.42)),
             span("c", "some-private-model", 1_000_000, 1_000_000, None),
         ])
         .expect("append");

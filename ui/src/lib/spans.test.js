@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   llmUsage, sessionIdOf, llmMessages, messageText,
   base64ToDataUri, parseLoadedMessages, toolResultParts,
+  isLlm, stepKindOf,
 } from './spans.js';
 
 const span = (attributes, extra = {}) => ({ attributes, ...extra });
@@ -38,6 +39,107 @@ describe('llmUsage', () => {
   it('recognizes an LLM span from operation name alone', () => {
     expect(llmUsage(span({ 'gen_ai.operation.name': 'chat' }))).not.toBeNull();
     expect(llmUsage(span({ 'http.method': 'GET' }))).toBeNull();
+  });
+});
+
+// The browser's step kind must be the server's (src/semconv.rs `facts()` and
+// `step_kind`): Agent mode keeps the spans the tape and the guard count as
+// steps, and an "llm" here that is "other" there would show a step the tape
+// does not have. These cases mirror the Rust tests of the same rules.
+describe('isLlm', () => {
+  it('is what semconv.rs facts() calls an LLM call', () => {
+    for (const attributes of [
+      { 'gen_ai.provider.name': 'openai', 'gen_ai.operation.name': 'chat' },
+      { 'gen_ai.operation.name': 'embeddings' },
+      { 'gen_ai.system': 'anthropic' },
+      { 'traceloop.span.kind': 'llm' },
+      { 'llm.request.type': 'chat' },
+      { 'llm.system': 'anthropic' },
+      { 'llm.model_name': 'm' },
+      { 'llm.token_count.total': 9 },
+      { 'llm.token_count.completion': '12' },
+      { 'openinference.span.kind': 'LLM' },
+      { 'openinference.span.kind': 'llm' },
+      { 'openinference.span.kind': 'Llm' },
+    ]) {
+      expect(isLlm(span(attributes)), JSON.stringify(attributes)).toBe(true);
+    }
+  });
+
+  it('counts an operation name or request type by presence, whatever its value', () => {
+    // `contains_key` on the server: an empty or non-string value still counts.
+    expect(isLlm(span({ 'gen_ai.operation.name': '' }))).toBe(true);
+    expect(isLlm(span({ 'gen_ai.operation.name': true }))).toBe(true);
+    expect(isLlm(span({ 'llm.request.type': null }))).toBe(true);
+  });
+
+  it('does not count cost, a stop reason, or a token count the server cannot read', () => {
+    for (const attributes of [
+      { 'http.method': 'GET', 'session.id': 's' },
+      { 'llm.cost_usd': 0.02 },
+      { 'gen_ai.usage.cost': 0.02 },
+      { 'gen_ai.response.finish_reason': 'stop' },
+      { 'llm.stop_reason': 'end_turn' },
+      { 'gen_ai.usage.input_tokens': '1.5' },
+      { 'gen_ai.usage.input_tokens': '-3' },
+      { 'traceloop.span.kind': 'LLM' },
+      { 'openinference.span.kind': 'TOOL' },
+      { 'openinference.span.kind': 'CHAIN' },
+    ]) {
+      expect(isLlm(span(attributes)), JSON.stringify(attributes)).toBe(false);
+    }
+  });
+});
+
+describe('stepKindOf', () => {
+  it('maps every recognized value, source by source', () => {
+    const cases = [
+      [{ 'gen_ai.operation.name': 'chat' }, 'llm'],
+      [{ 'gen_ai.operation.name': 'text_completion' }, 'llm'],
+      [{ 'gen_ai.operation.name': 'generate_content' }, 'llm'],
+      [{ 'gen_ai.operation.name': 'execute_tool' }, 'tool'],
+      [{ 'gen_ai.operation.name': 'invoke_agent' }, 'agent'],
+      [{ 'gen_ai.operation.name': 'create_agent' }, 'agent'],
+      [{ 'gen_ai.operation.name': 'embeddings' }, 'embedding'],
+      [{ 'openinference.span.kind': 'LLM' }, 'llm'],
+      [{ 'openinference.span.kind': 'TOOL' }, 'tool'],
+      [{ 'openinference.span.kind': 'AGENT' }, 'agent'],
+      [{ 'openinference.span.kind': 'RETRIEVER' }, 'retrieval'],
+      [{ 'openinference.span.kind': 'EMBEDDING' }, 'embedding'],
+      [{ 'openinference.span.kind': 'CHAIN' }, 'other'],
+      [{ 'traceloop.span.kind': 'llm' }, 'llm'],
+      [{ 'traceloop.span.kind': 'LLM' }, 'llm'],
+      [{ 'traceloop.span.kind': 'tool' }, 'tool'],
+      [{ 'traceloop.span.kind': 'agent' }, 'agent'],
+      [{ 'traceloop.span.kind': 'workflow' }, 'other'],
+      [{ 'traceloop.span.kind': 'task' }, 'other'],
+      [{ 'llm.model': 'm' }, 'llm'],
+      [{ 'gen_ai.tool.name': 'search' }, 'tool'],
+      [{ 'tool.name': 'search' }, 'tool'],
+      [{ 'traceloop.entity.name': 'search' }, 'other'],
+      [{}, 'other'],
+    ];
+    for (const [attributes, kind] of cases) {
+      expect(stepKindOf(span(attributes)), JSON.stringify(attributes)).toBe(kind);
+    }
+  });
+
+  it('ranks the sources in the documented order', () => {
+    expect(stepKindOf(span({ 'gen_ai.operation.name': 'execute_tool', 'openinference.span.kind': 'LLM' }))).toBe('tool');
+    expect(stepKindOf(span({ 'openinference.span.kind': 'AGENT', 'traceloop.span.kind': 'tool' }))).toBe('agent');
+    expect(stepKindOf(span({ 'traceloop.span.kind': 'workflow', 'llm.model': 'm' }))).toBe('other');
+    expect(stepKindOf(span({ 'openinference.span.kind': 'CHAIN', 'llm.model_name': 'm' }))).toBe('other');
+    expect(stepKindOf(span({ 'llm.model': 'm', 'gen_ai.tool.name': 'search' }))).toBe('llm');
+    expect(stepKindOf(span({ 'gen_ai.operation.name': 'frobnicate' }))).toBe('llm');
+  });
+
+  it('does not make a wrapper an LLM step for carrying a rolled-up cost', () => {
+    // An agent wrapper with only `gen_ai.usage.cost` is "other" on the tape
+    // and to the guard; Agent mode must not keep it as a model call.
+    expect(stepKindOf(span({ 'gen_ai.usage.cost': 0.41 }))).toBe('other');
+    expect(stepKindOf(span({ 'llm.cost_usd': 0.41, 'gen_ai.tool.name': 'search' }))).toBe('tool');
+    expect(stepKindOf(span({ 'gen_ai.response.finish_reason': 'stop' }))).toBe('other');
+    expect(stepKindOf(span({ 'gen_ai.operation.name': '' }))).toBe('llm');
   });
 });
 

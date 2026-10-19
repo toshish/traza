@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 320" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" role="img" aria-label="Three of Traza's six demos, replayed: a million-span ingest answered in microseconds to milliseconds; a kill -9 with every acknowledged span recovered; an agent diagnosing a runaway session over MCP.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 320" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" role="img" aria-label="Three of Traza's twelve demos, replayed: a million-span ingest answered in microseconds to milliseconds; a kill -9 with every acknowledged span recovered; an agent diagnosing a runaway session over MCP.">
   <style>
     .bg { fill: #1B1712; }
     .bar { fill: #241F18; }
@@ -78,5 +78,5 @@
   <text class="l a3-5 out" x="28" y="184">pass <tspan class="num">0.00 -&gt; 0.90</tspan> — 9 of 10 examples flipped fail -&gt; pass</text>
 
   <line x1="28" y1="252" x2="812" y2="252" stroke="#2E2820" stroke-width="1"/>
-  <text class="foot" x="28" y="284">six demos · every number measured while you watch · <tspan class="num">./examples/</tspan></text>
+  <text class="foot" x="28" y="284">twelve demos · every number measured while you watch · <tspan class="num">./examples/</tspan></text>
 </svg>

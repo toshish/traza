@@ -205,7 +205,9 @@ ended tidily".
 1. Create the directory if absent, then **acquire the directory lock**. One
    live `Store` per directory. A lock naming a PID that verifiably no longer
    exists is stale and reclaimed by exactly one winner through a sentinel file;
-   an unreadable or live lock rejects the open.
+   an unreadable or live lock rejects the open. A lock naming this process's
+   own PID is stale unless the process-wide registry of held directories says
+   this process holds it — a container's PID 1 restarted after an unclean stop.
 2. **Remove orphaned temp files** left by an interrupted segment write.
 3. **Finish interrupted compaction rewrites** from the supersede journal.
    Recovery follows the journal, never content.
@@ -227,6 +229,11 @@ untouched — restarting in `wal` mode must still recover it.
 The server starts one maintenance thread when TTL or compaction is enabled. It
 ticks every 5 seconds and runs `compact_segments`; every twelfth tick (one
 minute) it also runs `compact_expired` if TTL is configured.
+
+A second thread writes the per-tenant usage counters (`usage.json`) every
+5 seconds. It is separate because the maintenance tick runs its duties one
+after another, and a long merge or expiry pass there would stretch the gap
+between two usage writes — which is exactly what a crash can lose.
 
 **Compaction** merges same-size segments to bound the segment count, because a
 filtered query costs one index probe per segment — a store that only ever

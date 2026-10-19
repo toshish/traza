@@ -22,7 +22,7 @@
 //! requires. All slicing is bounds-checked; malformed input yields
 //! `DecodeError`, never a panic.
 
-use crate::otlp::{hex, AnyValueParts, OtlpError, SpanParts};
+use crate::otlp::{hex, AnyValueParts, OtlpError, ResourceIdentity, SpanParts};
 use crate::{Event, Link, Span};
 use serde_json::{Map, Value};
 
@@ -173,71 +173,71 @@ pub fn spans_from_protobuf(bytes: &[u8]) -> Decoded<Vec<Span>> {
 /// the encoder emitted them in field order. The sweep only re-walks tags —
 /// submessages it does not want are skipped, not decoded.
 fn decode_resource_spans(bytes: &[u8], out: &mut Vec<Span>) -> Decoded<()> {
-    let mut service = None;
-    let mut tenant = None;
+    let mut identity = ResourceIdentity::default();
     let mut reader = Reader::new(bytes);
     while !reader.done() {
         let (field, wire_type) = reader.tag()?;
         match (field, wire_type) {
-            (1, 2) => (service, tenant) = decode_resource_identity(reader.bytes_field()?)?,
+            (1, 2) => identity = decode_resource_identity(reader.bytes_field()?)?,
             _ => reader.skip(wire_type)?,
         }
     }
-    let service = service.unwrap_or_else(|| "unknown_service".to_owned());
-    let tenant = tenant.unwrap_or_default();
+    let service = identity
+        .service
+        .unwrap_or_else(|| "unknown_service".to_owned());
+    let tenant = identity.tenant.unwrap_or_default();
+    let resource = Resource {
+        service: &service,
+        tenant: &tenant,
+        kept: &identity.kept,
+    };
 
     let mut reader = Reader::new(bytes);
     while !reader.done() {
         let (field, wire_type) = reader.tag()?;
         match (field, wire_type) {
-            (2, 2) => decode_scope_spans(reader.bytes_field()?, &service, &tenant, out)?,
+            (2, 2) => decode_scope_spans(reader.bytes_field()?, &resource, out)?,
             _ => reader.skip(wire_type)?,
         }
     }
     Ok(())
 }
 
+/// What every span of one `ResourceSpans` inherits from its resource.
+struct Resource<'a> {
+    service: &'a str,
+    tenant: &'a str,
+    /// The kept build attributes ([`crate::otlp::KEPT_RESOURCE_ATTRIBUTES`]).
+    kept: &'a Map<String, Value>,
+}
+
 /// The first `service.name` and first `traza.tenant` resource attributes
-/// whose values are strings.
+/// whose values are strings, and the kept build attributes
+/// ([`crate::otlp::KEPT_RESOURCE_ATTRIBUTES`]).
 ///
 /// Every resource attribute is still decoded in full, not just the ones being
 /// looked for: decoding is what rejects invalid UTF-8 and hostile nesting, and
 /// skipping the others would quietly start accepting malformed resources. The
 /// cost is per-ResourceSpans, not per-span.
-#[allow(clippy::type_complexity)]
-fn decode_resource_identity(bytes: &[u8]) -> Decoded<(Option<String>, Option<String>)> {
+fn decode_resource_identity(bytes: &[u8]) -> Decoded<ResourceIdentity> {
     let mut reader = Reader::new(bytes);
-    let mut service = None;
-    let mut tenant = None;
+    let mut identity = ResourceIdentity::default();
     while !reader.done() {
         let (field, wire_type) = reader.tag()?;
         match (field, wire_type) {
             (1, 2) => {
                 let (key, value) = decode_key_value(reader.bytes_field()?, 0)?;
-                match (key.as_str(), value) {
-                    ("service.name", Value::String(name)) if service.is_none() => {
-                        service = Some(name);
-                    }
-                    ("traza.tenant", Value::String(name)) if tenant.is_none() => {
-                        tenant = Some(name);
-                    }
-                    _ => {}
-                }
+                identity.absorb(key, value);
             }
             _ => reader.skip(wire_type)?,
         }
     }
-    Ok((service, tenant))
+    Ok(identity)
 }
 
 /// Same two-sweep reason as [`decode_resource_spans`]: `scope` is field 1 and
 /// supplies attributes that sit beneath every span in field 2.
-fn decode_scope_spans(
-    bytes: &[u8],
-    service: &str,
-    tenant: &str,
-    out: &mut Vec<Span>,
-) -> Decoded<()> {
+fn decode_scope_spans(bytes: &[u8], resource: &Resource<'_>, out: &mut Vec<Span>) -> Decoded<()> {
     let mut scope_attributes = Map::new();
     let mut reader = Reader::new(bytes);
     while !reader.done() {
@@ -254,7 +254,12 @@ fn decode_scope_spans(
         match (field, wire_type) {
             (2, 2) => {
                 let parts = decode_span(reader.bytes_field()?)?;
-                out.push(parts.finish(service, tenant, &scope_attributes)?);
+                out.push(parts.finish(
+                    resource.service,
+                    resource.tenant,
+                    &scope_attributes,
+                    resource.kept,
+                )?);
             }
             _ => reader.skip(wire_type)?,
         }

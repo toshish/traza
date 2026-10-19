@@ -1,0 +1,736 @@
+# Replay: tapes, the replay proxy, diffs and recall
+
+Traza already records what an agent did. This guide covers what you can do
+with that recording afterwards:
+
+- read a run as a **tape** — its model calls, tool calls and agent
+  invocations in order, with what went into each and what came out;
+- **replay** a run: point the agent's OpenAI or Anthropic SDK at Traza and
+  re-run it, with every model answer served from the tape — zero model calls;
+- **diff** two runs to find the first step where they parted, and what kind of
+  difference it was;
+- **recall** earlier runs that dealt with the same thing, successful ones
+  first.
+
+Forking a run at a step — an edited answer, then the real provider — and
+replaying recorded runs as tests have [a guide of their own](fork.md).
+
+All of it runs in the one `traza-server` process. Traza never calls a model:
+a replay answers *in place of* the provider, from what was recorded. Route
+shapes are in the [HTTP API reference](http-api.md#runs-tapes-replays-diffs-and-recall).
+
+## See it run
+
+[`examples/replay/run.sh`](../../examples/replay/README.md) records a run of
+an agent written against the OpenAI chat-completions wire — a model call that
+asks for a tool, the tool, a model call that answers — with a scripted
+stand-in model, as OpenTelemetry GenAI spans. Then it stops the model, creates
+a replay, and runs the same agent code with `OPENAI_BASE_URL` set to the
+replay: both answers come back identical, every model call goes to the
+replay, and the replay reports `served` equal to the run's model steps. A
+changed system prompt is refused with `replay_divergence` at step 0, and
+`GET /v1/diff` names where a run with that prompt parted from the original.
+It takes about two seconds and exits non-zero if any claim fails.
+
+## Runs and tapes
+
+A **run** is one unit of agent work. Its id is the span's session id when it
+has one (`session.id`, `gen_ai.conversation.id`, or OpenLLMetry's
+`traceloop.association.properties.session_id`), otherwise `trace:<trace_id>`
+([run identity](../llm-semantics.md#run-identity)). Every route below takes a
+run id; a bare trace is always reachable as `trace:<trace_id>`.
+
+A **tape** is the run's *steps* — the spans whose step kind is `llm`, `tool`
+or `agent` ([step kinds](../llm-semantics.md#step-kind)) — in start order.
+Workflow wrappers, HTTP spans and retrievals are context around steps, not
+steps, so they are not on the tape.
+
+The examples in this guide use a research agent on the Anthropic SDK. A
+coordinator on `claude-opus-5-5` hands a web search to a `web-researcher`
+sub-agent on `claude-haiku-5-5` through its `Agent` tool, reads the sources
+the sub-agent found with `WebFetch`, and writes a brief. The sub-agent
+searches with `WebSearch`. The harness runs all three tools itself, so each
+call is a step of its own. The run was recorded as OpenTelemetry GenAI spans,
+prompts in OpenLLMetry's indexed layout.
+
+Its run `dr-0917` is eighteen spans, and every one is a step: the
+coordinator's `invoke_agent` span, its seven model calls, its `Agent` call
+(which holds the sub-agent's `invoke_agent` span, its two model calls and a
+`WebSearch`), and five `WebFetch` calls. It read two of its three sources
+twice.
+
+```sh
+curl -s localhost:8080/v1/tapes/dr-0917
+```
+
+```json
+{
+  "run": "dr-0917",
+  "tenant": null,
+  "spans_examined": 18,
+  "truncated": false,
+  "steps": [
+    {"index": 0, "kind": "agent", "name": "invoke_agent research-coordinator",
+     "agent": "research-coordinator", "fingerprint": "agent:research-coordinator",
+     "…": "trace, span, timing and status as below; no request or response"},
+    {
+      "index": 1,
+      "kind": "llm",
+      "name": "chat claude-opus-5-5",
+      "model": "claude-opus-5-5",
+      "agent": "research-coordinator",
+      "trace_id": "a41876d7175d7379e2c57700a0f32aca",
+      "span_id": "a1c7b039a39c0950",
+      "parent_span_id": "bcf07cce50a1f52c",
+      "service": "research-coordinator",
+      "start_ns": 1792375699065000000,
+      "duration_ns": 3600000000,
+      "status": "ok",
+      "request": [
+        {"role": "system", "content": "You are a research coordinator. Delegate web searches to the web-researcher subagent, read the sources it finds with WebFetch, then write a one-page brief that cites every source by URL."},
+        {"role": "user", "content": "Write a one-page brief on solid-state battery readiness for EVs in 2027, with sources."}
+      ],
+      "response": [
+        {"role": "assistant", "finish_reason": "tool_use",
+         "tool_calls": [{"id": "toolu_3f1122f4c8b6b74dc8ee54", "name": "Agent",
+                         "arguments": {"description": "Battery sources",
+                                       "prompt": "Find 2026 primary sources on solid-state battery pilot production, yields and cost per kWh.",
+                                       "subagent_type": "web-researcher"}}]}
+      ],
+      "request_digest": "ea97869dbfadddfc08be3a151877b8a2e29b6dfb7f39f1fe43e2621484244b50",
+      "response_digest": "54d13d575a267c22e2ea90d26527de3fed2cca599910b5fa55da7bea41db5818",
+      "fingerprint": "llm:claude-opus-5-5#ea97869dbfadddfc",
+      "tokens": {"input": 4, "output": 103, "cache_read": 0, "cache_write": 9840, "context": 9844},
+      "cost_usd": 0.051276
+    },
+    {
+      "index": 2,
+      "kind": "tool",
+      "name": "execute_tool Agent",
+      "tool": "Agent",
+      "agent": "research-coordinator",
+      "request": {"description": "Battery sources",
+                  "prompt": "Find 2026 primary sources on solid-state battery pilot production, yields and cost per kWh.",
+                  "subagent_type": "web-researcher"},
+      "response": "Sources:\n- https://www.example-energy.org/2026/solid-state-pilot-lines: Pilot lines (2026)\n- https://www.example-batteries.com/reports/ssb-cost-2026: Cost (2026)\n- https://www.example-auto.net/news/2026-ssb-sample-cells: Samples (2026)",
+      "fingerprint": "tool:Agent#b8a25c5ef91fd1e8",
+      "tokens": {"input": null, "output": null, "cache_read": null, "cache_write": null, "context": null},
+      "…": "trace, span, timing, status and digests as above"
+    },
+    {"index": 3, "kind": "agent", "name": "invoke_agent web-researcher", "…": "the sub-agent; steps 4 to 6 are its own"},
+    {"index": 4, "kind": "llm", "model": "claude-haiku-5-5", "agent": "web-researcher", "…": "…"},
+    {"…": "steps 5 to 17"}
+  ]
+}
+```
+
+(The response is abbreviated where marked; the server returns keys in sorted
+order.) The coordinator's `tokens.context` is its input plus both cache
+counters, because an Anthropic call's input leaves the cache out.
+`cost_usd` is priced from the server's `--pricing` file at list rates: these
+spans carry no cost of their own.
+
+Requests and responses are read with the same precedence the store
+uses everywhere — OTel GenAI `gen_ai.input.messages`, OpenLLMetry's indexed
+`gen_ai.prompt.{i}.*`, OpenInference's `llm.input_messages.{i}.message.*`,
+Traza's native events — and the indexed layouts all fold to one message shape.
+A token count a span did not report is `null`, not `0`.
+
+**Offloaded values.** A prompt or completion longer than
+`--payload-threshold-bytes` (256 KiB by default) is stored as a
+`{"$payload": "sha256/…"}` reference. `?resolve=true` inlines references, up
+to [`--tape-max-bytes`](../configuration.md#server-flags) of payload content
+per tape (8 MiB by default). The cut is a prefix — the first reference that
+does not fit, and every one after it, stays a reference — and the tape then
+says `"resolved_partial": true`. Digests and fingerprints always describe the
+stored form, so a tape read with and without `resolve` agrees on every
+identity it reports. Resolution spends the request's one
+[`--query-deadline-ms`](../configuration.md#server-flags) budget — reading the
+run and every payload together — so a run whose payloads cannot all be read
+within it is refused with `400` rather than allowed to run past it. A payload
+repeated across steps is probed for tenant reachability once per request.
+
+A model call that recorded `gen_ai.system_instructions` beside an offloaded
+`gen_ai.input.messages` is stored as both: the system message, then the
+reference — `[{"role": "system", …}, {"$payload": "sha256/…"}]` — so the
+digest covers the system prompt too. Resolved, the two combine as they would
+have inline: the system message, then the list's own messages.
+
+## Replaying a run with zero model calls
+
+Replay re-executes your agent against its own recording. The agent runs for
+real — your code, your prompts, your control flow — but every model call it
+makes is answered by Traza with the next recorded model step, in the shape the
+provider's SDK expects.
+
+**1. Record the run with content capture on.** A replay can only serve answers
+that were recorded. With OpenLLMetry that means `TRACELOOP_TRACE_CONTENT`
+left at its default (`true`); a model step recorded without its completion is
+refused at step 2, naming the step.
+
+**2. Create a replay of the run.**
+
+```sh
+curl -s -X POST localhost:8080/v1/replays \
+  -H "Authorization: Bearer $TRAZA_TOKEN" \
+  -d '{"run": "dr-0917"}'
+```
+
+```json
+{
+  "id": "rp_03dcdadb9395a8770c836a73da8c1576",
+  "run": "dr-0917",
+  "mode": "strict",
+  "steps": 18,
+  "llm_steps": 9,
+  "expires_at_ns": 1792390239903228000,
+  "unreadable_tool_steps": [],
+  "base_urls": {
+    "openai": "/v1/replays/rp_03dcdadb9395a8770c836a73da8c1576/openai/v1",
+    "anthropic": "/v1/replays/rp_03dcdadb9395a8770c836a73da8c1576/anthropic"
+  }
+}
+```
+
+The replay is a snapshot of the tape taken now. It lives for one hour from
+creation, in memory; a restart forgets it, and creating another is just
+another read. Any valid credential may create one — an `ro` token is enough,
+because nothing in the store changes.
+
+A replay holds only what it serves: each model step's answer and each tool
+step's arguments and result, read from payload files where they were
+offloaded, up to [`--tape-max-bytes`](../configuration.md#server-flags)
+between them. Recorded *requests* are not held — each is read, digested for
+strict matching, and dropped — so a long conversation whose prompt grows at
+every step costs the budget nothing for its prompts. A tool step whose value
+could not be read, or that recorded no result at all, is listed in
+`unreadable_tool_steps` (see
+[tools](#tools-still-execute-live--unless-you-replay-them-too)). A run with
+more than 20,000 spans is refused (`409`) rather than replayed as its
+beginning, which would end the agent's run early as if the recording stopped
+there — unless a [fork](fork.md#forking-a-run) goes live within the steps
+those spans hold, so nothing past them is served.
+
+**3. Point the SDK at it and run the agent.**
+
+```sh
+export ANTHROPIC_BASE_URL=http://localhost:8080/v1/replays/rp_03dcdadb9395a8770c836a73da8c1576/anthropic
+export ANTHROPIC_API_KEY=$TRAZA_TOKEN
+python research.py
+```
+
+For an agent on the OpenAI SDK:
+
+```sh
+export OPENAI_BASE_URL=http://localhost:8080/v1/replays/rp_03dcdadb9395a8770c836a73da8c1576/openai/v1
+export OPENAI_API_KEY=$TRAZA_TOKEN
+```
+
+The OpenAI SDK sends its key as `Authorization: Bearer`; the Anthropic SDK
+sends `x-api-key`, which Traza accepts as the credential on the routes under
+`/v1/replays/` (and nowhere else), looked up like any bearer token — a
+`TRAZA_TOKENS` entry or a credential minted at runtime. On an open server (no
+credential of either kind) any non-empty key works — the SDKs refuse to start
+without one.
+
+The agent's first call — `POST …/anthropic/v1/messages` with the
+coordinator's system prompt and the task — receives the recorded answer as an
+ordinary `Message`:
+
+```json
+{
+  "id": "msg_traza03dcdadb9395s1",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-opus-5-5",
+  "content": [{
+    "type": "tool_use",
+    "id": "toolu_3f1122f4c8b6b74dc8ee54",
+    "name": "Agent",
+    "input": {"description": "Battery sources",
+              "prompt": "Find 2026 primary sources on solid-state battery pilot production, yields and cost per kWh.",
+              "subagent_type": "web-researcher"}
+  }],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {"input_tokens": 4, "output_tokens": 103,
+            "cache_creation_input_tokens": 9840, "cache_read_input_tokens": 0}
+}
+```
+
+The model, tool-use ids, stop reason and token usage are the recording's.
+An id the recording did not carry (here, the message id) is made up from the
+replay id and the step; a recording with no model gets the request's `model`
+back, or `"unknown"`. A model name or response id longer than 256 bytes —
+recorded or requested — is treated as absent: a stream repeats both in every
+chunk, and no provider's come close. The agent then runs its `Agent` tool:
+the sub-agent's two model calls are answered from the tape too. The
+coordinator gets the sub-agent's list of sources back, fetches them, and
+receives the recorded brief.
+
+**4. Check what was served.**
+
+```sh
+curl -s localhost:8080/v1/replays/rp_03dcdadb9395a8770c836a73da8c1576 \
+  -H "Authorization: Bearer $TRAZA_TOKEN"
+```
+
+```json
+{
+  "id": "rp_03dcdadb9395a8770c836a73da8c1576",
+  "run": "dr-0917",
+  "mode": "strict",
+  "served": 9,
+  "remaining": 0,
+  "diverged": null,
+  "calls": [
+    {"step": 1, "matched": true, "at_ns": 1792386640619999959},
+    {"step": 4, "matched": true, "at_ns": 1792386640634349250},
+    {"step": 6, "matched": true, "at_ns": 1792386640664281500},
+    {"step": 7, "matched": true, "at_ns": 1792386640666475709},
+    {"step": 9, "matched": true, "at_ns": 1792386640670235792},
+    {"step": 11, "matched": true, "at_ns": 1792386640683857583},
+    {"step": 13, "matched": true, "at_ns": 1792386640690883042},
+    {"step": 15, "matched": true, "at_ns": 1792386640696399959},
+    {"step": 17, "matched": true, "at_ns": 1792386640702492541}
+  ],
+  "exhausted_calls": 0,
+  "unreadable_tool_steps": [],
+  "expires_at_ns": 1792390239903228000
+}
+```
+
+All nine recorded model steps were served, the coordinator's seven and the
+sub-agent's two, and every request matched the recording. Nothing was sent to
+a model provider: the replay routes make no outbound request of any kind. A
+tenth model call would get `410` with
+`{"error": {"type": "replay_exhausted", …}}`, and `exhausted_calls` would
+count it.
+
+### Streaming
+
+With `"stream": true` the answer comes back as server-sent events —
+`chat.completion.chunk` events ending in `data: [DONE]` for OpenAI (plus a
+usage chunk when `stream_options.include_usage` is set), and `message_start`,
+`content_block_start` / `_delta` / `_stop`, `message_delta`, `message_stop`
+for Anthropic, with tool calls as `tool_calls` argument deltas and
+`input_json_delta` respectively. The coordinator's last call, streamed:
+
+```text
+event: message_start
+data: {"message":{"content":[],"id":"msg_traza3c4fb48b26c3s17","model":"claude-opus-5-5","role":"assistant","stop_reason":null,"stop_sequence":null,"type":"message","usage":{"cache_creation_input_tokens":5499,"cache_read_input_tokens":33661,"input_tokens":5,"output_tokens":0}},"type":"message_start"}
+
+event: content_block_start
+data: {"content_block":{"text":"","type":"text"},"index":0,"type":"content_block_start"}
+
+event: content_block_delta
+data: {"delta":{"text":"Solid-state ","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"delta":{"text":"batteries in ","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"delta":{"text":"2027: pilot ","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+…
+
+event: content_block_delta
+data: {"delta":{"text":"launches after ","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"delta":{"text":"2028.","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+event: content_block_stop
+data: {"index":0,"type":"content_block_stop"}
+
+event: message_delta
+data: {"delta":{"stop_reason":"end_turn","stop_sequence":null},"type":"message_delta","usage":{"output_tokens":1900}}
+
+event: message_stop
+data: {"type":"message_stop"}
+```
+
+**The stream is reconstructed from the stored text.** No instrumentation
+records how a provider chunked its stream, so Traza re-chunks: windows of 16
+characters (wider for long text), cut back to just after whitespace. The
+events are what the SDKs parse, and the text they reassemble is exactly the
+recorded text; the chunk boundaries are not the provider's.
+
+### Strict and loose matching
+
+Steps are served in the order they were recorded. In **strict** mode (the
+default) each request must also *be* the recorded request: its messages are
+normalised into the message shape step facts use — role, content, tool-call
+id, and each tool call's id, name and arguments, with JSON-shaped text read as
+JSON — digested, and compared with the recorded step. The recorded side is
+normalised the same way, so a run recorded with OTel `parts` messages, with
+raw provider-shaped messages, or with offloaded content compares by what it
+said rather than how its instrumentation spelled it. That includes
+`gen_ai.system_instructions` recorded beside an offloaded
+`gen_ai.input.messages`: the two are combined once the list is read, exactly
+as they would have been inline. For the indexed layouts and native events the
+recorded digest is exactly the tape's `request_digest`.
+
+A request that does not match is refused and **does not consume the step**.
+Here the harness was changed to refuse to fetch a URL twice. At step 12 the
+coordinator asks again for the pilot-lines page it read at step 8; the new
+harness answers from what it already has instead, and the next model call,
+step 13, carries that answer rather than the page:
+
+```text
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+x-should-retry: false
+
+{"error":{"type":"replay_divergence","step":13,
+  "message":"this request's messages do not match recorded step 13: the agent diverged from the recording, so replaying the recorded answer would answer a different question",
+  "difference":{"message":9,"role":"user","field":"content","at_char":13,
+    "recorded":"[{\"content\":\"Pilot lines (2026): three cell makers ran solid-state pilot lines at 0.2 to 1 GWh a year. First-pass yields…",
+    "got":"[{\"content\":\"Already fetched https://www.example-energy.org/2026/solid-state-pilot-lines earlier in this run; reusing th…",
+    "recorded_messages":10,"got_messages":10},
+  "expected_digest":"38d64ab342a7ff12be1b446cc0209eecabbae76f5d4ec73b59a9e88a178ddd6d",
+  "got_digest":"2d02f0080506df8f483cde7735ec2240ee801fdbd82f82836201aa8a882f0cb1"},
+ "type":"error"}
+```
+
+The refusal also says **where** the request first differs, when the recorded
+request can be read again: `difference` names the message, its role, the
+field (`role`, `content`, `tool_call_id`, `tool_calls`, or `missing` /
+`extra`), the character, and a quote of each side. Here it is message 9, the
+user turn carrying the fetched page, at character 13 — the first character of
+the tool result's text, past `[{"content":"`. The replay keeps it with its
+first divergence. Explaining costs a re-read of the recording, so a
+replay does it at most 8 times; past that a divergence is refused without
+one. It is what makes a strict replay a usable
+[tape test](fork.md#tape-tests).
+
+A divergence means your agent asked a different question than it asked when
+the run was recorded — a changed prompt, a different tool result, a new
+branch — and serving the recorded answer would answer the wrong question. The
+replay remembers the first divergence (`"diverged"` in its status). Both SDKs
+retry a `409` by default; `x-should-retry: false` tells them not to, because
+the same request cannot start matching.
+
+**Loose** mode (`{"run": "…", "mode": "loose"}`) serves the steps in order
+whatever is asked, and records whether each call matched. Use it when the
+recording cannot be compared, or when you want to drive an agent down the
+recorded path regardless. A model step whose prompt was not recorded as a
+message list is refused in strict mode, naming the step: a bare prompt — text,
+or a JSON object such as a whole request body in OpenInference's
+`input.value` — inline or offloaded, with or without
+`gen_ai.system_instructions` beside it, even when the object reads like a
+message; and a list holding anything that is not a message (an element with
+no role, content, tool call or tool result), which would otherwise compare as
+if that element were not there. In loose mode such a step is served, and its
+calls are recorded as not matched.
+
+What strict mode compares is the **messages only** — not the model name,
+`tools`, temperature or any other parameter. A request with the recorded
+messages and a different model is served.
+
+### Tools still execute live — unless you replay them too
+
+A replay answers *model* calls. When the replayed model asks for a tool, your
+agent runs the real tool, with its real side effects. For a tool whose result
+you want replayed, take it from the recording instead:
+
+```sh
+curl -s -X POST localhost:8080/v1/replays/rp_d740106ef258077a5bf96fdd660ef813/tools/next \
+  -H "Authorization: Bearer $TRAZA_TOKEN" \
+  -d '{"tool": "WebFetch"}'
+```
+
+```json
+{"step": 8, "tool": "WebFetch",
+ "arguments": {"prompt": "List the 2026 figures on pilot lines, yields, cost per kWh and sample cells.",
+               "url": "https://www.example-energy.org/2026/solid-state-pilot-lines"},
+ "result": "Pilot lines (2026): three cell makers ran solid-state pilot lines at 0.2 to 1 GWh a year. First-pass yields were reported between 60% and 75%."}
+```
+
+Each call returns the next recorded tool step not yet served (the next one
+with that name, when `tool` is given), on a cursor of its own, independent of
+the model steps; `410` when none is left. A step whose arguments or result was
+offloaded and could not be read — erased, swept by retention, or past
+`--tape-max-bytes` — is listed in the replay's `unreadable_tool_steps` and
+answered `409` with `"type": "tool_unreadable"` instead of a payload reference
+dressed up as the result; so is a step that recorded no result at all
+(content capture was off), instead of a `null` your harness would take for
+what the tool returned. A result recorded as empty — `""` or `null` — is a
+result, and is served as recorded. A refused step is not consumed, because
+moving past it would hand your harness the next step's result as this one's.
+Wiring it in is a harness decision — for example, a wrapper your tool
+dispatcher calls instead of the tool when a `REPLAY_ID` is set. Traza does not
+intercept tool execution.
+
+### Erasure reaches replays
+
+A replay is a copy taken out of the store, so an
+[erasure](http-api.md#post-v1erasures) has to reach it. Every call through a
+replay first checks whether an erasure recorded since the replay was created
+covers anything it holds — a span, trace or session its answers or tool
+records came from, their tenant, or a payload they referenced. If one does,
+the replay is withdrawn: its content is dropped, and that call and every
+later one answer `410` with `"type": "replay_erased"` and the erasure's id,
+until the replay would have expired. A withdrawn replay frees its place
+among the live ones at once — an erasure does not lock a tenant out of
+replays for an hour — and withdrawn replays are bounded on their own: each
+tenant's share keeps at most 64 of them (the registry 1,024), and past that
+the one closest to expiring is forgotten, its id answering `404` from then
+on. The check applies from the moment the erasure is recorded, before its
+purge runs, exactly as the store's own reads do; when nothing has been erased it is one comparison. Withdrawn content
+leaves memory at the replay's next call — a replay nobody calls again keeps
+its copy until it expires, at most an hour later.
+
+## Comparing two runs
+
+`GET /v1/diff?a=<run>&b=<run>` aligns two runs' steps and names the first
+place they diverge. Here the second run is `dr-0917-dedupe`, the same task
+run again under the harness that refuses to fetch a URL twice — a
+[fork](fork.md#finding-a-runs-forks) of `dr-0917`:
+
+```sh
+curl -s "localhost:8080/v1/diff?a=dr-0917&b=dr-0917-dedupe"
+```
+
+```json
+{
+  "a": {"run": "dr-0917", "steps": 18, "cost_usd": 0.27121787500000005, "tokens": 3341,
+        "duration_ns": 58335000000, "errors": 0, "outcome": "success", "truncated": false},
+  "b": {"run": "dr-0917-dedupe", "steps": 16, "cost_usd": 0.202954675, "tokens": 3236,
+        "duration_ns": 51257000000, "errors": 0, "outcome": "success", "truncated": false},
+  "aligned": [
+    {"op": "same", "a": 0, "b": 0,
+     "fingerprint_a": "agent:research-coordinator",
+     "fingerprint_b": "agent:research-coordinator"},
+    {"…": "steps 1 to 10, each the same"},
+    {"op": "same", "a": 11, "b": 11,
+     "fingerprint_a": "llm:claude-opus-5-5#a3220904e522c49f",
+     "fingerprint_b": "llm:claude-opus-5-5#a3220904e522c49f"},
+    {"op": "changed", "why": "decision", "a": 12, "b": 12,
+     "fingerprint_a": "tool:WebFetch#4d0747980d9ec482",
+     "fingerprint_b": "tool:WebFetch#4d0747980d9ec482"},
+    {"op": "changed", "why": "input", "a": 13, "b": 13,
+     "fingerprint_a": "llm:claude-opus-5-5#38d64ab342a7ff12",
+     "fingerprint_b": "llm:claude-opus-5-5#2d02f0080506df8f"},
+    {"op": "same", "a": 14, "b": 14,
+     "fingerprint_a": "tool:WebFetch#8e9833ed4fb157ae",
+     "fingerprint_b": "tool:WebFetch#8e9833ed4fb157ae"},
+    {"op": "changed", "why": "input", "a": 15, "b": 15,
+     "fingerprint_a": "llm:claude-opus-5-5#5955c288ffbd662a",
+     "fingerprint_b": "llm:claude-opus-5-5#a5db4b2e5928b433"},
+    {"op": "delete", "why": "structure", "a": 16, "b": null,
+     "fingerprint_a": "tool:WebFetch#9bd78904d70ddce1", "fingerprint_b": null},
+    {"op": "delete", "why": "structure", "a": 17, "b": null,
+     "fingerprint_a": "llm:claude-opus-5-5#93bc8c819bb7abc8", "fingerprint_b": null}
+  ],
+  "first_divergence": {
+    "a": 12, "b": 12, "kind": "decision",
+    "explanation": "step 12 of a and step 12 of b (tool:WebFetch) received the same input and produced a different output: response e450b5a73db1 in a, 750af04196bb in b"
+  },
+  "delta": {"cost_usd": -0.06826320000000005, "tokens": -105, "duration_ns": -7078000000,
+            "errors": 0, "steps": -2},
+  "truncated": false
+}
+```
+
+Steps 0 to 11 are the same. At step 12 the same
+`WebFetch` request got a different answer — the page in `a`, the harness's
+"already fetched" note in `b` — so it is a `decision`. The next model call saw
+that answer, so its input changed; the fork never re-read the cost page, so
+`a`'s last fetch and the call after it have no partner. The fork is two steps
+shorter and about seven cents cheaper.
+
+Steps are aligned by longest common subsequence over their **signatures** —
+`kind:name`, the fingerprint without its input hash — so an extra or missing
+step shifts nothing after it. Each aligned pair is then classified:
+
+| What differs | `op` | `why` |
+|---|---|---|
+| nothing: same signature, input, output and configuration | `same` | — |
+| the input to the same step | `changed` | `input` |
+| the output, for the same input | `changed` | `decision` |
+| the model, or any `gen_ai.request.*` parameter, of a model call | `changed` | `config` |
+| a step only one run has | `insert` / `delete` | `structure` |
+
+A model swap changes the signature (`llm:gpt-6.1-sol` is not
+`llm:gpt-6-luna`), so it is detected between the aligned steps: model calls
+that both name a model and sit in the same unaligned stretch are paired as one
+`config` change.
+
+`cost_usd` is the run's metered cost, or its cost priced from `--pricing` —
+priced here, because these spans carry no cost of their own. Each side is compared up to its
+first 5,000 steps; past that the diff says `"truncated": true`, and its tail
+may report steps as missing that the cut removed. Each side is also read up to
+its first 50,000 spans: a side longer than that says `"truncated": true` in
+its own summary, its cost, tokens, duration and errors describe those first
+spans, and its outcome is `unknown` — how a run ended cannot be read from its
+beginning. A step's status is not compared: a step that errored with the same
+input and output digests as a successful one is `same` — read `errors` and
+the outcome for that.
+
+Reading both runs, extracting their steps, aligning them, classifying each
+aligned pair and explaining the first divergence all spend the request's one
+[`--query-deadline-ms`](../configuration.md#server-flags) budget. The
+alignment is quadratic in steps — two 5,000-step runs that share nothing
+compare every pair — so it compares signatures as interned ids, whatever the
+length of the names inside them, and checks the budget as it goes; so do
+the classification, which compares each pair's configuration whole, and the
+explanation, which compares every parameter of the divergent pair to count
+how many differ — both check it while they compare, so neither many
+parameters nor one large one can keep a comparison running past it. A pair
+it cannot diff within the budget is refused with `400` rather than left
+running, and so is one whose diff finished after the budget ran out.
+
+## Recall: has this been done before?
+
+`GET /v1/recall?q=<words>` finds earlier runs whose recorded text contains
+every word of the query — whole words, any order, the same matching as
+[`content=` search](http-api.md#content-search-content) — and ranks them:
+successful runs first, then the runs with more matching spans, then the most
+recent.
+
+```sh
+curl -s "localhost:8080/v1/recall?q=solid-state+battery&limit=1"
+```
+
+```json
+{
+  "runs": [{
+    "run": "dr-0917",
+    "tenant": "",
+    "outcome": "success",
+    "outcome_source": "derived",
+    "score": 11,
+    "last_end_ns": 1792375757395000000,
+    "steps": 18,
+    "cost_usd": 0.27121787500000005,
+    "skeleton": ["agent:research-coordinator", "llm:claude-opus-5-5", "tool:Agent",
+                 "agent:web-researcher", "llm:claude-haiku-5-5", "tool:WebSearch",
+                 "llm:claude-haiku-5-5", "llm:claude-opus-5-5", "tool:WebFetch",
+                 "llm:claude-opus-5-5", "tool:WebFetch", "llm:claude-opus-5-5",
+                 "tool:WebFetch", "llm:claude-opus-5-5", "tool:WebFetch",
+                 "llm:claude-opus-5-5", "tool:WebFetch", "llm:claude-opus-5-5"],
+    "skeleton_truncated": false,
+    "truncated": false
+  }],
+  "truncated": false
+}
+```
+
+Without `limit=1` the fork `dr-0917-dedupe` comes second: it succeeded too,
+with 10 matching spans to the original's 11.
+
+The **skeleton** is what the run did without quoting what it said: its step
+signatures in order, consecutive repeats folded (`"tool:search x3"`), at most
+40 entries. `score` is the number of the run's spans that matched. A failed
+run also names the step its failure is attributed to (`cause`), and a run that
+declared one carries its `goal`. `outcome=success` or `outcome=failure`
+returns only runs that ended that way; the default `any` keeps every run and
+ranks successes first. A run that is still active (its last span ended within
+the last 15 minutes) is `unknown` and never ranked as a success.
+
+Recall groups the newest 5,000 matching spans into runs and reads the 100 runs
+with the most matches among them in full; a query whose matches overflow the
+first bound says `"truncated": true`. Each run is read up to its first 20,000
+spans; a longer one carries `"truncated": true` of its own, its steps, cost
+and skeleton describe those first spans, and its outcome is `unknown` with no
+`cause` — so a long run that failed late is never ranked as a success on the
+strength of its beginning. Finding the newest matches means ranking
+all of them, so words that appear in more than 200,000 spans are refused with
+`400` — add a word to narrow them.
+
+## From an agent: the MCP tools
+
+With `--mcp`, four read tools put the same answers in front of a model:
+`get_run_tape` (a compact rendering of the tape with input and output
+previews), `compare_runs` (the alignment and first divergence, with
+structured content), `recall_runs` (recalled runs and their skeletons), and
+`list_forks` (a run's [forks](fork.md) and where each parted from it).
+Stored text in their results stays inside the untrusted-telemetry block, as
+everywhere on that surface. There is no replay tool: a replay is for an agent
+*harness*, and letting the model under test create one would let stored
+telemetry choose which recording its next run is fed. See the
+[MCP guide](mcp.md#the-tools).
+
+## Limits, stated plainly
+
+- **Tools execute live** unless your harness takes results from `tools/next`.
+- **Streams are reconstructed** from stored text, not the provider's bytes.
+- **Only what was recorded can be replayed.** A model step without a recorded
+  answer refuses the replay at creation, naming the step. An offloaded answer
+  that cannot be read — erased, swept by retention, or past
+  `--tape-max-bytes` — refuses it the same way (`409`), and the message says
+  which of those it was. A tool step that recorded no result is refused by
+  `tools/next` rather than served as `null`. A run longer than 20,000 spans
+  is refused rather than cut, except as a rewind that goes live inside it.
+- **Only chat completions and messages are replayed.** The OpenAI Responses
+  API, embeddings and legacy completions under the replay's base URL answer
+  `400`.
+- **Ids the recording lacks are invented.** If a recording's tool calls carry
+  no ids, the agent's follow-up request carries Traza's invented id where the
+  recording carries none, so strict matching stops at the first tool result;
+  use loose mode for such recordings. A model name or response id over 256
+  bytes counts as lacking.
+- **Answers are decoded by where they were recorded.** An answer recorded as
+  text — the `llm.completion` attribute, or an OpenInference `output.value`
+  whose `output.mime_type` is not JSON — is served as that text even when it
+  reads as JSON (`{"content": "hi", "count": 2}` comes back whole, not as a
+  message saying "hi"). A message list (`gen_ai.output.messages`, the indexed
+  layouts, native events) is read as messages, and an OpenInference JSON
+  `output.value` as the provider's response body.
+- **Answer text comes back as it was written.** An answer recorded as text is
+  served byte for byte, inline or offloaded — duplicate keys, spacing, key
+  order and the spelling of numbers included, even when it reads as JSON. So
+  is an OpenInference JSON `output.value` that holds no provider response
+  (no `choices`, not a message): it is served as its own text.
+- **JSON-shaped tool-call arguments come back compact.** Arguments recorded as
+  `{"url": "https://…", "prompt": "…"}` are served as
+  `{"prompt":"…","url":"https://…"}`, keys sorted; the normalisation compares
+  them as JSON, so this never causes a divergence.
+- **A served response is at most 64 MiB**, streamed or not. A stream repeats
+  fixed fields in every chunk and splits tool-call arguments into many, so a
+  recording of thousands of tiny tool calls can stream to hundreds of times
+  its size; a step that would render past the bound answers `409` with
+  `"type": "response_too_large"` and is not consumed (the same step unstreamed
+  may fit).
+- **Usage is passed through as recorded**, without converting between the
+  providers' prompt-caching conventions.
+- **An Anthropic answer is one message**, so a recording holding several
+  assistant messages is served as their text concatenated and their tool calls
+  in order.
+- **Concurrent model calls are served in arrival order.** Strict mode reports
+  a swapped pair as a divergence rather than serving answers to the wrong
+  questions. Calls to one replay take turns, each from reading the next step
+  to consuming it, so every served answer is rendered once: a call waits
+  while an earlier call to the same replay renders, and calls to other
+  replays do not wait. Waiting does not stretch the replay's hour: a call
+  whose turn comes after the replay expired is refused `404` without being
+  rendered, and an answer that finishes rendering after it is dropped
+  unserved, so no step is consumed past `expires_at_ns`. A call's time runs
+  from when the server read its request line and headers, so a slow upload
+  or a large body to parse counts against the hour too.
+- **The registry is bounded, per tenant first.** One tenant's data — or the
+  operator view, which counts as a share of its own — may be held by at most
+  64 live replays and 64 MiB of memory; the registry as a whole holds at most
+  1,024 replays and 512 MiB, as the backstop behind every share. The memory
+  is counted generously and charged while the snapshot is built: answers,
+  tool records, model names, ids, tool names, what erasure is checked
+  against, collection overhead, and each replay's call log at its full
+  4,096-entry bound (about 96 KiB, so a share holds its 64 replays with room
+  to spare). Past a bound, creation answers `429` with `Retry-After`: for a share,
+  the time until enough of *that share's* replays expire; for the whole
+  registry, the same for unbound operators and a flat 60 seconds for bound
+  credentials, which have no business learning when another tenant's replay
+  expires. A live replay is never evicted to make room. A snapshot larger than
+  a whole share can never be held and is refused with `409`, not told to
+  retry — as soon as building it passes the share, not after reading the
+  whole run into it.
+- **Erasure withdraws replays**, from the moment the erasure is recorded; see
+  [above](#erasure-reaches-replays). A withdrawn replay's copy stays in memory
+  until its next call or its expiry, and withdrawn replays are bounded like
+  live ones.
+- **Replays follow tenancy.** A replay created under a tenant can be used only
+  by that tenant's credentials and unbound operators; one created from the
+  operator view (no tenant) only by unbound operators. A foreign credential
+  gets `404`. Replay ids are hard to guess but are not credentials — every
+  call still authenticates.

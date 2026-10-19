@@ -289,6 +289,17 @@ pub(crate) fn copy_prefix(source: &Path, target: &Path, length: u64) -> Result<(
     Ok(())
 }
 
+/// A file's modification time as a manifest records it
+/// ([`ManifestFile::modified_unix_ns`]): nanoseconds since the Unix epoch, or
+/// 0 where the platform would not say.
+pub(crate) fn modified_unix_ns(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64)
+}
+
 /// Walks the engine directory and digests every load-bearing file, reusing a
 /// prior manifest's digest for any file whose path and length are unchanged.
 ///
@@ -352,11 +363,7 @@ pub(crate) fn digest_engine(engine: &Path, prior: &[ManifestFile]) -> Result<Vec
             }
             let metadata = entry.metadata()?;
             let bytes = metadata.len();
-            let modified_unix_ns = metadata
-                .modified()
-                .ok()
-                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64);
+            let modified_unix_ns = modified_unix_ns(&metadata);
             // A file carries its digest over only when path, length AND
             // modification time all match. Length alone is nearly enough —
             // segments are immutable, payload files are content-addressed, and

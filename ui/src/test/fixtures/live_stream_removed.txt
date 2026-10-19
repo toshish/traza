@@ -1,0 +1,12 @@
+event: snapshot
+data: {"runs":[{"agent":"support-app","cost_usd":0.0,"current":{"kind":"llm","name":"sim-small","pending":false,"started_ns":1792387083850350000},"errors":0,"last_activity_ns":1792387083898551000,"pending_nudges":0,"policy":"global","reasons":[],"run":"tkt-5001","service":"support-app","started_ns":1792387083850350000,"steps":1,"tenant":"","tokens":0,"verdict":"continue"}],"truncated":false,"window_ns":3000000000}
+
+event: removed
+data: {"reason":"evicted","run":"tkt-5001","tenant":""}
+
+event: run
+data: {"agent":"support-app","cost_usd":0.0,"current":{"kind":"llm","name":"sim-small","pending":false,"started_ns":1792387083900187000},"errors":0,"last_activity_ns":1792387083908290000,"pending_nudges":0,"policy":"global","reasons":[],"run":"tkt-5002","service":"support-app","started_ns":1792387083900187000,"steps":1,"tenant":"","tokens":0,"verdict":"continue"}
+
+event: removed
+data: {"reason":"expired","run":"tkt-5002","tenant":""}
+

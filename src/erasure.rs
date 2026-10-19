@@ -768,6 +768,20 @@ impl Mask {
         &self.payloads
     }
 
+    /// Whether a pending erasure covers the run `run` of `tenant` as a whole
+    /// — its tenant, its session (a session run), or its trace (a
+    /// `trace:<id>` run) — so that state keyed by the run, such as a nudge,
+    /// must not be created for it until the erasure settles.
+    pub(crate) fn covers_run(&self, tenant: &str, run: &str) -> bool {
+        if self.tenants.contains(tenant) {
+            return true;
+        }
+        match semconv::run_trace_id(run) {
+            Some(trace) => self.traces.contains(&(tenant.to_owned(), trace.to_owned())),
+            None => self.sessions.contains(&(tenant.to_owned(), run.to_owned())),
+        }
+    }
+
     /// Whether a pending erasure covers this annotation, judged against the
     /// annotation's own typed subject: trace-level annotations (empty
     /// `span_id`) are covered by trace subjects, span addresses by any
@@ -832,9 +846,100 @@ pub(crate) struct ErasureLog {
 struct Inner {
     /// Every erasure ever recorded, by id, with its settle when one landed.
     records: BTreeMap<u64, (EraseRecord, Option<SettleRecord>)>,
+    /// The id of every settle record, in the order the log took them in
+    /// (file order at open, then append order), an erasure settled twice
+    /// appearing twice. Append-only for the life of the open log, so a
+    /// reader that remembers how far it has read takes in only what was
+    /// settled since — which is how the ledger's evidence packs keep their
+    /// erasure cross-check without a pass over every erasure per request.
+    settles: Vec<u64>,
     /// The mask over pending erasures, or `None` when nothing is pending —
     /// which is the common case and the fast path every query takes.
     mask: Option<Arc<Mask>>,
+}
+
+/// Folds one replayed record into the log's state: the one replay rule,
+/// shared by [`ErasureLog::open`] and [`list_offline`] so the two can never
+/// disagree about what a log says.
+///
+/// Returns the id a settle record settled, for the open's settle order.
+fn replay(
+    records: &mut BTreeMap<u64, (EraseRecord, Option<SettleRecord>)>,
+    record: LogRecord,
+) -> Option<u64> {
+    match record {
+        LogRecord::Erase(erase) => {
+            records.insert(erase.id, (erase, None));
+        }
+        LogRecord::Settle(settle) => {
+            // A settle for an unknown id is tolerated: it can only be
+            // produced by a log manually spliced together, and dropping it
+            // is safer than inventing an intent.
+            if let Some(entry) = records.get_mut(&settle.id) {
+                let id = settle.id;
+                entry.1 = Some(settle);
+                return Some(id);
+            }
+        }
+        LogRecord::Note(note) => {
+            if let Some(entry) = records.get_mut(&note.id) {
+                entry.0.payload_refs.extend(note.payload_refs);
+                entry.0.payload_refs.sort();
+                entry.0.payload_refs.dedup();
+            }
+        }
+    }
+    None
+}
+
+/// One settle record, as [`ErasureLog::settlements`] hands it out: the
+/// erasure's id and subject, and the settle that is current for it.
+#[derive(Clone, Debug)]
+pub(crate) struct Settlement {
+    /// The erasure's id.
+    pub id: u64,
+    /// What it erased.
+    pub subject: Subject,
+    /// The generation that published the deletion.
+    pub generation: u64,
+    /// When it settled, nanoseconds since the Unix epoch.
+    pub settled_unix_ns: u64,
+}
+
+/// Every erasure the tombstone log in `directory` records, replayed exactly
+/// as [`ErasureLog::open`] replays it, but read-only — no heal, no append —
+/// for the offline ledger verification, which must examine a store without
+/// changing it. Also returns how many interior lines did not parse: where
+/// the open would refuse the log, this reports the count so the caller can
+/// say that what those lines recorded went unchecked. An unterminated
+/// final line that does not parse is a torn append — what the open heals
+/// away — and is neither replayed nor counted.
+pub(crate) fn list_offline(directory: &Path) -> Result<(Vec<ErasureStatus>, usize)> {
+    let contents = match fs::read(directory.join(LOG_NAME)) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(error) => return Err(error.into()),
+    };
+    let mut records = BTreeMap::new();
+    let mut unreadable = 0_usize;
+    let mut lines = contents.split_inclusive(|byte| *byte == b'\n').peekable();
+    while let Some(line) = lines.next() {
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        match serde_json::from_slice::<LogRecord>(line) {
+            Ok(record) => {
+                replay(&mut records, record);
+            }
+            Err(_) if lines.peek().is_none() && !line.ends_with(b"\n") => {}
+            Err(_) => unreadable += 1,
+        }
+    }
+    let statuses = records
+        .into_values()
+        .map(|(erase, settle)| ErasureStatus { erase, settle })
+        .collect();
+    Ok((statuses, unreadable))
 }
 
 impl Inner {
@@ -871,25 +976,10 @@ impl ErasureLog {
                     continue;
                 }
                 match serde_json::from_slice::<LogRecord>(line) {
-                    Ok(LogRecord::Erase(erase)) => {
+                    Ok(record) => {
                         valid_len = valid_len.saturating_add(line.len() as u64);
-                        inner.records.insert(erase.id, (erase, None));
-                    }
-                    Ok(LogRecord::Settle(settle)) => {
-                        valid_len = valid_len.saturating_add(line.len() as u64);
-                        if let Some(entry) = inner.records.get_mut(&settle.id) {
-                            entry.1 = Some(settle);
-                        }
-                        // A settle for an unknown id is tolerated: it can only
-                        // be produced by a log manually spliced together, and
-                        // dropping it is safer than inventing an intent.
-                    }
-                    Ok(LogRecord::Note(note)) => {
-                        valid_len = valid_len.saturating_add(line.len() as u64);
-                        if let Some(entry) = inner.records.get_mut(&note.id) {
-                            entry.0.payload_refs.extend(note.payload_refs);
-                            entry.0.payload_refs.sort();
-                            entry.0.payload_refs.dedup();
+                        if let Some(id) = replay(&mut inner.records, record) {
+                            inner.settles.push(id);
                         }
                     }
                     Err(_) if lines.peek().is_none() && !terminated => {
@@ -990,11 +1080,49 @@ impl ErasureLog {
     pub(crate) fn record_settle(&self, settle: SettleRecord) -> Result<()> {
         let mut inner = self.lock()?;
         self.append_line(&LogRecord::Settle(settle.clone()))?;
-        if let Some(entry) = inner.records.get_mut(&settle.id) {
+        let id = settle.id;
+        if let Some(entry) = inner.records.get_mut(&id) {
             entry.1 = Some(settle);
+            // In the same critical section as the record: a reader of the
+            // settle order never sees an id whose settle is not in place.
+            inner.settles.push(id);
         }
         inner.rebuild_mask();
         Ok(())
+    }
+
+    /// How many settle records the log has taken in: the length of the
+    /// settle order [`Self::settlements`] reads.
+    pub(crate) fn settled_count(&self) -> Result<usize> {
+        Ok(self.lock()?.settles.len())
+    }
+
+    /// The settle records at positions `from..to` of the settle order
+    /// (clamped to its end), each resolved to the settle CURRENT for its
+    /// erasure — so an erasure settled twice reads the same at both of its
+    /// positions once the second has landed — one per position, so a
+    /// reader can count positions by them. `None` where the erasure has no
+    /// settle now: only a log spliced so that an intent record replays
+    /// after its own settle leaves that. Clones only those subjects, never
+    /// the intent records' key lists, so a caller taking the order in a
+    /// chunk at a time holds the lock for that chunk alone.
+    pub(crate) fn settlements(&self, from: usize, to: usize) -> Result<Vec<Option<Settlement>>> {
+        let inner = self.lock()?;
+        let to = to.min(inner.settles.len());
+        let from = from.min(to);
+        Ok(inner.settles[from..to]
+            .iter()
+            .map(|id| {
+                let (erase, settle) = inner.records.get(id)?;
+                let settle = settle.as_ref()?;
+                Some(Settlement {
+                    id: *id,
+                    subject: erase.subject.clone(),
+                    generation: settle.generation,
+                    settled_unix_ns: settle.settled_unix_ns,
+                })
+            })
+            .collect())
     }
 
     /// Durably adds payload references to a pending erasure's accounting,
@@ -1062,6 +1190,34 @@ impl ErasureLog {
             erase: erase.clone(),
             settle: settle.clone(),
         }))
+    }
+
+    /// The newest erasure's id, or 0 before the first.
+    ///
+    /// Ids are allocated monotonically inside [`Self::begin`], in the same
+    /// critical section that installs the mask, so this is an EPOCH: a holder
+    /// of copies taken out of the store (a replay's snapshot) that read the
+    /// epoch before its read knows that every erasure at or below it was
+    /// already masking that read, and only newer ones need checking.
+    pub(crate) fn latest_id(&self) -> Result<u64> {
+        let inner = self.lock()?;
+        Ok(inner.records.keys().next_back().copied().unwrap_or(0))
+    }
+
+    /// The id of the first erasure newer than `after` — pending or settled —
+    /// whose record `covers` accepts, or `None`. Walks the log in memory
+    /// without cloning records.
+    pub(crate) fn first_since(
+        &self,
+        after: u64,
+        covers: impl Fn(&EraseRecord) -> bool,
+    ) -> Result<Option<u64>> {
+        let inner = self.lock()?;
+        Ok(inner
+            .records
+            .range(after.saturating_add(1)..)
+            .find(|(_, (erase, _))| covers(erase))
+            .map(|(id, _)| *id))
     }
 }
 

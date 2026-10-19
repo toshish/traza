@@ -74,7 +74,16 @@ fn open_store(dir: &Path) -> Store {
     Store::open(
         dir,
         Config {
+            fuses: Default::default(),
+            fate: Default::default(),
+            steer: Default::default(),
+            xray_stale_steps: traza::xray::DEFAULT_STALE_STEPS,
             pricing: Default::default(),
+            max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
+            max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),
+            max_span_events: Some(traza::caps::DEFAULT_MAX_SPAN_EVENTS),
+            max_span_bytes: Some(traza::caps::DEFAULT_MAX_SPAN_BYTES),
+            max_batch_spans: Some(traza::caps::DEFAULT_MAX_BATCH_SPANS),
             tenant_ttl_seconds: Default::default(),
             flush_spans: 100_000,
             max_buffer_age: None,
@@ -323,17 +332,18 @@ fn every_tool_declares_what_it_does_to_the_store() {
         }
     }
 
-    // Ten readers and one writer, so a tool added without a decision about
-    // its nature fails here rather than shipping as pessimistically annotated.
-    // (The second writer, promote_failures_to_dataset, needs --mcp-promote and
-    // so is absent from this listing; its own gating test covers it.)
+    // Twenty-two readers and one writer, so a tool added without a decision
+    // about its nature fails here rather than shipping as pessimistically
+    // annotated. (The second writer, promote_failures_to_dataset, needs
+    // --mcp-promote and so is absent from this listing; its own gating test
+    // covers it.)
     let read_only = tools
         .iter()
         .filter(|tool| tool["annotations"]["readOnlyHint"] == json!(true))
         .count();
     assert_eq!(
-        read_only, 10,
-        "expected ten read-only tools, found {read_only}"
+        read_only, 22,
+        "expected twenty-two read-only tools, found {read_only}"
     );
 }
 
