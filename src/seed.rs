@@ -2518,12 +2518,13 @@ fn push_behaviour_run(
                     coding_usage(rng, &mut attributes, name, *turn, delegated.is_some());
                     *turn += 1;
                 } else {
-                    attributes.insert(
-                        "gen_ai.usage.input_tokens".into(),
-                        json!(600 + 40 * position as u64),
-                    );
-                    attributes.insert("gen_ai.usage.output_tokens".into(), json!(90));
-                    attributes.insert("llm.cost_usd".into(), json!(0.002));
+                    let (input, output) = (600 + 40 * position as u64, 90);
+                    attributes.insert("gen_ai.usage.input_tokens".into(), json!(input));
+                    attributes.insert("gen_ai.usage.output_tokens".into(), json!(output));
+                    // Both cohorts' models, gpt-6.1-sol and claude-sonnet-5-5,
+                    // list at $2 input and $10 output per million tokens.
+                    let cost = (input * 2 + output * 10) as f64 / 1_000_000.0;
+                    attributes.insert("llm.cost_usd".into(), json!(round_cents(cost)));
                 }
                 let failed = last && plan.outcome == "failure";
                 (format!("chat {name}"), if failed { "error" } else { "ok" })
@@ -2995,6 +2996,51 @@ mod tests {
         });
         assert!(tenanted.spans.iter().all(|span| span.tenant == "acme"));
         assert_ne!(tenanted.spans[0].trace_id, first.spans[0].trace_id);
+    }
+
+    #[test]
+    fn the_support_and_research_agents_meter_their_calls_by_their_tokens() {
+        let generated = behaviour_corpus(&BehaviourOptions {
+            live: true,
+            ..BehaviourOptions::default()
+        });
+        // gpt-6.1-sol and claude-sonnet-5-5 both list at $2 input and $10
+        // output per million tokens; a metered cost wins over the pricing
+        // table, so it must be the tokens' own.
+        let mut models = HashSet::new();
+        for span in generated
+            .spans
+            .iter()
+            .filter(|span| span.service != CODER && span.name.starts_with("chat "))
+        {
+            let tokens = |key: &str| span.attributes[key].as_u64().expect(key) as f64;
+            let expected = round_cents(
+                (tokens("gen_ai.usage.input_tokens") * 2.0
+                    + tokens("gen_ai.usage.output_tokens") * 10.0)
+                    / 1_000_000.0,
+            );
+            let metered = span.attributes["llm.cost_usd"].as_f64().expect("metered");
+            assert!(
+                (metered - expected).abs() < 1e-9,
+                "{}: {metered} vs {expected}",
+                span.name
+            );
+            models.insert(span.attributes["gen_ai.request.model"].clone());
+        }
+        assert_eq!(
+            models,
+            HashSet::from([json!("gpt-6.1-sol"), json!("claude-sonnet-5-5")])
+        );
+        // A clean refund's three model calls, as the prompt grows.
+        let costs: Vec<f64> = generated
+            .spans
+            .iter()
+            .filter(|span| {
+                span.attributes["session.id"] == "refund_happy-0" && span.name.starts_with("chat ")
+            })
+            .map(|span| span.attributes["llm.cost_usd"].as_f64().expect("metered"))
+            .collect();
+        assert_eq!(costs, [0.0021, 0.00226, 0.00242]);
     }
 
     #[test]

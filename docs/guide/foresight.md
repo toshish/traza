@@ -139,7 +139,7 @@ of its fatal forks and hotspots, and the tree under `root`. One node — the
 search loop — with its children elided:
 
 ```json
-{"abandoned":5,"children":[…],"ci95":[0.0435,0.2136],"cost_usd_sum":0.2,"depth":2,"duration_ns_sum":249849000000,"ended":0,"entropy":0.0,"example_runs":[{"outcome":"success","run":"search_loop-9"},{"outcome":"failure","run":"search_loop-0"},{"outcome":"abandoned","run":"search_loop-8"}],"failure":40,"fatal_fork":true,"fork":{"gap":0.6154,"p_value":2.2114329254814858e-14,"siblings_success_rate":0.7154,"siblings_visits":130},"hotspot":false,"lift":0.1837,"p_fail_given_here":0.8,"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50}
+{"abandoned":5,"children":[…],"ci95":[0.0435,0.2136],"cost_usd_sum":0.23,"depth":2,"duration_ns_sum":249849000000,"ended":0,"entropy":0.0,"example_runs":[{"outcome":"success","run":"search_loop-9"},{"outcome":"failure","run":"search_loop-0"},{"outcome":"abandoned","run":"search_loop-8"}],"failure":40,"fatal_fork":true,"fork":{"gap":0.6154,"p_value":2.2114329254814858e-14,"siblings_success_rate":0.7154,"siblings_visits":130},"hotspot":false,"lift":0.1837,"p_fail_given_here":0.8,"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50}
 ```
 
 Per node:
@@ -185,7 +185,7 @@ significant first, each with its path from the root; `hotspots` the
 highest-entropy nodes, with their most common next tokens:
 
 ```json
-"fatal_forks":[{"fork":{"gap":0.6154,"p_value":2.2114329254814858e-14,"siblings_success_rate":0.7154,"siblings_visits":130},"path":["llm:gpt-6.1-sol","tool:search_orders×3-5"],"success_rate":0.1,"visits":50},{"fork":{"gap":0.4,"p_value":5.073367025895768e-05,"siblings_success_rate":0.9,"siblings_visits":60},"path":["llm:gpt-6.1-sol","tool:search_orders","llm:gpt-6.1-sol","tool:issue_refund×2"],"success_rate":0.5,"visits":30}],
+"fatal_forks":[{"fork":{"gap":0.6154,"p_value":2.2114329254814858e-14,"siblings_success_rate":0.7154,"siblings_visits":130},"path":["llm:gpt-6.1-sol","tool:search_orders×3-5"],"success_rate":0.1,"visits":50},{"fork":{"gap":0.4,"p_value":0.00005073367025895768,"siblings_success_rate":0.9,"siblings_visits":60},"path":["llm:gpt-6.1-sol","tool:search_orders","llm:gpt-6.1-sol","tool:issue_refund×2"],"success_rate":0.5,"visits":30}],
 "hotspots":[{"entropy":1.4955,"next":["tool:search_orders","tool:search_orders×3-5","tool:lookup_customer"],"path":["llm:gpt-6.1-sol"],"visits":180}]
 ```
 
@@ -233,7 +233,7 @@ curl 'http://127.0.0.1:8080/v1/fate/runs/live-doomed-0'
 ```
 
 ```json
-{"agent":"support-agent","base_rate":0.5444,"ci95":[0.0435,0.2136],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792370034773920000,"matched_depth":2,"min_support":30,"next":[{"ci95":[0.0435,0.2136],"success_rate":0.1,"token":"llm:gpt-6.1-sol","visits":50}],"node":{"abandoned":5,"ci95":[0.0435,0.2136],"cost_usd_avg":0.004,"depth":2,"failure":40,"lift":0.1837,"p_fail_given_here":0.8,"pooled":["tool:search_orders×3-5"],"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50},"outcome":"unknown","p_success":0.1,"partial":false,"path":["llm:gpt-6.1-sol","tool:search_orders×3-5"],"run":"live-doomed-0","steps":5,"support":50,"tenant":"","verdict":"likely_failure"}
+{"agent":"support-agent","base_rate":0.5444,"ci95":[0.0435,0.2136],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792373457955485000,"matched_depth":2,"min_support":30,"next":[{"ci95":[0.0435,0.2136],"success_rate":0.1,"token":"llm:gpt-6.1-sol","visits":50}],"node":{"abandoned":5,"ci95":[0.0435,0.2136],"cost_usd_avg":0.0046,"depth":2,"failure":40,"lift":0.1837,"p_fail_given_here":0.8,"pooled":["tool:search_orders×3-5"],"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50},"outcome":"unknown","p_success":0.1,"partial":false,"path":["llm:gpt-6.1-sol","tool:search_orders×3-5"],"run":"live-doomed-0","steps":5,"support":50,"tenant":"","verdict":"likely_failure"}
 ```
 
 The run's path is read from its stored spans exactly as a build reads runs,
@@ -251,7 +251,7 @@ longer one, pooled (`node.pooled`, and `last_open: true`). The corpus's
 healthy run has issued one refund:
 
 ```json
-{"agent":"support-agent","base_rate":0.5444,"ci95":[0.6695,0.842],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 69 of 90 times (76.7%, 95% CI 66.9–84.2%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792370034773920000,"matched_depth":4,"min_support":30,"next":[{"ci95":[0.7985,0.9534],"success_rate":0.9,"token":"llm:gpt-6.1-sol","visits":60},{"ci95":[0.3315,0.6685],"repeat":true,"success_rate":0.5,"token":"tool:issue_refund","visits":30}],"node":{"abandoned":0,"ci95":[0.6695,0.842],"cost_usd_avg":0.006,"depth":4,"failure":21,"lift":1.4082,"p_fail_given_here":0.2333,"pooled":["tool:issue_refund","tool:issue_refund×2"],"success":69,"success_rate":0.7667,"token":"tool:issue_refund","visits":90},"outcome":"unknown","p_success":0.7667,"partial":false,"path":["llm:gpt-6.1-sol","tool:search_orders","llm:gpt-6.1-sol","tool:issue_refund"],"recommended_next":"llm:gpt-6.1-sol","run":"live-healthy-0","steps":4,"support":90,"tenant":"","verdict":"on_track"}
+{"agent":"support-agent","base_rate":0.5444,"ci95":[0.6695,0.842],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 69 of 90 times (76.7%, 95% CI 66.9–84.2%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792373457955485000,"matched_depth":4,"min_support":30,"next":[{"ci95":[0.7985,0.9534],"success_rate":0.9,"token":"llm:gpt-6.1-sol","visits":60},{"ci95":[0.3315,0.6685],"repeat":true,"success_rate":0.5,"token":"tool:issue_refund","visits":30}],"node":{"abandoned":0,"ci95":[0.6695,0.842],"cost_usd_avg":0.006807,"depth":4,"failure":21,"lift":1.4082,"p_fail_given_here":0.2333,"pooled":["tool:issue_refund","tool:issue_refund×2"],"success":69,"success_rate":0.7667,"token":"tool:issue_refund","visits":90},"outcome":"unknown","p_success":0.7667,"partial":false,"path":["llm:gpt-6.1-sol","tool:search_orders","llm:gpt-6.1-sol","tool:issue_refund"],"recommended_next":"llm:gpt-6.1-sol","run":"live-healthy-0","steps":4,"support":90,"tenant":"","verdict":"on_track"}
 ```
 
 69 of 90: the 54 of 60 that stopped at one refund and the 15 of 30 that
@@ -321,7 +321,7 @@ curl -X POST http://127.0.0.1:8080/v1/fuses/check -d '{"run": "live-doomed-0"}'
 ```
 
 ```json
-{"evidence":[],"foresight":{"base_rate":0.5444,"ci95":[0.0435,0.2136],"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","map_built_at_ns":1792370034773920000,"matched_depth":2,"p_success":0.1,"raised":true,"successes":5,"support":50,"verdict":"likely_failure"},"grant":null,"limits":{"min_success_odds":0.7},"nudges":[],"policy":"support","reasons":["foresight: runs that took this path succeeded 5 of 50 times (≤21.4%)"],"run":"live-doomed-0","source":"rebuilt","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":0.002,"duration_ns":3831000000,"error_streak":0,"errors":3,"llm_calls":1,"steps":5,"tokens":690,"tool_calls":4,"top_repeat":null},"verdict":"stop"}
+{"evidence":[],"foresight":{"base_rate":0.5444,"ci95":[0.0435,0.2136],"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","map_built_at_ns":1792373457955485000,"matched_depth":2,"p_success":0.1,"raised":true,"successes":5,"support":50,"verdict":"likely_failure"},"grant":null,"limits":{"min_success_odds":0.7},"nudges":[],"policy":"support","reasons":["foresight: runs that took this path succeeded 5 of 50 times (≤21.4%)"],"run":"live-doomed-0","source":"rebuilt","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":0.0021,"duration_ns":3831000000,"error_streak":0,"errors":3,"llm_calls":1,"steps":5,"tokens":690,"tool_calls":4,"top_repeat":null},"verdict":"stop"}
 ```
 
 The upper bound, not the estimate, is compared, so a fuse acts only when the
@@ -337,7 +337,7 @@ bound 84.2%) answers `continue` under `min_success_odds: 0.7`; the same check
 naming a second `issue_refund` answers `stop`:
 
 ```json
-{"evidence":[],"foresight":{"base_rate":0.5444,"ci95":[0.3315,0.6685],"explanation":"if it calls tool:issue_refund next: runs that took this path succeeded 15 of 30 times (50.0%, 95% CI 33.2–66.8%); the agent's overall success rate is 54%","map_built_at_ns":1792370034773920000,"matched_depth":4,"next_tool":"issue_refund","p_success":0.5,"raised":true,"successes":15,"support":30,"verdict":"on_track"},"grant":null,"limits":{"min_success_odds":0.7},"nudges":[],"policy":"support","reasons":["foresight: runs that took this path and then called tool:issue_refund succeeded 15 of 30 times (≤66.8%)"],"run":"live-healthy-0","source":"live","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":0.004,"duration_ns":3690000000,"error_streak":0,"errors":0,"llm_calls":2,"steps":4,"tokens":1460,"tool_calls":2,"top_repeat":{"count":2,"example":{"span_id":"0000000000018703","trace_id":"cbf29ce4842223250000000000000187"},"fingerprint":"llm:gpt-6.1-sol","window_steps":50}},"verdict":"stop"}
+{"evidence":[],"foresight":{"base_rate":0.5444,"ci95":[0.3315,0.6685],"explanation":"if it calls tool:issue_refund next: runs that took this path succeeded 15 of 30 times (50.0%, 95% CI 33.2–66.8%); the agent's overall success rate is 54%","map_built_at_ns":1792373457955485000,"matched_depth":4,"next_tool":"issue_refund","p_success":0.5,"raised":true,"successes":15,"support":30,"verdict":"on_track"},"grant":null,"limits":{"min_success_odds":0.7},"nudges":[],"policy":"support","reasons":["foresight: runs that took this path and then called tool:issue_refund succeeded 15 of 30 times (≤66.8%)"],"run":"live-healthy-0","source":"live","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":0.004359999999999999,"duration_ns":3690000000,"error_streak":0,"errors":0,"llm_calls":2,"steps":4,"tokens":1460,"tool_calls":2,"top_repeat":{"count":2,"example":{"span_id":"0000000000018703","trace_id":"cbf29ce4842223250000000000000187"},"fingerprint":"llm:gpt-6.1-sol","window_steps":50}},"verdict":"stop"}
 ```
 
 (The foresight `verdict` is `on_track` — 66.8% is above the agent's 54% —

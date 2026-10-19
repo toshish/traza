@@ -92,10 +92,13 @@ def step_span(run, index, kind, name, status, start_ns):
     trace, base = ids(run)
     attributes = {"session.id": run}
     if kind == "llm":
+        # gpt-6.1-sol lists at $2 input and $10 output per million tokens.
+        tokens_in, tokens_out = 600 + 40 * index, 90
         attributes.update({"gen_ai.operation.name": "chat", "gen_ai.request.model": name,
                            "gen_ai.provider.name": "openai",
-                           "gen_ai.usage.input_tokens": 600 + 40 * index,
-                           "gen_ai.usage.output_tokens": 90, "llm.cost_usd": 0.002})
+                           "gen_ai.usage.input_tokens": tokens_in,
+                           "gen_ai.usage.output_tokens": tokens_out,
+                           "llm.cost_usd": round((tokens_in * 2 + tokens_out * 10) / 1e6, 6)})
         span_name = "chat " + name
     else:
         attributes.update({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name,

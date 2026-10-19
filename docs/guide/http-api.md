@@ -1518,7 +1518,7 @@ curl 'http://127.0.0.1:8080/v1/fate/map?agent=support-agent'
 One node of the answer, the search loop:
 
 ```json
-{"abandoned":5,"children":[…],"ci95":[0.0435,0.2136],"cost_usd_sum":0.2,"depth":2,"duration_ns_sum":249849000000,"ended":0,"entropy":0.0,"example_runs":[{"outcome":"success","run":"search_loop-9"},{"outcome":"failure","run":"search_loop-0"},{"outcome":"abandoned","run":"search_loop-8"}],"failure":40,"fatal_fork":true,"fork":{"gap":0.6154,"p_value":2.2114329254814858e-14,"siblings_success_rate":0.7154,"siblings_visits":130},"hotspot":false,"lift":0.1837,"p_fail_given_here":0.8,"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50}
+{"abandoned":5,"children":[…],"ci95":[0.0435,0.2136],"cost_usd_sum":0.23,"depth":2,"duration_ns_sum":249849000000,"ended":0,"entropy":0.0,"example_runs":[{"outcome":"success","run":"search_loop-9"},{"outcome":"failure","run":"search_loop-0"},{"outcome":"abandoned","run":"search_loop-8"}],"failure":40,"fatal_fork":true,"fork":{"gap":0.6154,"p_value":2.2114329254814858e-14,"siblings_success_rate":0.7154,"siblings_visits":130},"hotspot":false,"lift":0.1837,"p_fail_given_here":0.8,"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50}
 ```
 
 **Errors.** `400` for a missing `agent`, a `depth`, `min_support` or
@@ -1562,7 +1562,7 @@ curl 'http://127.0.0.1:8080/v1/fate/runs/live-healthy-0'
 ```
 
 ```json
-{"agent":"support-agent","base_rate":0.5444,"ci95":[0.6695,0.842],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 69 of 90 times (76.7%, 95% CI 66.9–84.2%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792370034773920000,"matched_depth":4,"min_support":30,"next":[{"ci95":[0.7985,0.9534],"success_rate":0.9,"token":"llm:gpt-6.1-sol","visits":60},{"ci95":[0.3315,0.6685],"repeat":true,"success_rate":0.5,"token":"tool:issue_refund","visits":30}],"node":{"abandoned":0,"ci95":[0.6695,0.842],"cost_usd_avg":0.006,"depth":4,"failure":21,"lift":1.4082,"p_fail_given_here":0.2333,"pooled":["tool:issue_refund","tool:issue_refund×2"],"success":69,"success_rate":0.7667,"token":"tool:issue_refund","visits":90},"outcome":"unknown","p_success":0.7667,"partial":false,"path":["llm:gpt-6.1-sol","tool:search_orders","llm:gpt-6.1-sol","tool:issue_refund"],"recommended_next":"llm:gpt-6.1-sol","run":"live-healthy-0","steps":4,"support":90,"tenant":"","verdict":"on_track"}
+{"agent":"support-agent","base_rate":0.5444,"ci95":[0.6695,0.842],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 69 of 90 times (76.7%, 95% CI 66.9–84.2%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792373457955485000,"matched_depth":4,"min_support":30,"next":[{"ci95":[0.7985,0.9534],"success_rate":0.9,"token":"llm:gpt-6.1-sol","visits":60},{"ci95":[0.3315,0.6685],"repeat":true,"success_rate":0.5,"token":"tool:issue_refund","visits":30}],"node":{"abandoned":0,"ci95":[0.6695,0.842],"cost_usd_avg":0.006807,"depth":4,"failure":21,"lift":1.4082,"p_fail_given_here":0.2333,"pooled":["tool:issue_refund","tool:issue_refund×2"],"success":69,"success_rate":0.7667,"token":"tool:issue_refund","visits":90},"outcome":"unknown","p_success":0.7667,"partial":false,"path":["llm:gpt-6.1-sol","tool:search_orders","llm:gpt-6.1-sol","tool:issue_refund"],"recommended_next":"llm:gpt-6.1-sol","run":"live-healthy-0","steps":4,"support":90,"tenant":"","verdict":"on_track"}
 ```
 
 **Errors.** `400` for an empty or over-long (1,024 bytes) run id,
