@@ -233,8 +233,8 @@ or working directory contains it. `--json` prints the counts as JSON:
  "files_filtered":0,"files_failed":0,"sessions":2,"spans_built":21,
  "spans_sent":21,"spans_refused":0,"spans_trimmed":0,"turns":3,"llm_steps":11,
  "tool_steps":6,
- "tool_errors":1,"agent_spans":1,"input_tokens":240,"output_tokens":625,
- "cache_read_tokens":8400,"cache_creation_tokens":3650,
+ "tool_errors":1,"agent_spans":1,"input_tokens":44,"output_tokens":2336,
+ "cache_read_tokens":148406,"cache_creation_tokens":39760,
  "transcript":{"lines":28,"malformed_lines":1,"records":{"assistant":13,
  "summary":1,"system/api_error":1,"system/stop_hook_summary":1,
  "user/prompt":4,"user/tool_result":6},
@@ -284,7 +284,7 @@ line — and open the run around it.
 ```text
 $ traza-server blame src/cart.rs:4
 src/cart.rs:4  self.items.iter().map(|item| item.price).sum()
-  introduced 2026-01-05T10:00:06Z by Edit in run 11111111-1111-4111-8111-111111111111  [claude-code, claude-sonnet-4-5-20250929, step 3]
+  introduced 2026-01-05T10:00:06Z by Edit in run 11111111-1111-4111-8111-111111111111  [claude-code, claude-opus-5-5, step 3]
     prompt: Add a total to the cart summary
     file /tmp/demo-shop/src/cart.rs  trace 257eaef69d566d3579947aac638045ca  span 9694fd7a902a860f
 ```

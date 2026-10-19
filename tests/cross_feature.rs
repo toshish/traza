@@ -22,15 +22,16 @@ use traza::seed::{behaviour_corpus, BehaviourOptions};
 
 const S1: &str = "11111111-1111-4111-8111-111111111111";
 const S2: &str = "22222222-2222-4222-8222-222222222222";
-const SONNET: &str = "llm:claude-sonnet-4-5-20250929";
+const OPUS: &str = "llm:claude-opus-5-5";
 /// The fixtures are dated January 2026; every windowed read starts before.
 const SINCE: &str = "since=1735689600000000000";
-/// Cache reads at a tenth of the input rate, writes at 1.25 times it.
+/// The vendor's list prices: cache writes at 1.25 times the input rate,
+/// cache reads at a twentieth of it for Opus and a tenth for Haiku.
 const PRICING: &str = r#"{"models": {
-  "claude-sonnet-4-5*": {"input_per_mtok": 3.0, "output_per_mtok": 15.0,
-                         "cache_read_per_mtok": 0.3, "cache_write_per_mtok": 3.75},
-  "claude-haiku-4-5*": {"input_per_mtok": 1.0, "output_per_mtok": 5.0,
-                        "cache_read_per_mtok": 0.1, "cache_write_per_mtok": 1.25}}}"#;
+  "claude-opus-5-5": {"input_per_mtok": 4.0, "output_per_mtok": 20.0,
+                      "cache_read_per_mtok": 0.2, "cache_write_per_mtok": 5.0},
+  "claude-haiku-5-5": {"input_per_mtok": 0.1, "output_per_mtok": 0.5,
+                       "cache_read_per_mtok": 0.01, "cache_write_per_mtok": 0.125}}}"#;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/import")
@@ -108,11 +109,12 @@ fn an_imported_claude_code_history_answers_every_new_read() {
     assert_eq!(imported["spans_sent"], json!(21), "{imported}");
 
     // Cost: the pricing file's cache rates price the cache counters the
-    // transcript recorded. The first call read 1,000 cached tokens and wrote
-    // 200: 10 × $3 + 120 × $15 + 1,000 × $0.30 + 200 × $3.75 per Mtok.
+    // transcript recorded. The first call read 17,920 cached tokens (the
+    // system prompt and tool definitions) and wrote 4,180: 3 × $4 + 1,286 ×
+    // $20 + 17,920 × $0.20 + 4,180 × $5 per Mtok.
     let first = step(&server, S1, 0);
     assert_eq!(first["kind"], "llm");
-    assert!(close(&first["cost_usd"], 0.002_88), "{first}");
+    assert!(close(&first["cost_usd"], 0.050_216), "{first}");
 
     // The Fate Map: both sessions are runs of the claude-code agent, one
     // that succeeded and one that ended on an API error, parting at their
@@ -133,7 +135,7 @@ fn an_imported_claude_code_history_answers_every_new_read() {
         &server,
         &format!("/v1/fate/map?agent=claude-code&{SINCE}&min_support=1"),
     );
-    let first_call = child(&map["root"], SONNET);
+    let first_call = child(&map["root"], OPUS);
     assert_eq!(first_call["visits"], json!(2));
     let read = child(first_call, "tool:Read");
     let write = child(first_call, "tool:Write");
@@ -175,10 +177,11 @@ fn an_imported_claude_code_history_answers_every_new_read() {
     // The Cache Autopsy pairs each call with its conversation's previous
     // one — the sub-agent's calls with each other. With a one-minute cache
     // assumed, two calls came back too late; the first of them reports
-    // reading its whole prefix from the cache anyway (1,500 tokens of the
-    // 1,408 its predecessor reported), so the cache outlived the assumption
-    // and it is stable. The other read nothing: its 197 tokens are priced at
-    // the input rate less the cache-read rate, $2.70 per Mtok.
+    // reading its whole prefix from the cache anyway (25,434 tokens, all its
+    // predecessor reported), so the cache outlived the assumption and it is
+    // stable. The other, an API error, read nothing and reported no counts:
+    // its 197 tokens, estimated from the recorded text, are priced at the
+    // input rate less the cache-read rate, $3.80 per Mtok.
     let autopsy = ok(&server, &format!("/v1/cache/{S1}?ttl_seconds=60"));
     let verdicts: Vec<(Value, Value, Value)> = autopsy["steps"]
         .as_array()
@@ -210,7 +213,7 @@ fn an_imported_claude_code_history_answers_every_new_read() {
     let summary = &autopsy["summary"];
     assert_eq!(summary["est_tokens_lost"], json!(197));
     assert!(
-        close(&summary["est_cost_lost_usd"], 0.000_531_9),
+        close(&summary["est_cost_lost_usd"], 0.000_748_6),
         "{summary}"
     );
 
@@ -271,14 +274,14 @@ fn an_imported_claude_code_history_answers_every_new_read() {
     let changes = ok(&server, &format!("/v1/changes?agent=claude-code&{SINCE}"));
     let agent = &changes["agents"][0];
     assert_eq!(agent["runs"], json!(2));
-    assert_eq!(agent["current"]["service_version"], "2.1.0");
+    assert_eq!(agent["current"]["service_version"], "2.1.303");
     assert_eq!(agent["changes"], json!([]));
     // The failed session is known as one everywhere.
     let failed = ok(
         &server,
         &format!("/v1/fate/map?agent=claude-code&{SINCE}&min_support=1"),
     );
-    let examples = child(child(&failed["root"], SONNET), "tool:Write")["example_runs"].clone();
+    let examples = child(child(&failed["root"], OPUS), "tool:Write")["example_runs"].clone();
     assert_eq!(examples, json!([{"run": S2, "outcome": "failure"}]));
     let _ = std::fs::remove_dir_all(&home);
 }

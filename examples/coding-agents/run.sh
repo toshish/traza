@@ -114,14 +114,17 @@ fi
 
 # The rates this demo prices with, cache rates included: without them a
 # Claude Code session's cache traffic goes unpriced (docs/configuration.md).
+# They are the vendors' list prices on 2026-10-18 (cache writes at the
+# five-minute rate). Haiku 5.5 costs more for prompts over 100K tokens; the
+# demo's Haiku calls stay near 11K, so its base rate is the one that applies.
 cat >"$tmp/pricing.json" <<'EOF'
 {"models": {
-  "claude-sonnet-4-5*": {"input_per_mtok": 3.00, "output_per_mtok": 15.00,
-                         "cache_read_per_mtok": 0.30, "cache_write_per_mtok": 3.75},
-  "claude-haiku-4-5*":  {"input_per_mtok": 1.00, "output_per_mtok": 5.00,
-                         "cache_read_per_mtok": 0.10, "cache_write_per_mtok": 1.25},
-  "gpt-5-codex*":       {"input_per_mtok": 1.25, "output_per_mtok": 10.00,
-                         "cache_read_per_mtok": 0.125}
+  "claude-opus-5-5":  {"input_per_mtok": 4.00, "output_per_mtok": 20.00,
+                       "cache_read_per_mtok": 0.20, "cache_write_per_mtok": 5.00},
+  "claude-haiku-5-5": {"input_per_mtok": 0.10, "output_per_mtok": 0.50,
+                       "cache_read_per_mtok": 0.01, "cache_write_per_mtok": 0.125},
+  "gpt-6.1-sol":      {"input_per_mtok": 2.00, "output_per_mtok": 10.00,
+                       "cache_read_per_mtok": 0.10, "cache_write_per_mtok": 2.50}
 }}
 EOF
 

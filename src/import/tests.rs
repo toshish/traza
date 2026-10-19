@@ -140,20 +140,20 @@ fn a_claude_code_session_becomes_turns_llm_steps_and_tool_steps() {
 
     // One API response written as three records counts its usage ONCE.
     let first = llm(&spans, S1, "msg_01");
-    assert_eq!(attr(&first, "gen_ai.usage.input_tokens"), &json!(10));
-    assert_eq!(attr(&first, "gen_ai.usage.output_tokens"), &json!(120));
+    assert_eq!(attr(&first, "gen_ai.usage.input_tokens"), &json!(3));
+    assert_eq!(attr(&first, "gen_ai.usage.output_tokens"), &json!(1286));
     assert_eq!(
         attr(&first, "gen_ai.usage.cache_read.input_tokens"),
-        &json!(1000)
+        &json!(17920)
     );
     assert_eq!(
         attr(&first, "gen_ai.usage.cache_creation.input_tokens"),
-        &json!(200)
+        &json!(4180)
     );
     assert_eq!(attr(&first, "gen_ai.provider.name"), &json!("anthropic"));
     assert_eq!(
         attr(&first, "gen_ai.request.model"),
-        &json!("claude-sonnet-4-5-20250929")
+        &json!("claude-opus-5-5")
     );
     let output = &attr(&first, "gen_ai.output.messages")[0];
     let part_types: Vec<&str> = output["parts"]
@@ -214,7 +214,7 @@ fn a_claude_code_session_becomes_turns_llm_steps_and_tool_steps() {
         assert_eq!(attr(span, "session.id"), &json!(S1), "{}", span.name);
         assert_eq!(attr(span, "traza.source"), &json!("claude-code"));
         assert_eq!(attr(span, "code.project"), &json!("/tmp/demo-shop"));
-        assert_eq!(attr(span, "service.version"), &json!("2.1.0"));
+        assert_eq!(attr(span, "service.version"), &json!("2.1.303"));
         assert_eq!(span.service, "claude-code");
     }
 
@@ -225,7 +225,7 @@ fn a_claude_code_session_becomes_turns_llm_steps_and_tool_steps() {
     assert_eq!(attr(&failed, "error.type"), &json!("overloaded"));
     assert_eq!(
         attr(&failed, "gen_ai.request.model"),
-        &json!("claude-sonnet-4-5-20250929")
+        &json!("claude-opus-5-5")
     );
     assert_eq!(attr(&failed, "gen_ai.response.model"), &Value::Null);
     let second_turn = turns(&spans)[1].clone();
@@ -396,7 +396,7 @@ fn a_codex_rollout_groups_items_into_responses_with_usage_attached_once() {
     );
     assert_eq!(stats.records.get("item_completed/late"), Some(&1));
     for call in &calls {
-        assert_eq!(attr(call, "gen_ai.request.model"), &json!("gpt-5-codex"));
+        assert_eq!(attr(call, "gen_ai.request.model"), &json!("gpt-6.1-sol"));
         assert_eq!(attr(call, "gen_ai.provider.name"), &json!("openai"));
     }
     let turn = turns(&spans)[0].clone();
@@ -527,10 +527,7 @@ fn a_codex_subagent_thread_joins_its_roots_run() {
         .find(|span| operation(span) == Some("chat"))
         .expect("call");
     assert_eq!(call.parent_span_id.as_deref(), Some(agent.span_id.as_str()));
-    assert_eq!(
-        attr(call, "gen_ai.request.model"),
-        &json!("gpt-5-codex-mini")
-    );
+    assert_eq!(attr(call, "gen_ai.request.model"), &json!("gpt-6-luna"));
     assert!(
         turns(&spans).is_empty(),
         "a sub-agent's turns are its agent span"
@@ -703,7 +700,7 @@ fn importing_again_sends_nothing_and_appended_lines_send_only_what_they_touch() 
         "message": {"role": "user", "content": "And add a test"}});
     let answer = json!({"type": "assistant", "uuid": "a10", "parentUuid": "u9", "sessionId": S1,
         "timestamp": "2026-01-05T10:10:04.000Z", "cwd": "/tmp/demo-shop",
-        "message": {"id": "msg_09", "role": "assistant", "model": "claude-sonnet-4-5-20250929",
+        "message": {"id": "msg_09", "role": "assistant", "model": "claude-opus-5-5",
             "content": [{"type": "text", "text": "Added."}], "stop_reason": "end_turn",
             "usage": {"input_tokens": 3, "output_tokens": 4}}});
     let mut text = std::fs::read_to_string(&main).expect("read");
@@ -726,7 +723,7 @@ fn importing_again_sends_nothing_and_appended_lines_send_only_what_they_touch() 
     let names: Vec<&str> = sink.sent.iter().map(|span| span.name.as_str()).collect();
     assert_eq!(
         names,
-        ["turn", "chat claude-sonnet-4-5-20250929"],
+        ["turn", "chat claude-opus-5-5"],
         "the turn (extended) and its call"
     );
     assert_eq!(completed.spans_sent, 2);
@@ -1413,7 +1410,7 @@ fn huge_span() -> Span {
         &trace_id(Source::Codex, "huge"),
         &span_id(Source::Codex, "huge", "llm", "1"),
         None,
-        "chat gpt-5-codex".into(),
+        "chat gpt-6.1-sol".into(),
         1,
     );
     let parts: Vec<Value> = (0..400)
@@ -1556,7 +1553,7 @@ fn compacted_transcript(dir: &Path, summary_first: bool) -> PathBuf {
     let record = |uuid: &str, second: u32, body: Value| -> String {
         let mut record = json!({
             "parentUuid": null, "isSidechain": false, "cwd": "/tmp/demo-shop",
-            "sessionId": S2, "version": "2.1.0", "uuid": uuid,
+            "sessionId": S2, "version": "2.1.303", "uuid": uuid,
             "timestamp": format!("2026-01-05T12:00:{second:02}.000Z"),
         });
         for (key, value) in body.as_object().expect("object") {
@@ -1567,7 +1564,7 @@ fn compacted_transcript(dir: &Path, summary_first: bool) -> PathBuf {
     let reply = |id: &str, text: &str| {
         json!({"type": "assistant", "message": {
             "id": id, "type": "message", "role": "assistant",
-            "model": "claude-sonnet-4-5-20250929",
+            "model": "claude-opus-5-5",
             "content": [{"type": "text", "text": text}],
             "usage": {"input_tokens": 5, "output_tokens": 5}}})
     };
@@ -1688,7 +1685,7 @@ fn a_codex_compaction_restarts_from_its_replacement_history() {
             0,
             "session_meta",
             json!({"id": C, "timestamp": "2025-06-03T08:00:00.000Z", "cwd": "/tmp/demo-api",
-                   "originator": "codex_cli_rs", "cli_version": "0.150.0",
+                   "originator": "codex_cli_rs", "cli_version": "0.163.0",
                    "model_provider": "openai"}),
         ),
         line(
@@ -1699,7 +1696,7 @@ fn a_codex_compaction_restarts_from_its_replacement_history() {
         line(
             1,
             "turn_context",
-            json!({"turn_id": "t1", "cwd": "/tmp/demo-api", "model": "gpt-5-codex"}),
+            json!({"turn_id": "t1", "cwd": "/tmp/demo-api", "model": "gpt-6.1-sol"}),
         ),
         line(2, "response_item", user("Keep the public API stable")),
         line(3, "response_item", answer("Noted.")),
@@ -1725,7 +1722,7 @@ fn a_codex_compaction_restarts_from_its_replacement_history() {
         line(
             6,
             "turn_context",
-            json!({"turn_id": "t2", "cwd": "/tmp/demo-api", "model": "gpt-5-codex"}),
+            json!({"turn_id": "t2", "cwd": "/tmp/demo-api", "model": "gpt-6.1-sol"}),
         ),
         line(7, "response_item", user("Add a health route")),
         line(8, "response_item", answer("Added.")),
@@ -1777,7 +1774,7 @@ fn one_response_repeated_with_endless_new_blocks_holds_bounded_dedup_state() {
             1,
             json!({"type": "assistant", "message": {
                 "id": "msg_same", "type": "message", "role": "assistant",
-                "model": "claude-sonnet-4-5-20250929",
+                "model": "claude-opus-5-5",
                 "content": [{"type": "text", "text": format!("block {index}")}]}}),
         );
         end += line.len() as u64 + 1;
@@ -1940,7 +1937,7 @@ fn a_watch_that_finds_a_rollout_mid_meta_line_keeps_its_sub_agent_identity() {
         .iter()
         .filter(|span| {
             attr(span, "gen_ai.agent.name") == &json!("reviewer")
-                || attr(span, "gen_ai.request.model") == &json!("gpt-5-codex-mini")
+                || attr(span, "gen_ai.request.model") == &json!("gpt-6-luna")
         })
         .collect();
     assert!(!child_spans.is_empty(), "the child's turn was imported");
@@ -2192,7 +2189,7 @@ fn files_beside_and_behind_a_transcript_are_read_within_a_cap() {
 fn cc_record(uuid: &str, second: u32, body: Value) -> String {
     let mut record = json!({
         "parentUuid": null, "isSidechain": false, "cwd": "/tmp/demo-shop",
-        "sessionId": S2, "version": "2.1.0", "uuid": uuid,
+        "sessionId": S2, "version": "2.1.303", "uuid": uuid,
         "timestamp": format!("2026-01-05T12:00:{second:02}.000Z"),
     });
     for (key, value) in body.as_object().expect("object") {
@@ -2208,7 +2205,7 @@ fn cc_edit(uuid: &str, second: u32, call: &str, file: &str, line: &str) -> Strin
         second,
         json!({"type": "assistant", "message": {
             "id": format!("msg_{call}"), "type": "message", "role": "assistant",
-            "model": "claude-sonnet-4-5-20250929", "stop_reason": "tool_use",
+            "model": "claude-opus-5-5", "stop_reason": "tool_use",
             "content": [{"type": "tool_use", "id": call, "name": "Edit",
                 "input": {"file_path": file, "old_string": "fn stale() {}", "new_string": line}}],
             "usage": {"input_tokens": 1, "output_tokens": 1}}}),

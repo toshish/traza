@@ -38,7 +38,7 @@ traza-server blame migrations/0007_order_coupon.sql:2
 
 ```
 migrations/0007_order_coupon.sql:2  ALTER TABLE orders ADD COLUMN coupon_code TEXT;
-  introduced 2026-10-18T10:20:40Z by Write in run 1c0a7e5b-2f4d-4e6a-8b9c-0d1e2f3a4b5c  [claude-code, claude-sonnet-4-5-20250929, step 33]
+  introduced 2026-10-18T10:20:40Z by Write in run 1c0a7e5b-2f4d-4e6a-8b9c-0d1e2f3a4b5c  [claude-code, claude-opus-5-5, step 33]
     prompt: Now record which coupon each order used.
 ```
 
@@ -123,7 +123,7 @@ From the [coding-agents demo](examples/coding-agents/README.md), a Claude Code s
 
 ```
 step  agent          cause              gap  cache read  cache write  what changed
-23    claude-code    ttl_expired    16m 03s           0       17,320  TTL passed: ~734 tokens re-processed, $0.0020 lost
+23    claude-code    ttl_expired    16m 03s           0       17,320  TTL passed: ~734 tokens re-processed, $0.0028 lost
 30    claude-code    new_context     6m 43s           0        4,120  rewritten — the /compact
 
 dropped since step 29: 20 chunks, ~968 tokens — 2 of them instructions the agent was given:

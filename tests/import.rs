@@ -23,9 +23,10 @@ const S2: &str = "22222222-2222-4222-8222-222222222222";
 const A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const CART_LINE: &str = "        self.items.iter().map(|item| item.price).sum()";
 const PRICING: &str = r#"{"models": {
-  "claude-sonnet-4-5*": {"input_per_mtok": 3.0, "output_per_mtok": 15.0},
-  "claude-haiku-4-5*": {"input_per_mtok": 1.0, "output_per_mtok": 5.0},
-  "gpt-5-codex*": {"input_per_mtok": 1.25, "output_per_mtok": 10.0}}}"#;
+  "claude-opus-5-5": {"input_per_mtok": 4.0, "output_per_mtok": 20.0},
+  "claude-haiku-5-5": {"input_per_mtok": 0.1, "output_per_mtok": 0.5},
+  "gpt-6.1-sol": {"input_per_mtok": 2.0, "output_per_mtok": 10.0},
+  "gpt-6-luna": {"input_per_mtok": 0.1, "output_per_mtok": 0.5}}}"#;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/import")
@@ -155,9 +156,9 @@ fn an_import_records_runs_steps_tokens_costs_and_outcomes() {
         ),
         (json!(3), json!(11), json!(6))
     );
-    assert_eq!(claude["input_tokens"], json!(240));
-    assert_eq!(claude["output_tokens"], json!(625));
-    assert_eq!(claude["cache_read_tokens"], json!(8400));
+    assert_eq!(claude["input_tokens"], json!(44));
+    assert_eq!(claude["output_tokens"], json!(2336));
+    assert_eq!(claude["cache_read_tokens"], json!(148406));
     // Unknown records and garbage lines are counted, and the import succeeds.
     assert_eq!(
         claude["transcript"]["unknown_records"],
@@ -174,15 +175,15 @@ fn an_import_records_runs_steps_tokens_costs_and_outcomes() {
     assert_eq!(first["kind"], json!("llm"));
     assert_eq!(
         first["tokens"]["input"],
-        json!(10),
+        json!(3),
         "usage counted once per response"
     );
-    assert_eq!(first["tokens"]["output"], json!(120));
-    assert_eq!(first["tokens"]["cache_read"], json!(1000));
+    assert_eq!(first["tokens"]["output"], json!(1286));
+    assert_eq!(first["tokens"]["cache_read"], json!(17920));
     let cost = first["cost_usd"].as_f64().expect("priced");
     assert!(
-        (cost - 0.00183).abs() < 1e-12,
-        "10 in x $3 + 120 out x $15 per Mtok: {cost}"
+        (cost - 0.025732).abs() < 1e-12,
+        "3 in x $4 + 1,286 out x $20 per Mtok: {cost}"
     );
     let tools: Vec<(&str, &str)> = steps
         .iter()
@@ -212,8 +213,8 @@ fn an_import_records_runs_steps_tokens_costs_and_outcomes() {
 
     // Sessions roll up the tokens; recall reads outcomes and goals.
     let (_, session) = server.json("GET", &format!("/v1/sessions/{S1}"), None, &[]);
-    assert_eq!(session["prompt_tokens"], json!(140), "{session}");
-    assert_eq!(session["completion_tokens"], json!(425));
+    assert_eq!(session["prompt_tokens"], json!(41), "{session}");
+    assert_eq!(session["completion_tokens"], json!(2088));
     let (_, recall) = server.json("GET", "/v1/recall?q=cart&outcome=any", None, &[]);
     let recalled = recall["runs"]
         .as_array()
@@ -364,7 +365,7 @@ fn append_turn(path: &Path, session: &str, key: &str, minute: u32) {
         "parentUuid": format!("u-{key}"), "sessionId": session,
         "timestamp": format!("2026-01-05T12:{minute:02}:05.000Z"), "cwd": "/tmp/demo-shop",
         "message": {"id": format!("msg-{key}"), "role": "assistant",
-            "model": "claude-sonnet-4-5-20250929", "stop_reason": "end_turn",
+            "model": "claude-opus-5-5", "stop_reason": "end_turn",
             "content": [{"type": "text", "text": format!("answer {key}")}],
             "usage": {"input_tokens": 1, "output_tokens": 2}}});
     let mut text = std::fs::read_to_string(path).unwrap_or_default();
@@ -518,7 +519,7 @@ fn blame_finds_the_step_that_introduced_a_line_over_http_cli_and_mcp() {
     assert_eq!(first["tool"], json!("Edit"));
     assert_eq!(first["file"], json!("/tmp/demo-shop/src/cart.rs"));
     assert_eq!(first["prompt"], json!("Add a total to the cart summary"));
-    assert_eq!(first["model"], json!("claude-sonnet-4-5-20250929"));
+    assert_eq!(first["model"], json!("claude-opus-5-5"));
     assert_eq!(first["step_index"], json!(3));
     assert_eq!(first["service"], json!("claude-code"));
     assert_eq!(
@@ -739,7 +740,7 @@ fn edit_session(projects: &Path, session: &str, cwd: &str, file: &str, line: &st
         json!({"type": "assistant", "uuid": "a", "parentUuid": "p", "sessionId": session,
                "cwd": cwd, "timestamp": at(1),
                "message": {"id": format!("msg-{session}"), "role": "assistant",
-                   "model": "claude-sonnet-4-5-20250929", "stop_reason": "tool_use",
+                   "model": "claude-opus-5-5", "stop_reason": "tool_use",
                    "content": [{"type": "tool_use", "id": format!("toolu-{session}"),
                        "name": "Edit", "input": {"file_path": file, "old_string": "",
                            "new_string": line}}],

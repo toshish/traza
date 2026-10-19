@@ -65,8 +65,9 @@ sessions left them, so blame can read real lines.
 - **Outcomes are inferred.** No session declares one, so each reads as how
   its last span ended — which is why the test-tampering session reads as a
   success. The detectors are how you find it.
-- **The pricing file is the demo's.** Its rates are chosen for the example;
-  set your own with [`--pricing`](../../docs/configuration.md#model-pricing).
+- **The pricing file is the demo's.** Its rates are the vendors' list prices
+  on 2026-10-18 for the models the transcripts name, and prices change; set
+  your own with [`--pricing`](../../docs/configuration.md#model-pricing).
 - **Blame sees recorded edits only** — the editing tools' arguments, Codex
   patches — not lines written by shell commands.
 
