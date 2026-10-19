@@ -211,40 +211,53 @@ SDK at it and every model call is answered from the recording — your code,
 prompts and control flow run for real; no request goes to a provider.
 
 ```ts
-import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 import { Client } from "@trazadb/sdk";
 
-const tools: OpenAI.ChatCompletionTool[] = [
-  { type: "function", function: { name: "get_weather", parameters: { type: "object", properties: { city: { type: "string" } } } } },
-];
+const COORDINATOR =
+  "You are a research coordinator. Delegate web searches to the web-researcher subagent, read the sources it finds with WebFetch, then write a one-page brief that cites every source by URL.";
+const WORKER =
+  "You are web-researcher. Search the web and reply with the most relevant primary sources, one line each, with their URLs.";
+const TASK = "Write a one-page brief on solid-state battery readiness for EVs in 2027, with sources.";
+const tool = (name: string, field: string): Anthropic.Tool => ({
+  name,
+  input_schema: { type: "object", properties: { [field]: { type: "string" } } },
+});
 
 const traza = Client.fromEnv();
-const replay = await traza.replay("weather-7"); // strict by default
-const openai = new OpenAI({ baseURL: replay.openaiBaseUrl, apiKey: traza.token ?? "traza-open" });
+const replay = await traza.replay("dr-0917"); // strict by default
+const anthropic = new Anthropic({ baseURL: replay.anthropicBaseUrl, apiKey: traza.token ?? "traza-open" });
 
-const messages: OpenAI.ChatCompletionMessageParam[] = [
-  { role: "system", content: "You are a weather assistant." },
-  { role: "user", content: "What's the weather in Paris?" },
-];
-for (;;) {
-  const answer = await openai.chat.completions.create({ model: "gpt-6.1-sol", messages, tools });
-  const message = answer.choices[0]!.message;
-  messages.push(message);
-  if (!message.tool_calls?.length) break;
-  for (const call of message.tool_calls) {
-    if (call.type !== "function") continue;
-    const recorded = await replay.nextTool(call.function.name); // the recorded result, not a live call
-    messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(recorded?.result) });
+async function run(model: string, system: string, task: string, tools: Anthropic.Tool[]): Promise<string> {
+  const messages: Anthropic.MessageParam[] = [{ role: "user", content: task }];
+  for (;;) {
+    const answer = await anthropic.messages.create({ model, max_tokens: 8192, system, messages, tools });
+    messages.push({ role: "assistant", content: answer.content });
+    const calls = answer.content.filter((block) => block.type === "tool_use");
+    if (!calls.length) return answer.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+    const results: Anthropic.ToolResultBlockParam[] = [];
+    for (const call of calls) {
+      const content =
+        call.name === "Agent" // the sub-agent's calls are on the tape too
+          ? await run("claude-haiku-5-5", WORKER, (call.input as { prompt: string }).prompt, [tool("WebSearch", "query")])
+          : String((await replay.nextTool(call.name))?.result); // the recorded result, not a live search or fetch
+      results.push({ type: "tool_result", tool_use_id: call.id, content });
+    }
+    messages.push({ role: "user", content: results });
   }
 }
-console.log(messages.at(-1)); // … It's raining in Paris, 12°C. Take an umbrella.
-console.log(await replay.status()); // served: 2, remaining: 0, diverged: null, …
+
+console.log(await run("claude-opus-5-5", COORDINATOR, TASK, [tool("Agent", "prompt"), tool("WebFetch", "url")])); // Solid-state batteries in 2027: …
+console.log(await replay.status()); // served: 9, remaining: 0, diverged: null, …
 ```
 
-That loop was type-checked and run, as written, against a recorded
-OpenLLMetry run with `openai` 6.49.0, and the Anthropic route with
-`@anthropic-ai/sdk` 0.129.0
-(`new Anthropic({ baseURL: replay.anthropicBaseUrl, apiKey })`).
+That loop was type-checked and run, as written, with `@anthropic-ai/sdk`
+0.129.0 and TypeScript 5.9.3, against `dr-0917`: the research run the
+[replay guide](../../docs/guide/replay.md) uses, a coordinator on
+`claude-opus-5-5` and a `web-researcher` sub-agent on `claude-haiku-5-5`. All
+nine model calls, the sub-agent's two included, were answered from the
+recording. An agent on the OpenAI SDK takes
+`new OpenAI({ baseURL: replay.openaiBaseUrl, apiKey })` instead.
 
 - `replay.env({ apiKey })` gives `OPENAI_BASE_URL`, `OPENAI_API_KEY`,
   `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` as absolute URLs, for an agent
@@ -258,7 +271,7 @@ OpenLLMetry run with `openai` 6.49.0, and the Anthropic route with
   `OPENAI_BASE_URL` sends it to the real provider. If your client holds an
   operator token, mint a dedicated `ro` credential bound to the run's tenant,
   create the replay under that tenant (`new Client(url, { token, tenant: "acme" })`),
-  and pass the `ro` token as `apiKey` (in the loop above, as the OpenAI
+  and pass the `ro` token as `apiKey` (in the loop above, as the Anthropic
   client's `apiKey`). Any credential of the replay's tenant may consume it.
 - **Tools still run live** unless your harness takes their results from
   `nextTool()`, which resolves `null` once no recorded tool step is left.
@@ -270,15 +283,19 @@ OpenLLMetry run with `openai` 6.49.0, and the Anthropic route with
 Comparing runs, and recalling earlier ones
 -----------------------------------------
 
+`dr-0917-dedupe` is the same task run again under a harness that refuses to
+fetch a URL twice: a [fork](../../docs/guide/fork.md) of `dr-0917`.
+
 ```ts
-const diff = await traza.diff("weather-7", "weather-8");
+const diff = await traza.diff("dr-0917", "dr-0917-dedupe");
 diff.first_divergence?.explanation;
-// "step 0 of a and step 0 of b (llm:gpt-6.1-sol) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b"
+// "step 12 of a and step 12 of b (tool:WebFetch) received the same input and produced a different output: response e450b5a73db1 in a, 750af04196bb in b"
 for (const step of diff.aligned) console.log(step.op, step.why, step.fingerprint_a, step.fingerprint_b);
 
-const { runs } = await traza.recall("weather Paris", { outcome: "any", limit: 5 });
+const { runs } = await traza.recall("solid-state battery", { outcome: "any", limit: 5 });
 for (const run of runs) console.log(run.run, run.outcome, run.skeleton.join(" -> "));
-// weather-7 success llm:gpt-6.1-sol -> tool:get_weather -> llm:gpt-6.1-sol
+// dr-0917 success agent:research-coordinator -> llm:claude-opus-5-5 -> tool:Agent -> …
+// dr-0917-dedupe success agent:research-coordinator -> llm:claude-opus-5-5 -> tool:Agent -> …
 ```
 
 `tape(run, { resolve })` returns the run's steps with their inputs, outputs,
@@ -358,7 +375,10 @@ package. The suite starts two real servers on ephemeral ports — one open,
 one with `TRAZA_TOKENS` — and runs every method against their responses,
 including a fuse stop throwing `FuseTripped`, a replay consumed over the
 OpenAI and Anthropic routes with plain `fetch`, an aborted long-poll, a quota
-refusal, and an evidence pack's digest. Redirects and unreadable answers,
+refusal, and an evidence pack's digest. `test/research.test.js` records
+`dr-0917` and runs this README's replay loop against it, with a few lines of
+`fetch` standing in for the Anthropic SDK, and checks the outputs shown here
+and in the guides. Redirects and unreadable answers,
 which the real server never sends, come from a canned-answer stub
 (`test/stub.js`), and `test/server.test.js` checks that the harness itself
 fails fast — no hung process, no server or directory left behind — when the

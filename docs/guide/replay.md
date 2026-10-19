@@ -45,64 +45,92 @@ or `agent` ([step kinds](../llm-semantics.md#step-kind)) — in start order.
 Workflow wrappers, HTTP spans and retrievals are context around steps, not
 steps, so they are not on the tape.
 
-The examples in this guide use a weather agent instrumented with OpenLLMetry.
-Its run `weather-7` is four spans: a workflow wrapper, a model call that asks
-for the `get_weather` tool, the tool, and a model call that answers.
+The examples in this guide use a research agent on the Anthropic SDK. A
+coordinator on `claude-opus-5-5` hands a web search to a `web-researcher`
+sub-agent on `claude-haiku-5-5` through its `Agent` tool, reads the sources
+the sub-agent found with `WebFetch`, and writes a brief. The sub-agent
+searches with `WebSearch`. The harness runs all three tools itself, so each
+call is a step of its own. The run was recorded as OpenTelemetry GenAI spans,
+prompts in OpenLLMetry's indexed layout.
+
+Its run `dr-0917` is eighteen spans, and every one is a step: the
+coordinator's `invoke_agent` span, its seven model calls, its `Agent` call
+(which holds the sub-agent's `invoke_agent` span, its two model calls and a
+`WebSearch`), and five `WebFetch` calls. It read two of its three sources
+twice.
 
 ```sh
-curl -s localhost:8080/v1/tapes/weather-7
+curl -s localhost:8080/v1/tapes/dr-0917
 ```
 
 ```json
 {
-  "run": "weather-7",
+  "run": "dr-0917",
   "tenant": null,
-  "spans_examined": 4,
+  "spans_examined": 18,
   "truncated": false,
   "steps": [
-    {
-      "index": 0,
-      "kind": "llm",
-      "name": "openai.chat",
-      "model": "gpt-6.1-sol",
-      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
-      "span_id": "llm-1",
-      "parent_span_id": "wf",
-      "service": "weather-agent",
-      "start_ns": 1791964800010000000,
-      "duration_ns": 390000000,
-      "status": "ok",
-      "request": [
-        {"role": "system", "content": "You are a weather assistant."},
-        {"role": "user", "content": "What's the weather in Paris?"}
-      ],
-      "response": [
-        {"role": "assistant", "finish_reason": "tool_calls",
-         "tool_calls": [{"id": "call_w1", "name": "get_weather", "arguments": {"city": "Paris"}}]}
-      ],
-      "request_digest": "8b9a07d4aac0a133c789406dfccd9477618c1049ca0255f58b262fc72fca3d8b",
-      "response_digest": "bc0a9a93dfc45c687262d0e46fceb83a1c7c92d362ccb045210310872c51d35f",
-      "fingerprint": "llm:gpt-6.1-sol#8b9a07d4aac0a133",
-      "tokens": {"input": 82, "output": 17, "cache_read": null, "cache_write": null, "context": 82}
-    },
+    {"index": 0, "kind": "agent", "name": "invoke_agent research-coordinator",
+     "agent": "research-coordinator", "fingerprint": "agent:research-coordinator",
+     "…": "trace, span, timing and status as below; no request or response"},
     {
       "index": 1,
+      "kind": "llm",
+      "name": "chat claude-opus-5-5",
+      "model": "claude-opus-5-5",
+      "agent": "research-coordinator",
+      "trace_id": "a41876d7175d7379e2c57700a0f32aca",
+      "span_id": "a1c7b039a39c0950",
+      "parent_span_id": "bcf07cce50a1f52c",
+      "service": "research-coordinator",
+      "start_ns": 1792375699065000000,
+      "duration_ns": 3600000000,
+      "status": "ok",
+      "request": [
+        {"role": "system", "content": "You are a research coordinator. Delegate web searches to the web-researcher subagent, read the sources it finds with WebFetch, then write a one-page brief that cites every source by URL."},
+        {"role": "user", "content": "Write a one-page brief on solid-state battery readiness for EVs in 2027, with sources."}
+      ],
+      "response": [
+        {"role": "assistant", "finish_reason": "tool_use",
+         "tool_calls": [{"id": "toolu_3f1122f4c8b6b74dc8ee54", "name": "Agent",
+                         "arguments": {"description": "Battery sources",
+                                       "prompt": "Find 2026 primary sources on solid-state battery pilot production, yields and cost per kWh.",
+                                       "subagent_type": "web-researcher"}}]}
+      ],
+      "request_digest": "ea97869dbfadddfc08be3a151877b8a2e29b6dfb7f39f1fe43e2621484244b50",
+      "response_digest": "54d13d575a267c22e2ea90d26527de3fed2cca599910b5fa55da7bea41db5818",
+      "fingerprint": "llm:claude-opus-5-5#ea97869dbfadddfc",
+      "tokens": {"input": 4, "output": 103, "cache_read": 0, "cache_write": 9840, "context": 9844},
+      "cost_usd": 0.051276
+    },
+    {
+      "index": 2,
       "kind": "tool",
-      "name": "get_weather.tool",
-      "tool": "get_weather",
-      "request": {"city": "Paris"},
-      "response": {"celsius": 12, "forecast": "rain"},
-      "fingerprint": "tool:get_weather#6e1e312d537bc71b",
+      "name": "execute_tool Agent",
+      "tool": "Agent",
+      "agent": "research-coordinator",
+      "request": {"description": "Battery sources",
+                  "prompt": "Find 2026 primary sources on solid-state battery pilot production, yields and cost per kWh.",
+                  "subagent_type": "web-researcher"},
+      "response": "Sources:\n- https://www.example-energy.org/2026/solid-state-pilot-lines: Pilot lines (2026)\n- https://www.example-batteries.com/reports/ssb-cost-2026: Cost (2026)\n- https://www.example-auto.net/news/2026-ssb-sample-cells: Samples (2026)",
+      "fingerprint": "tool:Agent#b8a25c5ef91fd1e8",
       "tokens": {"input": null, "output": null, "cache_read": null, "cache_write": null, "context": null},
       "…": "trace, span, timing, status and digests as above"
     },
-    {"index": 2, "kind": "llm", "…": "the model call that answers"}
+    {"index": 3, "kind": "agent", "name": "invoke_agent web-researcher", "…": "the sub-agent; steps 4 to 6 are its own"},
+    {"index": 4, "kind": "llm", "model": "claude-haiku-5-5", "agent": "web-researcher", "…": "…"},
+    {"…": "steps 5 to 17"}
   ]
 }
 ```
 
 (The response is abbreviated where marked; the server returns keys in sorted
-order.) Requests and responses are read with the same precedence the store
+order.) The coordinator's `tokens.context` is its input plus both cache
+counters, because an Anthropic call's input leaves the cache out.
+`cost_usd` is priced from the server's `--pricing` file at list rates: these
+spans carry no cost of their own.
+
+Requests and responses are read with the same precedence the store
 uses everywhere — OTel GenAI `gen_ai.input.messages`, OpenLLMetry's indexed
 `gen_ai.prompt.{i}.*`, OpenInference's `llm.input_messages.{i}.message.*`,
 Traza's native events — and the indexed layouts all fold to one message shape.
@@ -145,21 +173,21 @@ refused at step 2, naming the step.
 ```sh
 curl -s -X POST localhost:8080/v1/replays \
   -H "Authorization: Bearer $TRAZA_TOKEN" \
-  -d '{"run": "weather-7"}'
+  -d '{"run": "dr-0917"}'
 ```
 
 ```json
 {
-  "id": "rp_ac879985abef9cba12bb342bdc3b8bd1",
-  "run": "weather-7",
+  "id": "rp_03dcdadb9395a8770c836a73da8c1576",
+  "run": "dr-0917",
   "mode": "strict",
-  "steps": 3,
-  "llm_steps": 2,
-  "expires_at_ns": 1792065649987347000,
+  "steps": 18,
+  "llm_steps": 9,
+  "expires_at_ns": 1792390239903228000,
   "unreadable_tool_steps": [],
   "base_urls": {
-    "openai": "/v1/replays/rp_ac879985abef9cba12bb342bdc3b8bd1/openai/v1",
-    "anthropic": "/v1/replays/rp_ac879985abef9cba12bb342bdc3b8bd1/anthropic"
+    "openai": "/v1/replays/rp_03dcdadb9395a8770c836a73da8c1576/openai/v1",
+    "anthropic": "/v1/replays/rp_03dcdadb9395a8770c836a73da8c1576/anthropic"
   }
 }
 ```
@@ -186,16 +214,16 @@ those spans hold, so nothing past them is served.
 **3. Point the SDK at it and run the agent.**
 
 ```sh
-export OPENAI_BASE_URL=http://localhost:8080/v1/replays/rp_ac879985abef9cba12bb342bdc3b8bd1/openai/v1
-export OPENAI_API_KEY=$TRAZA_TOKEN
-python weather_agent.py
+export ANTHROPIC_BASE_URL=http://localhost:8080/v1/replays/rp_03dcdadb9395a8770c836a73da8c1576/anthropic
+export ANTHROPIC_API_KEY=$TRAZA_TOKEN
+python research.py
 ```
 
-For an agent on the Anthropic SDK:
+For an agent on the OpenAI SDK:
 
 ```sh
-export ANTHROPIC_BASE_URL=http://localhost:8080/v1/replays/rp_ac879985abef9cba12bb342bdc3b8bd1/anthropic
-export ANTHROPIC_API_KEY=$TRAZA_TOKEN
+export OPENAI_BASE_URL=http://localhost:8080/v1/replays/rp_03dcdadb9395a8770c836a73da8c1576/openai/v1
+export OPENAI_API_KEY=$TRAZA_TOKEN
 ```
 
 The OpenAI SDK sends its key as `Authorization: Bearer`; the Anthropic SDK
@@ -205,69 +233,77 @@ sends `x-api-key`, which Traza accepts as the credential on the routes under
 credential of either kind) any non-empty key works — the SDKs refuse to start
 without one.
 
-The agent's first call — `POST …/openai/v1/chat/completions` with the system
-and user messages — receives the recorded answer as an ordinary
-`ChatCompletion`:
+The agent's first call — `POST …/anthropic/v1/messages` with the
+coordinator's system prompt and the task — receives the recorded answer as an
+ordinary `Message`:
 
 ```json
 {
-  "id": "chatcmpl-trazaac879985abefs0",
-  "object": "chat.completion",
-  "created": 1791964800,
-  "model": "gpt-6.1-sol",
-  "choices": [{
-    "index": 0,
-    "message": {
-      "role": "assistant",
-      "content": null,
-      "refusal": null,
-      "tool_calls": [{"id": "call_w1", "type": "function",
-                      "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]
-    },
-    "logprobs": null,
-    "finish_reason": "tool_calls"
+  "id": "msg_traza03dcdadb9395s1",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-opus-5-5",
+  "content": [{
+    "type": "tool_use",
+    "id": "toolu_3f1122f4c8b6b74dc8ee54",
+    "name": "Agent",
+    "input": {"description": "Battery sources",
+              "prompt": "Find 2026 primary sources on solid-state battery pilot production, yields and cost per kWh.",
+              "subagent_type": "web-researcher"}
   }],
-  "usage": {"prompt_tokens": 82, "completion_tokens": 17, "total_tokens": 99},
-  "system_fingerprint": null
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {"input_tokens": 4, "output_tokens": 103,
+            "cache_creation_input_tokens": 9840, "cache_read_input_tokens": 0}
 }
 ```
 
-The model, `created` time, tool-call ids and token usage are the recording's.
-An id the recording did not carry (here, the response id) is made up from the
+The model, tool-use ids, stop reason and token usage are the recording's.
+An id the recording did not carry (here, the message id) is made up from the
 replay id and the step; a recording with no model gets the request's `model`
 back, or `"unknown"`. A model name or response id longer than 256 bytes —
 recorded or requested — is treated as absent: a stream repeats both in every
-chunk, and no provider's come close. The agent then runs `get_weather`
-itself, sends the result back, and receives the recorded final answer.
+chunk, and no provider's come close. The agent then runs its `Agent` tool:
+the sub-agent's two model calls are answered from the tape too. The
+coordinator gets the sub-agent's list of sources back, fetches them, and
+receives the recorded brief.
 
 **4. Check what was served.**
 
 ```sh
-curl -s localhost:8080/v1/replays/rp_ac879985abef9cba12bb342bdc3b8bd1 \
+curl -s localhost:8080/v1/replays/rp_03dcdadb9395a8770c836a73da8c1576 \
   -H "Authorization: Bearer $TRAZA_TOKEN"
 ```
 
 ```json
 {
-  "id": "rp_ac879985abef9cba12bb342bdc3b8bd1",
-  "run": "weather-7",
+  "id": "rp_03dcdadb9395a8770c836a73da8c1576",
+  "run": "dr-0917",
   "mode": "strict",
-  "served": 2,
+  "served": 9,
   "remaining": 0,
   "diverged": null,
   "calls": [
-    {"step": 0, "matched": true, "at_ns": 1792062055501840000},
-    {"step": 2, "matched": true, "at_ns": 1792062063623225000}
+    {"step": 1, "matched": true, "at_ns": 1792386640619999959},
+    {"step": 4, "matched": true, "at_ns": 1792386640634349250},
+    {"step": 6, "matched": true, "at_ns": 1792386640664281500},
+    {"step": 7, "matched": true, "at_ns": 1792386640666475709},
+    {"step": 9, "matched": true, "at_ns": 1792386640670235792},
+    {"step": 11, "matched": true, "at_ns": 1792386640683857583},
+    {"step": 13, "matched": true, "at_ns": 1792386640690883042},
+    {"step": 15, "matched": true, "at_ns": 1792386640696399959},
+    {"step": 17, "matched": true, "at_ns": 1792386640702492541}
   ],
   "exhausted_calls": 0,
   "unreadable_tool_steps": [],
-  "expires_at_ns": 1792065649987347000
+  "expires_at_ns": 1792390239903228000
 }
 ```
 
-Both recorded model steps were served and both requests matched the
-recording. Nothing was sent to a model provider: the replay routes make no
-outbound request of any kind. A third model call would get `410` with
+All nine recorded model steps were served, the coordinator's seven and the
+sub-agent's two, and every request matched the recording. Nothing was sent to
+a model provider: the replay routes make no outbound request of any kind. A
+tenth model call would get `410` with
 `{"error": {"type": "replay_exhausted", …}}`, and `exhausted_calls` would
 count it.
 
@@ -278,22 +314,40 @@ With `"stream": true` the answer comes back as server-sent events —
 usage chunk when `stream_options.include_usage` is set), and `message_start`,
 `content_block_start` / `_delta` / `_stop`, `message_delta`, `message_stop`
 for Anthropic, with tool calls as `tool_calls` argument deltas and
-`input_json_delta` respectively:
+`input_json_delta` respectively. The coordinator's last call, streamed:
 
 ```text
-data: {"choices":[{"delta":{"content":"","refusal":null,"role":"assistant"},"finish_reason":null,"index":0,"logprobs":null}],"created":1791964800,"id":"chatcmpl-trazaac879985abefs2","model":"gpt-6.1-sol","object":"chat.completion.chunk","system_fingerprint":null}
+event: message_start
+data: {"message":{"content":[],"id":"msg_traza3c4fb48b26c3s17","model":"claude-opus-5-5","role":"assistant","stop_reason":null,"stop_sequence":null,"type":"message","usage":{"cache_creation_input_tokens":5499,"cache_read_input_tokens":33661,"input_tokens":5,"output_tokens":0}},"type":"message_start"}
 
-data: {"choices":[{"delta":{"content":"It's raining in "},"finish_reason":null,"index":0,"logprobs":null}],…}
+event: content_block_start
+data: {"content_block":{"text":"","type":"text"},"index":0,"type":"content_block_start"}
 
-data: {"choices":[{"delta":{"content":"Paris, 12°C. "},"finish_reason":null,"index":0,"logprobs":null}],…}
+event: content_block_delta
+data: {"delta":{"text":"Solid-state ","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
-data: {"choices":[{"delta":{"content":"Take an "},"finish_reason":null,"index":0,"logprobs":null}],…}
+event: content_block_delta
+data: {"delta":{"text":"batteries in ","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
-data: {"choices":[{"delta":{"content":"umbrella."},"finish_reason":null,"index":0,"logprobs":null}],…}
+event: content_block_delta
+data: {"delta":{"text":"2027: pilot ","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
-data: {"choices":[{"delta":{},"finish_reason":"stop","index":0,"logprobs":null}],…}
+…
 
-data: [DONE]
+event: content_block_delta
+data: {"delta":{"text":"launches after ","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"delta":{"text":"2028.","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+event: content_block_stop
+data: {"index":0,"type":"content_block_stop"}
+
+event: message_delta
+data: {"delta":{"stop_reason":"end_turn","stop_sequence":null},"type":"message_delta","usage":{"output_tokens":1900}}
+
+event: message_stop
+data: {"type":"message_stop"}
 ```
 
 **The stream is reconstructed from the stored text.** No instrumentation
@@ -317,26 +371,35 @@ said rather than how its instrumentation spelled it. That includes
 as they would have been inline. For the indexed layouts and native events the
 recorded digest is exactly the tape's `request_digest`.
 
-A request that does not match is refused and **does not consume the step**:
+A request that does not match is refused and **does not consume the step**.
+Here the harness was changed to refuse to fetch a URL twice. At step 12 the
+coordinator asks again for the pilot-lines page it read at step 8; the new
+harness answers from what it already has instead, and the next model call,
+step 13, carries that answer rather than the page:
 
 ```text
 HTTP/1.1 409 Conflict
 Content-Type: application/json
 x-should-retry: false
 
-{"error":{"type":"replay_divergence","step":2,
-  "message":"this request's messages do not match recorded step 2: the agent diverged from the recording, so replaying the recorded answer would answer a different question",
-  "expected_digest":"6db28425e9e18cdbf0bb3dd925d6afa9352b5f91e8a33438e5d4a29f03993f9d",
-  "got_digest":"cd1ff438bb759f43d89b1089fc5ca10b67a08a6311fee65adc9d4bee844c8fc3"}}
+{"error":{"type":"replay_divergence","step":13,
+  "message":"this request's messages do not match recorded step 13: the agent diverged from the recording, so replaying the recorded answer would answer a different question",
+  "difference":{"message":9,"role":"user","field":"content","at_char":13,
+    "recorded":"[{\"content\":\"Pilot lines (2026): three cell makers ran solid-state pilot lines at 0.2 to 1 GWh a year. First-pass yields…",
+    "got":"[{\"content\":\"Already fetched https://www.example-energy.org/2026/solid-state-pilot-lines earlier in this run; reusing th…",
+    "recorded_messages":10,"got_messages":10},
+  "expected_digest":"38d64ab342a7ff12be1b446cc0209eecabbae76f5d4ec73b59a9e88a178ddd6d",
+  "got_digest":"2d02f0080506df8f483cde7735ec2240ee801fdbd82f82836201aa8a882f0cb1"},
+ "type":"error"}
 ```
 
 The refusal also says **where** the request first differs, when the recorded
 request can be read again: `difference` names the message, its role, the
 field (`role`, `content`, `tool_call_id`, `tool_calls`, or `missing` /
-`extra`), the character, and a quote of each side — `{"message": 1, "role":
-"user", "field": "content", "at_char": 22, "recorded": "What's the weather
-in Paris?", "got": "What's the weather in Lyon?", …}`. The replay keeps it
-with its first divergence. Explaining costs a re-read of the recording, so a
+`extra`), the character, and a quote of each side. Here it is message 9, the
+user turn carrying the fetched page, at character 13 — the first character of
+the tool result's text, past `[{"content":"`. The replay keeps it with its
+first divergence. Explaining costs a re-read of the recording, so a
 replay does it at most 8 times; past that a divergence is refused without
 one. It is what makes a strict replay a usable
 [tape test](fork.md#tape-tests).
@@ -372,13 +435,16 @@ agent runs the real tool, with its real side effects. For a tool whose result
 you want replayed, take it from the recording instead:
 
 ```sh
-curl -s -X POST localhost:8080/v1/replays/rp_ac879985abef9cba12bb342bdc3b8bd1/tools/next \
+curl -s -X POST localhost:8080/v1/replays/rp_d740106ef258077a5bf96fdd660ef813/tools/next \
   -H "Authorization: Bearer $TRAZA_TOKEN" \
-  -d '{"tool": "get_weather"}'
+  -d '{"tool": "WebFetch"}'
 ```
 
 ```json
-{"step": 1, "tool": "get_weather", "arguments": {"city": "Paris"}, "result": {"celsius": 12, "forecast": "rain"}}
+{"step": 8, "tool": "WebFetch",
+ "arguments": {"prompt": "List the 2026 figures on pilot lines, yields, cost per kWh and sample cells.",
+               "url": "https://www.example-energy.org/2026/solid-state-pilot-lines"},
+ "result": "Pilot lines (2026): three cell makers ran solid-state pilot lines at 0.2 to 1 GWh a year. First-pass yields were reported between 60% and 75%."}
 ```
 
 Each call returns the next recorded tool step not yet served (the next one
@@ -418,37 +484,61 @@ its copy until it expires, at most an hour later.
 ## Comparing two runs
 
 `GET /v1/diff?a=<run>&b=<run>` aligns two runs' steps and names the first
-place they diverge. Here the second run asked about Lyon instead of Paris:
+place they diverge. Here the second run is `dr-0917-dedupe`, the same task
+run again under the harness that refuses to fetch a URL twice — a
+[fork](fork.md#finding-a-runs-forks) of `dr-0917`:
 
 ```sh
-curl -s "localhost:8080/v1/diff?a=weather-7&b=weather-8"
+curl -s "localhost:8080/v1/diff?a=dr-0917&b=dr-0917-dedupe"
 ```
 
 ```json
 {
-  "a": {"run": "weather-7", "steps": 3, "cost_usd": 0.0, "tokens": 233,
-        "duration_ns": 1000000000, "errors": 0, "outcome": "success", "truncated": false},
-  "b": {"run": "weather-8", "steps": 3, "cost_usd": 0.0, "tokens": 233,
-        "duration_ns": 1000000000, "errors": 0, "outcome": "success", "truncated": false},
+  "a": {"run": "dr-0917", "steps": 18, "cost_usd": 0.27121787500000005, "tokens": 3341,
+        "duration_ns": 58335000000, "errors": 0, "outcome": "success", "truncated": false},
+  "b": {"run": "dr-0917-dedupe", "steps": 16, "cost_usd": 0.202954675, "tokens": 3236,
+        "duration_ns": 51257000000, "errors": 0, "outcome": "success", "truncated": false},
   "aligned": [
-    {"op": "changed", "why": "input", "a": 0, "b": 0,
-     "fingerprint_a": "llm:gpt-6.1-sol#8b9a07d4aac0a133",
-     "fingerprint_b": "llm:gpt-6.1-sol#1ae84ec741143bc4"},
-    {"op": "changed", "why": "input", "a": 1, "b": 1,
-     "fingerprint_a": "tool:get_weather#6e1e312d537bc71b",
-     "fingerprint_b": "tool:get_weather#ac8cc520a3295a36"},
-    {"op": "changed", "why": "input", "a": 2, "b": 2,
-     "fingerprint_a": "llm:gpt-6.1-sol#6db28425e9e18cdb",
-     "fingerprint_b": "llm:gpt-6.1-sol#592c7b1d345f6104"}
+    {"op": "same", "a": 0, "b": 0,
+     "fingerprint_a": "agent:research-coordinator",
+     "fingerprint_b": "agent:research-coordinator"},
+    {"…": "steps 1 to 10, each the same"},
+    {"op": "same", "a": 11, "b": 11,
+     "fingerprint_a": "llm:claude-opus-5-5#a3220904e522c49f",
+     "fingerprint_b": "llm:claude-opus-5-5#a3220904e522c49f"},
+    {"op": "changed", "why": "decision", "a": 12, "b": 12,
+     "fingerprint_a": "tool:WebFetch#4d0747980d9ec482",
+     "fingerprint_b": "tool:WebFetch#4d0747980d9ec482"},
+    {"op": "changed", "why": "input", "a": 13, "b": 13,
+     "fingerprint_a": "llm:claude-opus-5-5#38d64ab342a7ff12",
+     "fingerprint_b": "llm:claude-opus-5-5#2d02f0080506df8f"},
+    {"op": "same", "a": 14, "b": 14,
+     "fingerprint_a": "tool:WebFetch#8e9833ed4fb157ae",
+     "fingerprint_b": "tool:WebFetch#8e9833ed4fb157ae"},
+    {"op": "changed", "why": "input", "a": 15, "b": 15,
+     "fingerprint_a": "llm:claude-opus-5-5#5955c288ffbd662a",
+     "fingerprint_b": "llm:claude-opus-5-5#a5db4b2e5928b433"},
+    {"op": "delete", "why": "structure", "a": 16, "b": null,
+     "fingerprint_a": "tool:WebFetch#9bd78904d70ddce1", "fingerprint_b": null},
+    {"op": "delete", "why": "structure", "a": 17, "b": null,
+     "fingerprint_a": "llm:claude-opus-5-5#93bc8c819bb7abc8", "fingerprint_b": null}
   ],
   "first_divergence": {
-    "a": 0, "b": 0, "kind": "input",
-    "explanation": "step 0 of a and step 0 of b (llm:gpt-6.1-sol) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b"
+    "a": 12, "b": 12, "kind": "decision",
+    "explanation": "step 12 of a and step 12 of b (tool:WebFetch) received the same input and produced a different output: response e450b5a73db1 in a, 750af04196bb in b"
   },
-  "delta": {"cost_usd": 0.0, "tokens": 0, "duration_ns": 0, "errors": 0, "steps": 0},
+  "delta": {"cost_usd": -0.06826320000000005, "tokens": -105, "duration_ns": -7078000000,
+            "errors": 0, "steps": -2},
   "truncated": false
 }
 ```
+
+Steps 0 to 11 are the same. At step 12 the same
+`WebFetch` request got a different answer — the page in `a`, the harness's
+"already fetched" note in `b` — so it is a `decision`. The next model call saw
+that answer, so its input changed; the fork never re-read the cost page, so
+`a`'s last fetch and the call after it have no partner. The fork is two steps
+shorter and about seven cents cheaper.
 
 Steps are aligned by longest common subsequence over their **signatures** —
 `kind:name`, the fingerprint without its input hash — so an extra or missing
@@ -468,7 +558,7 @@ that both name a model and sit in the same unaligned stretch are paired as one
 `config` change.
 
 `cost_usd` is the run's metered cost, or its cost priced from `--pricing` —
-`0.0` here because these spans carry neither. Each side is compared up to its
+priced here, because these spans carry no cost of their own. Each side is compared up to its
 first 5,000 steps; past that the diff says `"truncated": true`, and its tail
 may report steps as missing that the cut removed. Each side is also read up to
 its first 50,000 spans: a side longer than that says `"truncated": true` in
@@ -500,27 +590,35 @@ successful runs first, then the runs with more matching spans, then the most
 recent.
 
 ```sh
-curl -s "localhost:8080/v1/recall?q=weather+Paris"
+curl -s "localhost:8080/v1/recall?q=solid-state+battery&limit=1"
 ```
 
 ```json
 {
   "runs": [{
-    "run": "weather-7",
+    "run": "dr-0917",
     "tenant": "",
     "outcome": "success",
     "outcome_source": "derived",
-    "score": 3,
-    "last_end_ns": 1791964801000000000,
-    "steps": 3,
-    "cost_usd": 0.0,
-    "skeleton": ["llm:gpt-6.1-sol", "tool:get_weather", "llm:gpt-6.1-sol"],
+    "score": 11,
+    "last_end_ns": 1792375757395000000,
+    "steps": 18,
+    "cost_usd": 0.27121787500000005,
+    "skeleton": ["agent:research-coordinator", "llm:claude-opus-5-5", "tool:Agent",
+                 "agent:web-researcher", "llm:claude-haiku-5-5", "tool:WebSearch",
+                 "llm:claude-haiku-5-5", "llm:claude-opus-5-5", "tool:WebFetch",
+                 "llm:claude-opus-5-5", "tool:WebFetch", "llm:claude-opus-5-5",
+                 "tool:WebFetch", "llm:claude-opus-5-5", "tool:WebFetch",
+                 "llm:claude-opus-5-5", "tool:WebFetch", "llm:claude-opus-5-5"],
     "skeleton_truncated": false,
     "truncated": false
   }],
   "truncated": false
 }
 ```
+
+Without `limit=1` the fork `dr-0917-dedupe` comes second: it succeeded too,
+with 10 matching spans to the original's 11.
 
 The **skeleton** is what the run did without quoting what it said: its step
 signatures in order, consecutive repeats folded (`"tool:search x3"`), at most
@@ -586,8 +684,9 @@ telemetry choose which recording its next run is fed. See the
   is an OpenInference JSON `output.value` that holds no provider response
   (no `choices`, not a message): it is served as its own text.
 - **JSON-shaped tool-call arguments come back compact.** Arguments recorded as
-  `{"city": "Paris"}` are served as `{"city":"Paris"}`, keys sorted; the
-  normalisation compares them as JSON, so this never causes a divergence.
+  `{"url": "https://…", "prompt": "…"}` are served as
+  `{"prompt":"…","url":"https://…"}`, keys sorted; the normalisation compares
+  them as JSON, so this never causes a divergence.
 - **A served response is at most 64 MiB**, streamed or not. A stream repeats
   fixed fields in every chunk and splits tool-call arguments into many, so a
   recording of thousands of tiny tool calls can stream to hundreds of times

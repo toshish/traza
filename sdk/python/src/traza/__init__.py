@@ -63,7 +63,7 @@ from .forking import Fork  # noqa: E402
 
 def fork(run: str, at_step: int, response: Any = None, *, client: Optional[Client] = None, **options: Any) -> Fork:
     """:meth:`Client.fork` on ``client``, or on :meth:`Client.from_env` —
-    ``with traza.fork("run-7", at_step=2, response="It is sunny.") as f: ...``."""
+    ``with traza.fork("dr-0917", at_step=10, tool_result={"error": "fetch failed: 404"}) as f: ...``."""
     return (client or Client.from_env()).fork(run, at_step, response, **options)
 
 

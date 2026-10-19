@@ -7,9 +7,18 @@ recording never took::
 
     import traza
 
-    with traza.fork("weather-7", at_step=2, response="It is sunny in Paris.") as fork:
-        run_agent("What's the weather in Paris?")   # steps 0-1 replayed, 2 edited, then live
+    with traza.fork("dr-0917", at_step=10, tool_result={"error": "fetch failed: 404"}) as fork:
+        run_research(TASK, recorded=fork.tool_result)   # steps 0-9 replayed, 10 edited, then live
     print(fork.id, fork.status().fork.live_calls)
+
+Before it runs a tool of its own (the search, a fetch), the harness asks
+``recorded`` for that tool's result. It uses the step's ``result`` when one
+comes back — the edit, at step 10 — and runs the real tool on ``None``, as
+it does past the cut. The ``Agent`` tool still runs the sub-agent, whose
+model calls are on the tape.
+:meth:`Fork.call_tool` makes that choice in one call. The switch carries
+model calls only, so an edited tool result reaches the agent through its
+harness or not at all.
 
 Inside the ``with`` block ``OPENAI_BASE_URL`` and ``ANTHROPIC_BASE_URL``
 point at a *switch*: a small HTTP server on a loopback port, private to this

@@ -3,11 +3,11 @@
 ::
 
     traza test -- python agent.py --task "{input}"     # every golden run, JUnit XML on stdout
-    traza test --junit report.xml --run weather-7 -- python agent.py
-    traza golden add weather-7                          # make a run a regression test
+    traza test --junit report.xml --run dr-0917 -- python agent.py
+    traza golden add dr-0917                            # make a run a regression test
     traza golden list
-    traza forks weather-7                               # its branches and where they parted
-    traza fork weather-7 --at 2 --response "It is sunny." -- python agent.py
+    traza forks dr-0917                                 # its branches and where they parted
+    traza fork dr-0917 --at 10 --tool-result '{"error": "fetch failed: 404"}' -- python research.py
     traza forward --upstream https://api.trazadb.com    # plain HTTP on 127.0.0.1:8089, TLS upstream
 
 The server is ``--url`` (default ``TRAZA_URL``, else ``http://127.0.0.1:8080``)
@@ -183,10 +183,16 @@ def _cmd_fork(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         options["response"] = json.loads(args.response_json)
     if args.tool_result is not None:
         options["tool_result"] = json.loads(args.tool_result)
-    fork = _client(args).fork(args.run, args.at, live=not args.no_live, set_env=False, **options)
+    client = _client(args)
+    fork = client.fork(args.run, args.at, live=not args.no_live, set_env=False, **options)
     with fork:
         env = dict(os.environ)
         env.update(fork.env())
+        # The harness asks the server for its tool results, the edit among
+        # them: tell it where the server is, as well as the switch.
+        env["TRAZA_URL"] = client.url
+        if client.tenant is not None:
+            env["TRAZA_TENANT"] = client.tenant
         _say(f"fork {fork.id} of {args.run}, cut at step {fork.step}; its run records as {fork.run_id}")
         code = subprocess.call(command, env=env)
     status = fork.final_status
@@ -239,7 +245,8 @@ def build_parser() -> argparse.ArgumentParser:
     fork.add_argument("--at", type=int, required=True, help="the tape step to cut at")
     fork.add_argument("--response", help="answer text served at the step")
     fork.add_argument("--response-json", help="an assistant message, as JSON, served at the step")
-    fork.add_argument("--tool-result", help="a tool result, as JSON, served at the step")
+    fork.add_argument("--tool-result", help="a tool result, as JSON, served at the step by "
+                      "POST $TRAZA_URL/v1/replays/$TRAZA_REPLAY_ID/tools/next, which the agent's harness asks")
     fork.add_argument("--no-live", action="store_true", help="after the edit, keep serving the recording")
 
     _forward.add_arguments(commands.add_parser(

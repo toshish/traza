@@ -4,9 +4,11 @@
 //! harness recorded found again and diffed against their parent, and the
 //! runs marked golden listed for a test runner — all under tenant binding.
 //!
-//! Runs are seeded the way OpenLLMetry's OpenAI instrumentation records them
+//! Runs are seeded the way OpenLLMetry's instrumentations record them
 //! (indexed `gen_ai.prompt.{i}.*`), and the provider routes are driven with
-//! raw HTTP shaped as the official SDKs send it.
+//! raw HTTP shaped as the official SDKs send it. The mechanics are tested on
+//! a small weather run; the last test walks `dr-0917`, the research run the
+//! replay and fork guides print, and holds every output they show.
 
 mod common;
 
@@ -98,8 +100,8 @@ fn weather_run(session: &str, trace: &str, at_ms: u64, forecast: &str, extra: Va
             at_ms + 400,
             json!({
                 "gen_ai.system": "openai", "llm.request.type": "chat",
-                "gen_ai.request.model": "gpt-4o",
-                "gen_ai.response.model": "gpt-4o-2024-08-06",
+                "gen_ai.request.model": "gpt-6.1-sol",
+                "gen_ai.response.model": "gpt-6.1-sol",
                 "gen_ai.response.id": "chatcmpl-AbC123",
                 "gen_ai.usage.prompt_tokens": 82, "gen_ai.usage.completion_tokens": 17,
                 "gen_ai.prompt.0.role": "system", "gen_ai.prompt.0.content": SYSTEM,
@@ -131,8 +133,8 @@ fn weather_run(session: &str, trace: &str, at_ms: u64, forecast: &str, extra: Va
             at_ms + 900,
             json!({
                 "gen_ai.system": "openai", "llm.request.type": "chat",
-                "gen_ai.request.model": "gpt-4o",
-                "gen_ai.response.model": "gpt-4o-2024-08-06",
+                "gen_ai.request.model": "gpt-6.1-sol",
+                "gen_ai.response.model": "gpt-6.1-sol",
                 "gen_ai.usage.prompt_tokens": 120, "gen_ai.usage.completion_tokens": 14,
                 "gen_ai.prompt.0.role": "system", "gen_ai.prompt.0.content": SYSTEM,
                 "gen_ai.prompt.1.role": "user", "gen_ai.prompt.1.content": USER,
@@ -167,14 +169,14 @@ fn ingest(server: &Server, spans: Vec<Value>, token: &str) {
 
 /// The two requests the weather agent's OpenAI SDK sends.
 fn first_request() -> Value {
-    json!({"model": "gpt-4o", "messages": [
+    json!({"model": "gpt-6.1-sol", "messages": [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": USER},
     ]})
 }
 
 fn second_request(tool_result: &str) -> Value {
-    json!({"model": "gpt-4o", "messages": [
+    json!({"model": "gpt-6.1-sol", "messages": [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": USER},
         {"role": "assistant", "content": null, "tool_calls": [{
@@ -298,7 +300,7 @@ fn a_fork_serves_its_edit_then_hands_the_run_to_the_real_provider() {
         "POST",
         &format!("/v1/replays/{replay}/anthropic/v1/messages"),
         Some(
-            &json!({"model": "claude-x", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}),
+            &json!({"model": "claude-opus-5-5", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}),
         ),
         &[
             ("x-api-key", ACME.to_owned()),
@@ -531,7 +533,7 @@ fn a_divergence_says_which_message_differs_and_where() {
         &server,
         "POST",
         &format!("/v1/replays/{replay}/anthropic/v1/messages"),
-        Some(&json!({"model": "claude-x", "max_tokens": 64,
+        Some(&json!({"model": "claude-opus-5-5", "max_tokens": 64,
                      "messages": [{"role": "user", "content": USER}]})),
         &[
             ("x-api-key", ACME.to_owned()),
@@ -1087,4 +1089,1060 @@ fn an_annotation_walk_never_outlives_its_query_budget() {
             "{path}: {body}"
         );
     }
+}
+
+// ------------------------------------------------------------ the guides' research run
+
+// `dr-0917`, the run the replay and fork guides (and the SDK READMEs) print,
+// built span for span as the site's demo script records it: a coordinator on
+// claude-opus-5-5 hands a web search to a web-researcher sub-agent on
+// claude-haiku-5-5 through its `Agent` tool, then reads the sources with
+// `WebFetch`; the sub-agent searches with `WebSearch`. The harness runs every
+// tool itself, so each is a step. Prompts are OpenLLMetry's indexed layout,
+// with the cache counters Anthropic reports. Every digest, fingerprint, quote
+// and cost the guides print comes from these bytes: the test below is what
+// keeps them true.
+
+const RS_COORDINATOR: &str = "You are a research coordinator. Delegate web searches to the \
+    web-researcher subagent, read the sources it finds with WebFetch, then write a one-page brief \
+    that cites every source by URL.";
+const RS_WORKER: &str = "You are web-researcher. Search the web and reply with the most relevant \
+    primary sources, one line each, with their URLs.";
+const RS_TASK: &str =
+    "Write a one-page brief on solid-state battery readiness for EVs in 2027, with sources.";
+const RS_BRIEF: &str =
+    "Find 2026 primary sources on solid-state battery pilot production, yields and cost per kWh.";
+const RS_QUERY: &str = "solid-state battery pilot line yield cost per kWh 2026";
+const RS_FETCH_PROMPT: &str =
+    "List the 2026 figures on pilot lines, yields, cost per kWh and sample cells.";
+const RS_URLS: [&str; 3] = [
+    "https://www.example-energy.org/2026/solid-state-pilot-lines",
+    "https://www.example-batteries.com/reports/ssb-cost-2026",
+    "https://www.example-auto.net/news/2026-ssb-sample-cells",
+];
+const RS_PAGES: [&str; 3] = [
+    "Pilot lines (2026): three cell makers ran solid-state pilot lines at 0.2 to 1 GWh a year. \
+     First-pass yields were reported between 60% and 75%.",
+    "Cost (2026): solid-state cells were estimated at $180 to $240 per kWh, against about $95 for \
+     LFP. The gap narrows only with sulfide electrolyte scale-up after 2028.",
+    "Samples (2026): two automakers began road tests of B-sample solid-state cells late in the \
+     year. Neither committed to a 2027 production vehicle.",
+];
+/// The size each page extract was reported at, in tokens.
+const RS_PAGE_TOKENS: [u64; 3] = [6_200, 5_400, 4_800];
+const RS_FINAL: &str = "Solid-state batteries in 2027: pilot scale, not production. Pilot lines \
+    ran at 0.2 to 1 GWh a year in 2026 with 60 to 75% first-pass yields; cells cost $180 to $240 \
+    per kWh against about $95 for LFP; automakers are road-testing B-samples but none has \
+    committed to a 2027 vehicle. Expect limited premium launches after 2028.";
+/// The list rates the guides' server was started with (`--pricing`).
+const RS_PRICING: &str = r#"{"models": {
+    "claude-opus-5-5": {"input_per_mtok": 4.0, "output_per_mtok": 20.0,
+                        "cache_read_per_mtok": 0.2, "cache_write_per_mtok": 5.0},
+    "claude-haiku-5-5": {"input_per_mtok": 0.1, "output_per_mtok": 0.5,
+                         "cache_read_per_mtok": 0.01, "cache_write_per_mtok": 0.125}}}"#;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Who {
+    Coordinator,
+    Worker,
+}
+
+impl Who {
+    fn model(self) -> &'static str {
+        match self {
+            Who::Coordinator => "claude-opus-5-5",
+            Who::Worker => "claude-haiku-5-5",
+        }
+    }
+    fn agent(self) -> &'static str {
+        match self {
+            Who::Coordinator => "research-coordinator",
+            Who::Worker => "web-researcher",
+        }
+    }
+    fn system(self) -> &'static str {
+        match self {
+            Who::Coordinator => RS_COORDINATOR,
+            Who::Worker => RS_WORKER,
+        }
+    }
+    /// The cached prefix: the agent's system prompt and tool definitions.
+    fn prefix(self) -> u64 {
+        match self {
+            Who::Coordinator => 9_800,
+            Who::Worker => 2_600,
+        }
+    }
+}
+
+/// A JSON object with its keys in the given order, as the harness's
+/// `JSON.stringify` writes it; each value is already JSON.
+fn rs_object(pairs: &[(&str, String)]) -> String {
+    let fields: Vec<String> = pairs
+        .iter()
+        .map(|(key, value)| format!("{}:{value}", json!(key)))
+        .collect();
+    format!("{{{}}}", fields.join(","))
+}
+
+fn rs_str(text: &str) -> String {
+    json!(text).to_string()
+}
+
+/// One step of the run as the harness lives it.
+enum Plan {
+    /// A model call answered with a tool call: the tool and its arguments, as written.
+    Ask(Who, &'static str, String),
+    /// A model call answered with text; `true` when it is the sub-agent's last.
+    Say(Who, &'static str, bool),
+    /// A tool the harness ran: name, result, its size in tokens, and whether
+    /// the deduping harness answered it from what it already had.
+    Run(&'static str, String, u64, bool),
+}
+
+/// The research run's plan: `fetches` are the pages the coordinator reads, in
+/// order; `dedupe` is the harness that refuses to fetch a URL twice.
+fn research_plan(fetches: &[usize], dedupe: bool) -> Vec<Plan> {
+    let mut plan = vec![
+        Plan::Ask(
+            Who::Coordinator,
+            "Agent",
+            rs_object(&[
+                ("description", rs_str("Battery sources")),
+                ("prompt", rs_str(RS_BRIEF)),
+                ("subagent_type", rs_str("web-researcher")),
+            ]),
+        ),
+        Plan::Ask(
+            Who::Worker,
+            "WebSearch",
+            rs_object(&[("query", rs_str(RS_QUERY))]),
+        ),
+    ];
+    let search: Vec<String> = RS_URLS
+        .iter()
+        .enumerate()
+        .map(|(index, url)| format!("{}. {url}", index + 1))
+        .collect();
+    plan.push(Plan::Run("WebSearch", search.join("\n"), 380, false));
+    plan.push(Plan::Say(Who::Worker, "findings", true));
+    let mut seen = Vec::new();
+    for &page in fetches {
+        plan.push(Plan::Ask(
+            Who::Coordinator,
+            "WebFetch",
+            rs_object(&[
+                ("url", rs_str(RS_URLS[page])),
+                ("prompt", rs_str(RS_FETCH_PROMPT)),
+            ]),
+        ));
+        if dedupe && seen.contains(&page) {
+            let note = format!(
+                "Already fetched {} earlier in this run; reusing that result.",
+                RS_URLS[page]
+            );
+            plan.push(Plan::Run("WebFetch", note, 40, true));
+        } else {
+            plan.push(Plan::Run(
+                "WebFetch",
+                RS_PAGES[page].to_owned(),
+                RS_PAGE_TOKENS[page],
+                false,
+            ));
+        }
+        seen.push(page);
+    }
+    plan.push(Plan::Say(Who::Coordinator, "brief", false));
+    plan
+}
+
+fn rs_findings() -> String {
+    let lines: Vec<String> = RS_URLS
+        .iter()
+        .zip(RS_PAGES)
+        .map(|(url, page)| format!("- {url}: {}", page.split(':').next().unwrap()))
+        .collect();
+    format!("Sources:\n{}", lines.join("\n"))
+}
+
+/// A message as the harness sends it, and as its instrumentation records it.
+#[derive(Clone)]
+struct Message {
+    role: &'static str,
+    sent: Value,
+    recorded: String,
+}
+
+impl Message {
+    fn text(role: &'static str, text: &str) -> Message {
+        Message {
+            role,
+            sent: json!({"role": role, "content": text}),
+            recorded: text.to_owned(),
+        }
+    }
+    fn blocks(role: &'static str, recorded: String) -> Message {
+        let content: Value = serde_json::from_str(&recorded).expect("blocks are JSON");
+        Message {
+            role,
+            sent: json!({"role": role, "content": content}),
+            recorded,
+        }
+    }
+}
+
+enum Call {
+    /// A model call: who made it, the messages it sent, its answer's content
+    /// blocks as recorded, the tool call in them, and its usage (input,
+    /// output, cache read, cache write).
+    Model {
+        who: Who,
+        sent: Vec<Message>,
+        content: String,
+        tool: Option<(String, &'static str, String)>,
+        text: Option<String>,
+        usage: [u64; 4],
+    },
+    /// A tool the harness ran, for the tool call `id`.
+    Tool {
+        who: Who,
+        name: &'static str,
+        id: String,
+        arguments: String,
+        result: String,
+        deduped: bool,
+    },
+    /// The sub-agent finished: its answer is the `Agent` call's result.
+    Closes(String),
+}
+
+/// Walks a plan, building each agent's conversation exactly as the harness
+/// sends it, with the usage the provider reports: the prompt read from the
+/// cache up to the previous call, what was added since written to it.
+fn research_calls(plan: &[Plan], key: &str) -> Vec<Call> {
+    struct Convo {
+        messages: Vec<Message>,
+        ctx: u64,
+        cached: Option<u64>,
+    }
+    let mut coordinator = Convo {
+        messages: vec![Message::text("user", RS_TASK)],
+        ctx: 40,
+        cached: None,
+    };
+    let mut worker = Convo {
+        messages: vec![Message::text("user", RS_BRIEF)],
+        ctx: 30,
+        cached: None,
+    };
+    let mut calls = Vec::new();
+    let mut pending: Option<(Who, String, String)> = None;
+    let mut task_id = String::new();
+    let mut tools_asked = 0_u64;
+    for step in plan {
+        match step {
+            Plan::Ask(who, _, _) | Plan::Say(who, _, _) => {
+                let who = *who;
+                let convo = if who == Who::Coordinator {
+                    &mut coordinator
+                } else {
+                    &mut worker
+                };
+                let sent = convo.messages.clone();
+                let read = convo.cached.map_or(0, |cached| who.prefix() + cached);
+                let write = convo
+                    .cached
+                    .map_or(who.prefix() + convo.ctx, |cached| convo.ctx - cached);
+                let (content, tool, text, output) = match step {
+                    Plan::Ask(_, name, arguments) => {
+                        tools_asked += 1;
+                        let digest =
+                            traza::payload::sha256_hex(format!("{key}:{tools_asked}").as_bytes());
+                        let id = format!("toolu_{}", &digest[..22]);
+                        let content = format!(
+                            "[{}]",
+                            rs_object(&[
+                                ("type", rs_str("tool_use")),
+                                ("id", rs_str(&id)),
+                                ("name", rs_str(name)),
+                                ("input", arguments.clone()),
+                            ])
+                        );
+                        pending = Some((who, id.clone(), arguments.clone()));
+                        if *name == "Agent" {
+                            task_id = id.clone();
+                        }
+                        let output = 60 + (arguments.len() as u64).div_ceil(4);
+                        (content, Some((id, *name, arguments.clone())), None, output)
+                    }
+                    Plan::Say(_, which, _) => {
+                        let text = if *which == "brief" {
+                            RS_FINAL.to_owned()
+                        } else {
+                            rs_findings()
+                        };
+                        let content = format!(
+                            "[{}]",
+                            rs_object(&[("type", rs_str("text")), ("text", rs_str(&text))])
+                        );
+                        let output = if who == Who::Coordinator { 1_900 } else { 720 };
+                        (content, None, Some(text), output)
+                    }
+                    Plan::Run(..) => unreachable!(),
+                };
+                convo.cached = Some(convo.ctx);
+                convo.ctx += output;
+                convo
+                    .messages
+                    .push(Message::blocks("assistant", content.clone()));
+                let usage = [3 + tools_asked % 5, output, read, write];
+                let last = matches!(step, Plan::Say(_, _, true));
+                calls.push(Call::Model {
+                    who,
+                    sent,
+                    content,
+                    tool,
+                    text: text.clone(),
+                    usage,
+                });
+                if last {
+                    let text = text.expect("the sub-agent's answer");
+                    let result = format!(
+                        "[{}]",
+                        rs_object(&[
+                            ("type", rs_str("tool_result")),
+                            ("tool_use_id", rs_str(&task_id)),
+                            ("content", rs_str(&text)),
+                        ])
+                    );
+                    coordinator.messages.push(Message::blocks("user", result));
+                    coordinator.ctx += output;
+                    calls.push(Call::Closes(text));
+                }
+            }
+            Plan::Run(name, result, tokens, deduped) => {
+                let (who, id, arguments) = pending.clone().expect("a tool call to answer");
+                let convo = if who == Who::Coordinator {
+                    &mut coordinator
+                } else {
+                    &mut worker
+                };
+                let block = format!(
+                    "[{}]",
+                    rs_object(&[
+                        ("type", rs_str("tool_result")),
+                        ("tool_use_id", rs_str(&id)),
+                        ("content", rs_str(result)),
+                    ])
+                );
+                convo.messages.push(Message::blocks("user", block));
+                convo.ctx += tokens;
+                calls.push(Call::Tool {
+                    who,
+                    name,
+                    id,
+                    arguments,
+                    result: result.clone(),
+                    deduped: *deduped,
+                });
+            }
+        }
+    }
+    calls
+}
+
+/// The run's spans in Traza's native JSON: its root, each model call with the
+/// prompt it sent and its answer, the `Agent` call holding the sub-agent, and
+/// each tool call. `extra` lands on every span — a fork's tags.
+fn research_spans(run: &str, key: &str, start: u64, calls: &[Call], extra: &Value) -> Vec<Value> {
+    let trace = &traza::payload::sha256_hex(format!("trace:{key}").as_bytes())[..32];
+    let mut serial = 0;
+    let mut next_id = || {
+        serial += 1;
+        traza::payload::sha256_hex(format!("span:{key}:{serial}").as_bytes())[..16].to_owned()
+    };
+    let root = next_id();
+    let base = |more: Value| {
+        let mut attributes = json!({"session.id": run});
+        for source in [extra, &more] {
+            for (name, value) in source.as_object().expect("an object") {
+                attributes[name] = value.clone();
+            }
+        }
+        attributes
+    };
+    let span = |id: &str, parent: &str, name: String, start: u64, ms: u64, attributes: Value| {
+        json!({
+            "trace_id": trace, "span_id": id, "parent_span_id": parent, "name": name,
+            "service": "research-coordinator", "status": "ok",
+            "start_time_unix_nano": start, "end_time_unix_nano": start + ms * MS,
+            "attributes": attributes,
+        })
+    };
+    let mut spans: Vec<Value> = Vec::new();
+    let mut clock = start + 5 * MS;
+    let (mut task, mut sub_agent) = (usize::MAX, usize::MAX);
+    for step in calls {
+        match step {
+            Call::Closes(result) => {
+                spans[sub_agent]["end_time_unix_nano"] = json!(clock);
+                spans[task]["end_time_unix_nano"] = json!(clock + 2 * MS);
+                spans[task]["attributes"]["gen_ai.tool.call.result"] = json!(result);
+                clock += 10 * MS;
+            }
+            Call::Model {
+                who,
+                sent,
+                content: _,
+                tool,
+                text,
+                usage,
+            } => {
+                let model = who.model();
+                let ms = match (who, text.is_some()) {
+                    (Who::Coordinator, true) => 21_400,
+                    (Who::Coordinator, false) => 3_600,
+                    (Who::Worker, true) => 4_100,
+                    (Who::Worker, false) => 1_200,
+                };
+                let mut attributes = base(json!({
+                    "gen_ai.operation.name": "chat", "gen_ai.system": "anthropic",
+                    "gen_ai.provider.name": "anthropic",
+                    "gen_ai.request.model": model, "gen_ai.response.model": model,
+                    "gen_ai.agent.name": who.agent(),
+                    "gen_ai.usage.input_tokens": usage[0], "gen_ai.usage.output_tokens": usage[1],
+                    "gen_ai.usage.cache_read.input_tokens": usage[2],
+                    "gen_ai.usage.cache_creation.input_tokens": usage[3],
+                    "gen_ai.prompt.0.role": "system", "gen_ai.prompt.0.content": who.system(),
+                    "gen_ai.completion.0.role": "assistant",
+                }));
+                for (index, message) in sent.iter().enumerate() {
+                    attributes[format!("gen_ai.prompt.{}.role", index + 1)] = json!(message.role);
+                    attributes[format!("gen_ai.prompt.{}.content", index + 1)] =
+                        json!(message.recorded);
+                }
+                match (text, tool) {
+                    (Some(text), _) => {
+                        attributes["gen_ai.completion.0.content"] = json!(text);
+                        attributes["gen_ai.completion.0.finish_reason"] = json!("end_turn");
+                    }
+                    (None, Some((id, name, arguments))) => {
+                        attributes["gen_ai.completion.0.finish_reason"] = json!("tool_use");
+                        attributes["gen_ai.completion.0.tool_calls.0.id"] = json!(id);
+                        attributes["gen_ai.completion.0.tool_calls.0.name"] = json!(name);
+                        attributes["gen_ai.completion.0.tool_calls.0.arguments"] = json!(arguments);
+                    }
+                    (None, None) => unreachable!(),
+                }
+                let parent = if *who == Who::Worker {
+                    spans[sub_agent]["span_id"].as_str().unwrap().to_owned()
+                } else {
+                    root.clone()
+                };
+                let id = next_id();
+                spans.push(span(
+                    &id,
+                    &parent,
+                    format!("chat {model}"),
+                    clock,
+                    ms,
+                    attributes,
+                ));
+                clock += (ms + 40) * MS;
+                if let Some((id, "Agent", arguments)) = tool {
+                    let task_id = next_id();
+                    spans.push(span(
+                        &task_id,
+                        &root,
+                        "execute_tool Agent".into(),
+                        clock,
+                        0,
+                        base(json!({
+                            "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "Agent",
+                            "gen_ai.agent.name": Who::Coordinator.agent(),
+                            "gen_ai.tool.call.id": id, "gen_ai.tool.call.arguments": arguments,
+                        })),
+                    ));
+                    task = spans.len() - 1;
+                    clock += 5 * MS;
+                    let agent_id = next_id();
+                    spans.push(span(
+                        &agent_id,
+                        &task_id,
+                        "invoke_agent web-researcher".into(),
+                        clock,
+                        0,
+                        base(json!({
+                            "gen_ai.operation.name": "invoke_agent",
+                            "gen_ai.agent.name": Who::Worker.agent(),
+                        })),
+                    ));
+                    sub_agent = spans.len() - 1;
+                    clock += 5 * MS;
+                }
+            }
+            Call::Tool {
+                who,
+                name,
+                id,
+                arguments,
+                result,
+                deduped,
+            } => {
+                let ms = match (*name, deduped) {
+                    ("WebSearch", _) => 900,
+                    (_, true) => 2,
+                    _ => 1_700,
+                };
+                let parent = if *who == Who::Worker {
+                    spans[sub_agent]["span_id"].as_str().unwrap().to_owned()
+                } else {
+                    root.clone()
+                };
+                let span_id = next_id();
+                spans.push(span(
+                    &span_id,
+                    &parent,
+                    format!("execute_tool {name}"),
+                    clock,
+                    ms,
+                    base(json!({
+                        "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name,
+                        "gen_ai.agent.name": who.agent(), "gen_ai.tool.call.id": id,
+                        "gen_ai.tool.call.arguments": arguments, "gen_ai.tool.call.result": result,
+                    })),
+                ));
+                clock += (ms + 40) * MS;
+            }
+        }
+    }
+    let mut root_span = span(
+        &root,
+        "",
+        "invoke_agent research-coordinator".into(),
+        start,
+        (clock + 10 * MS - start) / MS,
+        base(json!({
+            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.agent.name": Who::Coordinator.agent(),
+        })),
+    );
+    root_span["parent_span_id"] = Value::Null;
+    spans.insert(0, root_span);
+    spans
+}
+
+/// How a walk of a replay ended: every call answered, or refused at a call.
+enum Walk {
+    Done {
+        /// Each `tools/next` answer, in order.
+        tools: Vec<Value>,
+        /// The messages of each model request, in order.
+        requests: Vec<Value>,
+    },
+    Refused {
+        tools: Vec<Value>,
+        /// The last is the request refused, when a model call was.
+        requests: Vec<Value>,
+        status: u16,
+        head: Vec<(String, String)>,
+        body: Value,
+    },
+}
+
+/// The messages of each model request a run recorded, in order.
+fn recorded_requests(calls: &[Call]) -> Vec<Value> {
+    calls
+        .iter()
+        .filter_map(|step| match step {
+            Call::Model { sent, .. } => Some(Value::Array(
+                sent.iter().map(|message| message.sent.clone()).collect(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The research harness against a replay. `calls` says only what it does
+/// next: which agent calls its model, which tool it runs. Each conversation
+/// is built from what the replay answers: the served answer, and each tool
+/// result from `tools/next` — except a URL the deduping harness refuses to
+/// fetch again, which it answers itself. The sub-agent starts from the brief
+/// in the coordinator's `Agent` call, and its last answer is that call's
+/// result. Model calls go over the Anthropic route as the Anthropic SDK sends
+/// them (`x-api-key`); a tool result that is not text goes back as JSON.
+fn research_walk(server: &Server, replay: &str, calls: &[Call]) -> Walk {
+    let mut coordinator = vec![json!({"role": "user", "content": RS_TASK})];
+    let mut worker: Vec<Value> = Vec::new();
+    let mut tools = Vec::new();
+    let mut requests = Vec::new();
+    for step in calls {
+        match step {
+            Call::Model { who, content, .. } => {
+                let convo = if *who == Who::Coordinator {
+                    &mut coordinator
+                } else {
+                    &mut worker
+                };
+                let messages = Value::Array(convo.clone());
+                requests.push(messages.clone());
+                let (status, head, body) = call_anthropic(
+                    server,
+                    replay,
+                    &json!({"model": who.model(), "max_tokens": 8192, "system": who.system(),
+                            "messages": messages}),
+                );
+                if status != 200 {
+                    return Walk::Refused {
+                        tools,
+                        requests,
+                        status,
+                        head,
+                        body,
+                    };
+                }
+                let recorded: Value = serde_json::from_str(content).unwrap();
+                assert_eq!(body["content"], recorded, "the recorded answer is served");
+                let brief = body["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|block| block["type"] == "tool_use" && block["name"] == "Agent")
+                    .map(|block| block["input"]["prompt"].clone());
+                convo.push(json!({"role": "assistant", "content": body["content"]}));
+                if let Some(brief) = brief {
+                    worker = vec![json!({"role": "user", "content": brief})];
+                }
+            }
+            Call::Tool {
+                who,
+                name,
+                result,
+                deduped,
+                ..
+            } => {
+                let answer = if *deduped {
+                    result.clone()
+                } else {
+                    let (status, head, body) = call(
+                        server,
+                        "POST",
+                        &format!("/v1/replays/{replay}/tools/next"),
+                        Some(&json!({"tool": name})),
+                        &[bearer(ACME)],
+                    );
+                    if status != 200 {
+                        return Walk::Refused {
+                            tools,
+                            requests,
+                            status,
+                            head,
+                            body,
+                        };
+                    }
+                    let answer = match &body["result"] {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    tools.push(body);
+                    answer
+                };
+                let convo = if *who == Who::Coordinator {
+                    &mut coordinator
+                } else {
+                    &mut worker
+                };
+                rs_answer_tool(convo, answer);
+            }
+            Call::Closes(_) => {
+                let findings = worker
+                    .last()
+                    .and_then(|answer| answer["content"].as_array())
+                    .and_then(|blocks| blocks.iter().find(|block| block["type"] == "text"))
+                    .and_then(|block| block["text"].as_str())
+                    .expect("the sub-agent's last answer is text")
+                    .to_owned();
+                rs_answer_tool(&mut coordinator, findings);
+            }
+        }
+    }
+    Walk::Done { tools, requests }
+}
+
+/// Answers the tool call in an agent's last answer with `result`.
+fn rs_answer_tool(convo: &mut Vec<Value>, result: String) {
+    let id = convo
+        .last()
+        .and_then(|answer| answer["content"].as_array())
+        .and_then(|blocks| blocks.iter().find(|block| block["type"] == "tool_use"))
+        .expect("a tool call to answer")["id"]
+        .clone();
+    convo.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": id, "content": result},
+    ]}));
+}
+
+fn call_anthropic(
+    server: &Server,
+    replay: &str,
+    body: &Value,
+) -> (u16, Vec<(String, String)>, Value) {
+    call(
+        server,
+        "POST",
+        &format!("/v1/replays/{replay}/anthropic/v1/messages"),
+        Some(body),
+        &[
+            ("x-api-key", ACME.to_owned()),
+            ("anthropic-version", "2023-06-01".to_owned()),
+        ],
+    )
+}
+
+fn create_replay(server: &Server, body: Value) -> Value {
+    let (status, created) = as_token(server, "POST", "/v1/replays", Some(&body), ACME);
+    assert_eq!(status, 201, "{body} -> {created}");
+    created
+}
+
+fn close_to(value: &Value, expected: f64) -> bool {
+    value
+        .as_f64()
+        .is_some_and(|got| (got - expected).abs() < 1e-9)
+}
+
+#[test]
+fn the_guides_research_run_replays_refuses_and_forks_as_they_print() {
+    let dir = common::temp_dir();
+    let pricing = dir.join("pricing.json");
+    std::fs::write(&pricing, RS_PRICING).expect("writes the rates");
+    let server = server(&["--pricing", pricing.to_str().expect("utf8")]);
+    // The original harness read the pilot-lines page and the cost page twice.
+    let fetches = [0, 1, 0, 2, 1];
+    let recorded = research_calls(&research_plan(&fetches, false), "dr-0917");
+    ingest(
+        &server,
+        research_spans("dr-0917", "dr-0917", T0, &recorded, &json!({})),
+        ACME_WRITER,
+    );
+
+    // The tape (replay guide, "Runs and tapes"): eighteen steps, every span one.
+    let (status, tape) = as_token(&server, "GET", "/v1/tapes/dr-0917", None, ACME);
+    assert_eq!(status, 200, "{tape}");
+    assert_eq!(tape["spans_examined"], json!(18));
+    let steps = tape["steps"].as_array().unwrap();
+    let fingerprints: Vec<&str> = steps
+        .iter()
+        .map(|step| step["fingerprint"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        fingerprints[..6],
+        [
+            "agent:research-coordinator",
+            "llm:claude-opus-5-5#ea97869dbfadddfc",
+            "tool:Agent#b8a25c5ef91fd1e8",
+            "agent:web-researcher",
+            "llm:claude-haiku-5-5#629f8c5aa2e5db83",
+            "tool:WebSearch#77934dd2a4e0f5da",
+        ]
+    );
+    assert_eq!(
+        steps[1]["request_digest"],
+        json!("ea97869dbfadddfc08be3a151877b8a2e29b6dfb7f39f1fe43e2621484244b50")
+    );
+    assert_eq!(
+        steps[1]["response_digest"],
+        json!("54d13d575a267c22e2ea90d26527de3fed2cca599910b5fa55da7bea41db5818")
+    );
+    assert_eq!(
+        steps[1]["tokens"],
+        json!({"input": 4, "output": 103, "cache_read": 0, "cache_write": 9840, "context": 9844})
+    );
+    assert!(close_to(&steps[1]["cost_usd"], 0.051276), "{}", steps[1]);
+
+    // A strict replay, walked by the recorded harness: nine model calls, the
+    // sub-agent's two among them, every one matched.
+    let created = create_replay(&server, json!({"run": "dr-0917"}));
+    assert_eq!(
+        (created["steps"].clone(), created["llm_steps"].clone()),
+        (json!(18), json!(9))
+    );
+    let replay = created["id"].as_str().unwrap().to_owned();
+    let Walk::Done { tools, requests } = research_walk(&server, &replay, &recorded) else {
+        panic!("the recorded harness was refused");
+    };
+    assert_eq!(
+        requests,
+        recorded_requests(&recorded),
+        "with nothing edited, the harness sends exactly what it recorded"
+    );
+    assert_eq!(tools[1]["step"], json!(8), "{}", tools[1]);
+    assert_eq!(tools[1]["result"], json!(RS_PAGES[0]));
+    let (_, report) = as_token(&server, "GET", &format!("/v1/replays/{replay}"), None, ACME);
+    assert_eq!(
+        (report["served"].clone(), report["remaining"].clone()),
+        (json!(9), json!(0))
+    );
+    assert_eq!(report["diverged"], Value::Null);
+    let served: Vec<(u64, bool)> = report["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|call| {
+            (
+                call["step"].as_u64().unwrap(),
+                call["matched"] == json!(true),
+            )
+        })
+        .collect();
+    assert_eq!(
+        served,
+        [1, 4, 6, 7, 9, 11, 13, 15, 17].map(|step| (step, true))
+    );
+
+    // The harness that refuses to fetch a URL twice, replayed strictly: its
+    // call after the refused fetch is the first that differs (replay guide,
+    // "Strict and loose matching"; fork guide, "Tape tests").
+    let deduped = research_calls(&research_plan(&fetches, true), "dr-0917");
+    let strict = create_replay(&server, json!({"run": "dr-0917"}));
+    let strict = strict["id"].as_str().unwrap();
+    let Walk::Refused {
+        requests,
+        status,
+        head,
+        body,
+        ..
+    } = research_walk(&server, strict, &deduped)
+    else {
+        panic!("the deduping harness walked a strict replay");
+    };
+    assert_eq!(
+        requests[..],
+        recorded_requests(&deduped)[..7],
+        "the deduping harness sends its own conversation, refused at its seventh call"
+    );
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(header(&head, "x-should-retry"), Some("false"));
+    assert_eq!(body["type"], json!("error"));
+    let error = &body["error"];
+    assert_eq!(error["type"], json!("replay_divergence"));
+    assert_eq!(error["step"], json!(13));
+    assert_eq!(
+        error["expected_digest"],
+        json!("38d64ab342a7ff12be1b446cc0209eecabbae76f5d4ec73b59a9e88a178ddd6d")
+    );
+    assert_eq!(
+        error["got_digest"],
+        json!("2d02f0080506df8f483cde7735ec2240ee801fdbd82f82836201aa8a882f0cb1")
+    );
+    assert_eq!(
+        error["difference"],
+        json!({
+            "message": 9, "role": "user", "field": "content", "at_char": 13,
+            "recorded": "[{\"content\":\"Pilot lines (2026): three cell makers ran solid-state pilot lines at 0.2 to 1 GWh a year. First-pass yields…",
+            "got": "[{\"content\":\"Already fetched https://www.example-energy.org/2026/solid-state-pilot-lines earlier in this run; reusing th…",
+            "recorded_messages": 10, "got_messages": 10,
+        })
+    );
+    let (_, report) = as_token(&server, "GET", &format!("/v1/replays/{strict}"), None, ACME);
+    assert_eq!(report["served"], json!(6));
+    assert_eq!(report["diverged"]["difference"], error["difference"]);
+
+    // The fork guide's thirty seconds: the cost page gone at step 10, live after it.
+    let fork = create_replay(
+        &server,
+        json!({"run": "dr-0917",
+               "edits": [{"step": 10, "tool_result": {"error": "fetch failed: 404"}}],
+               "live_after": 10}),
+    );
+    assert_eq!(
+        fork["llm_steps"],
+        json!(5),
+        "nothing past the live point is held"
+    );
+    let fork_id = fork["fork_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        fork["fork"],
+        json!({"id": fork_id, "parent": "dr-0917", "step": 10,
+               "edits": [{"step": 10, "kind": "tool_result"}], "live_after": 10,
+               "attributes": {"traza.fork.parent": "dr-0917", "traza.fork.step": 10,
+                              "traza.fork.id": fork_id}})
+    );
+    let Walk::Refused {
+        tools,
+        requests,
+        status,
+        head,
+        body,
+    } = research_walk(&server, fork["id"].as_str().unwrap(), &recorded)
+    else {
+        panic!("the fork never went live");
+    };
+    assert_eq!(
+        tools[2],
+        json!({"step": 10, "tool": "WebFetch",
+               "arguments": {"prompt": RS_FETCH_PROMPT, "url": RS_URLS[1]},
+               "result": {"error": "fetch failed: 404"}, "edited": true})
+    );
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(header(&head, "x-should-retry"), Some("false"));
+    assert_eq!(
+        (
+            body["error"]["type"].clone(),
+            body["error"]["live_after"].clone(),
+            body["error"]["served"].clone(),
+            body["error"]["fork_id"].clone()
+        ),
+        (json!("replay_live"), json!(10), json!(5), json!(fork_id))
+    );
+    // The call refused is step 11, and it carries the failed fetch: the
+    // recorded conversation with the cost page swapped for the 404. That is
+    // the request the harness takes to the real provider.
+    let parent_requests = recorded_requests(&recorded);
+    assert_eq!(requests.len(), 6, "five served, the sixth refused");
+    assert_eq!(requests[..5], parent_requests[..5]);
+    let mut with_404 = parent_requests[5].clone();
+    let fetched = &mut with_404.as_array_mut().unwrap().last_mut().unwrap()["content"][0];
+    assert_eq!(
+        (fetched["type"].clone(), fetched["content"].clone()),
+        (json!("tool_result"), json!(RS_PAGES[1])),
+        "the recording read the cost page"
+    );
+    fetched["content"] = json!(r#"{"error":"fetch failed: 404"}"#);
+    assert_eq!(requests[5], with_404);
+
+    // A model answer cannot stand in for a tool step.
+    let (status, refused) = as_token(
+        &server,
+        "POST",
+        "/v1/replays",
+        Some(&json!({"run": "dr-0917", "edits": [{"step": 10, "response": "The page is gone."}]})),
+        ACME,
+    );
+    assert_eq!(status, 400);
+    assert_eq!(
+        refused,
+        json!({"error": "step 10 is a tool call (tool:WebFetch), so a \"response\" edit cannot replace it: a tool result is edited with \"tool_result\""})
+    );
+
+    // The rewind the deduping harness was tried with: replayed through step
+    // 11, live from its cut at 12, where the harness refuses the fetch.
+    let rewind = create_replay(&server, json!({"run": "dr-0917", "live_after": 11}));
+    assert_eq!(rewind["fork"]["step"], json!(12));
+    let Walk::Refused {
+        requests,
+        status,
+        body,
+        ..
+    } = research_walk(&server, rewind["id"].as_str().unwrap(), &deduped)
+    else {
+        panic!("the rewind never went live");
+    };
+    assert_eq!(requests[..], recorded_requests(&deduped)[..7]);
+    assert_eq!(status, 409);
+    assert_eq!(
+        (
+            body["error"]["type"].clone(),
+            body["error"]["served"].clone()
+        ),
+        (json!("replay_live"), json!(6))
+    );
+    // Its live half, as the harness's instrumentation recorded it: the whole
+    // run under its own session id, every span tagged with the fork.
+    let live = research_calls(&research_plan(&[0, 1, 0, 2], true), "dr-0917");
+    ingest(
+        &server,
+        research_spans(
+            "dr-0917-dedupe",
+            "dr-0917-dedupe",
+            T0 + 90 * 60_000 * MS,
+            &live,
+            &rewind["fork"]["attributes"],
+        ),
+        ACME_WRITER,
+    );
+
+    // The fork listing and the diff the guides print.
+    let explanation = "step 12 of a and step 12 of b (tool:WebFetch) received the same input and \
+                       produced a different output: response e450b5a73db1 in a, 750af04196bb in b";
+    let (status, listing) = as_token(&server, "GET", "/v1/forks?run=dr-0917", None, ACME);
+    assert_eq!(status, 200, "{listing}");
+    let parent = &listing["parent"];
+    assert_eq!(
+        (
+            parent["steps"].clone(),
+            parent["tokens"].clone(),
+            parent["outcome"].clone()
+        ),
+        (json!(18), json!(3341), json!("success"))
+    );
+    assert!(close_to(&parent["cost_usd"], 0.271217875), "{parent}");
+    let forks = listing["forks"].as_array().unwrap();
+    assert_eq!(forks.len(), 1, "{listing}");
+    let dedupe = &forks[0];
+    assert_eq!(dedupe["run"], json!("dr-0917-dedupe"));
+    assert_eq!(dedupe["fork_id"], rewind["fork_id"]);
+    assert_eq!(dedupe["fork_step"], json!(12));
+    assert_eq!(
+        (
+            dedupe["steps"].clone(),
+            dedupe["outcome"].clone(),
+            dedupe["diverged_before_cut"].clone()
+        ),
+        (json!(16), json!("success"), json!(false))
+    );
+    assert!(close_to(&dedupe["cost_usd"], 0.202954675), "{dedupe}");
+    assert_eq!(
+        dedupe["first_divergence"],
+        json!({"a": 12, "b": 12, "kind": "decision", "explanation": explanation})
+    );
+    assert_eq!(
+        (
+            dedupe["delta"]["steps"].clone(),
+            dedupe["delta"]["tokens"].clone(),
+            dedupe["delta"]["duration_ns"].clone()
+        ),
+        (json!(-2), json!(-105), json!(-7_078_000_000_i64))
+    );
+    assert!(
+        close_to(&dedupe["delta"]["cost_usd"], -0.0682632),
+        "{dedupe}"
+    );
+    let (status, diff) = as_token(
+        &server,
+        "GET",
+        "/v1/diff?a=dr-0917&b=dr-0917-dedupe",
+        None,
+        ACME,
+    );
+    assert_eq!(status, 200, "{diff}");
+    assert_eq!(diff["first_divergence"], dedupe["first_divergence"]);
+    let ops: Vec<String> = diff["aligned"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pair| {
+            format!(
+                "{}{}",
+                pair["op"].as_str().unwrap(),
+                pair["why"]
+                    .as_str()
+                    .map(|why| format!(":{why}"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect();
+    let mut expected = vec!["same".to_owned(); 12];
+    expected.extend(
+        [
+            "changed:decision",
+            "changed:input",
+            "same",
+            "changed:input",
+            "delete:structure",
+            "delete:structure",
+        ]
+        .map(str::to_owned),
+    );
+    assert_eq!(ops, expected);
 }

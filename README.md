@@ -21,9 +21,9 @@ Point any OpenTelemetry exporter at it. Agents instrumented with OpenLLMetry, Op
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:8080
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export OTEL_EXPORTER_OTLP_COMPRESSION=gzip
-python weather_agent.py                       # your instrumented agent
+python research.py                            # your instrumented agent
 
-curl -s localhost:8080/v1/tapes/weather-7     # its model and tool calls in order, with what went in and came out
+curl -s localhost:8080/v1/tapes/dr-0917       # its model and tool calls in order, with what went in and came out
 ```
 
 A run is a session (`session.id`, `gen_ai.conversation.id`, or OpenLLMetry's association property) or, without one, a trace. [Ingest](docs/guide/ingest.md) · [steps and runs](docs/llm-semantics.md#steps-and-runs)
@@ -139,23 +139,23 @@ Re-run a recorded run through the agent's own code, with every model answer serv
 
 ```sh
 curl -s -X POST localhost:8080/v1/replays -H "Authorization: Bearer $TRAZA_TOKEN" \
-  -d '{"run": "weather-7"}'                   # answers its id and base_urls for both SDKs
+  -d '{"run": "dr-0917"}'                     # answers its id and base_urls for both SDKs
 
-export OPENAI_BASE_URL=http://localhost:8080/v1/replays/rp_ac879985abef9cba12bb342bdc3b8bd1/openai/v1
-export OPENAI_API_KEY=$TRAZA_TOKEN
-python weather_agent.py                       # zero model calls; ANTHROPIC_BASE_URL works the same way
+export ANTHROPIC_BASE_URL=http://localhost:8080/v1/replays/rp_03dcdadb9395a8770c836a73da8c1576/anthropic
+export ANTHROPIC_API_KEY=$TRAZA_TOKEN
+python research.py                            # zero model calls; OPENAI_BASE_URL works the same way
 ```
 
-Strict mode refuses a request that is not the recorded one (`409 replay_divergence`, naming the step) rather than answer a different question, and `GET /v1/diff?a=weather-7&b=weather-8` names the first step where two runs parted, and why. Tools still run live unless your harness takes their recorded results from `tools/next`, and streams are rebuilt from the stored text. On a server with no credentials, any non-empty API key works. [Replay](docs/guide/replay.md) · [limits](docs/guide/replay.md#limits-stated-plainly)
+Strict mode refuses a request that is not the recorded one (`409 replay_divergence`, naming the step) rather than answer a different question, and `GET /v1/diff?a=dr-0917&b=dr-0917-dedupe` names the first step where two runs parted, and why. Tools still run live unless your harness takes their recorded results from `tools/next`, and streams are rebuilt from the stored text. On a server with no credentials, any non-empty API key works. [Replay](docs/guide/replay.md) · [limits](docs/guide/replay.md#limits-stated-plainly)
 
-**Fork and rewind.** The same replay can serve a different answer at any step and then hand the agent to the real provider — what would it have done had the tool said sunshine?
+**Fork and rewind.** The same replay can serve a different answer at any step and then hand the agent to the real provider — what would it have written had a source page been gone?
 
 ```sh
 curl -s -X POST localhost:8080/v1/replays \
-  -d '{"run": "weather-7", "edits": [{"step": 1, "tool_result": {"forecast": "sun", "celsius": 24}}], "live_after": 1}'
+  -d '{"run": "dr-0917", "edits": [{"step": 10, "tool_result": {"error": "fetch failed: 404"}}], "live_after": 10}'
 ```
 
-After the live point every call answers `409 replay_live`, and the harness — `traza.fork(…)` in Python, `client.fork(…)` in TypeScript, or your own — switches to the real model; Traza never calls one. `GET /v1/forks?run=weather-7` lists the branches tried, each diffed against its parent. Recorded runs also become **tape tests**: `@pytest.mark.traza_tape("weather-7")` fails a test with the message, field and character where the agent left the recorded path, and `traza test` replays every run marked golden into a JUnit report. [Fork and rewind](docs/guide/fork.md) · [limits](docs/guide/fork.md#limits-stated-plainly)
+The harness takes the edited fetch from `tools/next`, as it takes any recorded tool result. After the live point every call answers `409 replay_live`, and the harness — `traza.fork(…)` in Python, `client.fork(…)` in TypeScript, or your own — switches to the real model; Traza never calls one. `GET /v1/forks?run=dr-0917` lists the branches tried, each diffed against its parent. Recorded runs also become **tape tests**: `@pytest.mark.traza_tape("dr-0917")` fails a test with the message, field and character where the agent left the recorded path, and `traza test` replays every run marked golden into a JUnit report. [Fork and rewind](docs/guide/fork.md) · [limits](docs/guide/fork.md#limits-stated-plainly)
 
 ## Prove
 

@@ -23,67 +23,74 @@ recording at the cut and say so. Route shapes are in the
 
 ## Thirty seconds of it
 
-The examples use the weather run from the [replay guide](replay.md):
-`weather-7`, a model call that asks for `get_weather` (step 0), the tool
-(step 1), and the model call that answers (step 2). Ask: what would the agent
-have said had the tool returned sunshine?
+The examples use the research run from the [replay guide](replay.md):
+`dr-0917`, eighteen steps in which a coordinator hands a web search to a
+sub-agent, then fetches the sources it found and writes a brief. Step 10 is
+its first fetch of the cost page. Ask: what would the coordinator have
+written had that page been gone?
 
 ```sh
 curl -s -X POST localhost:8080/v1/replays -d '{
-  "run": "weather-7",
-  "edits": [{"step": 1, "tool_result": {"forecast": "sun", "celsius": 24}}],
-  "live_after": 1
+  "run": "dr-0917",
+  "edits": [{"step": 10, "tool_result": {"error": "fetch failed: 404"}}],
+  "live_after": 10
 }'
 ```
 
 ```json
 {
-  "id": "rp_c28b383ca80306a558138f514ad39934",
-  "run": "weather-7",
+  "id": "rp_a63207a11b0a3eaad73d832eb2e01dec",
+  "run": "dr-0917",
   "mode": "strict",
-  "steps": 3,
-  "llm_steps": 1,
-  "expires_at_ns": 1792302016223771000,
+  "steps": 18,
+  "llm_steps": 5,
+  "expires_at_ns": 1792390270730002000,
   "unreadable_tool_steps": [],
   "base_urls": {
-    "openai": "/v1/replays/rp_c28b383ca80306a558138f514ad39934/openai/v1",
-    "anthropic": "/v1/replays/rp_c28b383ca80306a558138f514ad39934/anthropic"
+    "openai": "/v1/replays/rp_a63207a11b0a3eaad73d832eb2e01dec/openai/v1",
+    "anthropic": "/v1/replays/rp_a63207a11b0a3eaad73d832eb2e01dec/anthropic"
   },
-  "fork_id": "fk_b6956c347b2ab03ff5b1fc530c36754d",
+  "fork_id": "fk_7aa99871913c76bfa3336deba92d857d",
   "fork": {
-    "id": "fk_b6956c347b2ab03ff5b1fc530c36754d",
-    "parent": "weather-7",
-    "step": 1,
-    "edits": [{"step": 1, "kind": "tool_result"}],
-    "live_after": 1,
+    "id": "fk_7aa99871913c76bfa3336deba92d857d",
+    "parent": "dr-0917",
+    "step": 10,
+    "edits": [{"step": 10, "kind": "tool_result"}],
+    "live_after": 10,
     "attributes": {
-      "traza.fork.parent": "weather-7",
-      "traza.fork.step": 1,
-      "traza.fork.id": "fk_b6956c347b2ab03ff5b1fc530c36754d"
+      "traza.fork.parent": "dr-0917",
+      "traza.fork.step": 10,
+      "traza.fork.id": "fk_7aa99871913c76bfa3336deba92d857d"
     }
   }
 }
 ```
 
-The agent's first model call is answered from the recording, exactly as a
-plain replay would. Its harness asks `tools/next` for the tool result and
-gets the edit, marked as one:
+The agent's first five model calls — the coordinator's three and the
+sub-agent's two — are answered from the recording, exactly as a plain replay
+would. Its harness asks `tools/next` for the result of each tool it runs
+itself — the search and the fetches; the `Agent` tool runs the sub-agent,
+whose model calls are on the tape. The search and the first fetch come from
+the recording; the fetch at step 10 gets the edit, marked as one:
 
 ```json
-{"step": 1, "tool": "get_weather", "arguments": {"city": "Paris"},
- "result": {"celsius": 24, "forecast": "sun"}, "edited": true}
+{"step": 10, "tool": "WebFetch",
+ "arguments": {"prompt": "List the 2026 figures on pilot lines, yields, cost per kWh and sample cells.",
+               "url": "https://www.example-batteries.com/reports/ssb-cost-2026"},
+ "result": {"error": "fetch failed: 404"}, "edited": true}
 ```
 
-The agent sends the sunny result back with its next model call — step 2, past
-the live point — and the replay hands the run over:
+The agent sends the failed fetch back with its next model call — step 11,
+past the live point — and the replay hands the run over:
 
 ```text
 HTTP/1.1 409 Conflict
 x-should-retry: false
 
-{"error":{"type":"replay_live","live_after":1,"served":1,
-  "fork_id":"fk_b6956c347b2ab03ff5b1fc530c36754d",
-  "message":"this fork goes live after step 1: the recording is not served past it, so send this call to the real provider (or run the real tool) — the run continues from here as a new branch"}}
+{"error":{"type":"replay_live","live_after":10,"served":5,
+  "fork_id":"fk_7aa99871913c76bfa3336deba92d857d",
+  "message":"this fork goes live after step 10: the recording is not served past it, so send this call to the real provider (or run the real tool) — the run continues from here as a new branch"},
+ "type":"error"}
 ```
 
 That `409` is the harness's signal to send this call, and every later one, to
@@ -134,9 +141,12 @@ steps need not be replayable at all — a long run whose later answers were
 offloaded past `--tape-max-bytes`, or recorded with content capture off, can
 still be rewound to any point before them. `llm_steps` counts what is held.
 
-**Rewind** is a live point alone: `{"run": "weather-7", "live_after": 1}`
-replays steps 0 and 1 exactly, then everything after is live. Re-running a
-long agent from step 40 costs nothing for its first 40 steps.
+**Rewind** is a live point alone: `{"run": "dr-0917", "live_after": 11}`
+replays steps 0 to 11 exactly, then everything after is live. That is how the
+harness that refuses to fetch a URL twice was tried on this run. Step 12 is
+the repeated fetch it refuses, so the recording is served up to the call that
+asked for it, and the rest ran live. Re-running a long agent from step 40
+costs nothing for its first 40 steps.
 
 **A run longer than a replay holds can still be rewound.** A plain replay
 refuses a run past 20,000 spans rather than replaying its beginning as if the
@@ -149,7 +159,7 @@ length.
 Refusals are `400` and say what to change:
 
 ```json
-{"error":"step 1 is a tool call (tool:get_weather), so a \"response\" edit cannot replace it: a tool result is edited with \"tool_result\""}
+{"error":"step 10 is a tool call (tool:WebFetch), so a \"response\" edit cannot replace it: a tool result is edited with \"tool_result\""}
 ```
 
 — and likewise an edit or live point past the run's last step, an edit after
@@ -168,39 +178,47 @@ as `merged_into_parent` rather than hiding them.
 
 ## Finding a run's forks
 
-`GET /v1/forks?run=weather-7` lists every run whose spans carry
-`traza.fork.parent = weather-7`, the most recently started first, each read
-and diffed against its parent in its own tenant:
+`GET /v1/forks?run=dr-0917` lists every run whose spans carry
+`traza.fork.parent = dr-0917`, the most recently started first, each read
+and diffed against its parent in its own tenant. Here there is one: the
+[rewind](#forking-a-run) under the deduping harness, run with
+`traza.fork("dr-0917", at_step=12, run_id="dr-0917-dedupe")` and recorded
+under that session id. The 404 fork above is not listed: nothing ran past its
+live point, so it recorded nothing.
 
 ```json
 {
-  "run": "weather-7",
-  "parent": {"run": "weather-7", "steps": 3, "cost_usd": 0.0, "tokens": 233,
-             "duration_ns": 1000000000, "errors": 0, "outcome": "success", "truncated": false},
+  "run": "dr-0917",
+  "parent": {"run": "dr-0917", "steps": 18, "cost_usd": 0.27121787500000005, "tokens": 3341,
+             "duration_ns": 58335000000, "errors": 0, "outcome": "success", "truncated": false},
   "forks": [{
-    "run": "fk_b6956c347b2ab03ff5b1fc530c36754d",
+    "run": "dr-0917-dedupe",
     "tenant": "",
-    "fork_id": "fk_b6956c347b2ab03ff5b1fc530c36754d",
-    "fork_step": 1,
-    "first_start_ns": 1791964860000000000,
-    "last_end_ns": 1791964861000000000,
-    "tagged_spans": 4,
+    "fork_id": "fk_a9277a1d7df0130387db2879c908035b",
+    "fork_step": 12,
+    "first_start_ns": 1792381327733000000,
+    "last_end_ns": 1792381378990000000,
+    "tagged_spans": 16,
     "diffed": true,
-    "steps": 3,
+    "steps": 16,
     "outcome": "success",
-    "cost_usd": 0.0,
+    "cost_usd": 0.202954675,
     "errors": 0,
-    "first_divergence": {"a": 1, "b": 1, "kind": "decision",
-      "explanation": "step 1 of a and step 1 of b (tool:get_weather) received the same input and produced a different output: response 25ac26944464 in a, 05b04b8ed40a in b"},
-    "delta": {"cost_usd": 0.0, "tokens": 0, "duration_ns": 0, "errors": 0, "steps": 0},
+    "first_divergence": {"a": 12, "b": 12, "kind": "decision",
+      "explanation": "step 12 of a and step 12 of b (tool:WebFetch) received the same input and produced a different output: response e450b5a73db1 in a, 750af04196bb in b"},
+    "delta": {"cost_usd": -0.06826320000000005, "tokens": -105, "duration_ns": -7078000000,
+              "errors": 0, "steps": -2},
     "diverged_before_cut": false,
     "truncated": false
   }],
   "merged_into_parent": 0,
-  "spans_examined": 4,
+  "spans_examined": 16,
   "truncated": false
 }
 ```
+
+The fork parted at its cut, step 12, and nowhere before it. It ended well,
+two steps shorter and about seven cents cheaper.
 
 `first_divergence` is the [differ's](replay.md#comparing-two-runs), with the
 parent as `a`. `diverged_before_cut` says whether the fork parted from its
@@ -225,8 +243,8 @@ so past that cap the oldest forks are listed and the newest may be missing —
 ```python
 import traza
 
-with traza.fork("weather-7", at_step=1, tool_result={"forecast": "sun", "celsius": 24}) as fork:
-    answer = run_agent("What's the weather in Paris?")   # 0 replayed, 1 edited, 2 live
+with traza.fork("dr-0917", at_step=10, tool_result={"error": "fetch failed: 404"}) as fork:
+    brief = run_research(TASK, recorded=fork.tool_result)   # steps 0-9 replayed, 10 edited, 11 on live
 print(fork.id, fork.final_status.fork.live_calls)
 print(fork.diff().first_divergence.explanation)
 ```
@@ -235,46 +253,60 @@ print(fork.diff().first_divergence.explanation)
 result; with neither, the recording simply stops before `at_step`.
 `live=False` serves the edit and lets the recording play on.
 
+The harness takes its tool results from the callback it is handed, as in a
+[tape test](#python-and-pytest) — here `fork.tool_result`. Before it runs a
+tool of its own (the search, a fetch) it asks the callback for that tool's
+result. It uses the step's `result` when one comes back, and runs the real
+tool on `None`. The `Agent` tool is not one of those: it runs the sub-agent,
+whose model calls are on the tape. So the fetch at step 10 gets the 404, and
+the fetches after the cut run for real.
+`fork.call_tool(name, fn, *args)` makes that choice in one call. The switch
+below carries model calls only, so an edited tool result reaches the agent
+through its harness or not at all.
+
 Inside the block, `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` point at a
 **switch**: a small HTTP server on a loopback port, private to the process,
 that forwards each model call to the replay until the replay answers
 `replay_live`, and from then on to the real provider — the base URL and key
 the environment named when the fork was made (`OPENAI_BASE_URL`, else
 OpenAI's API, and `OPENAI_API_KEY`; the same for Anthropic), as it stood
-before any fork changed it, or the `live_openai_base_url` /
-`live_openai_api_key` options. The agent sees one provider throughout. The switch listens on `127.0.0.1` only and answers only
+before any fork changed it, or the `live_anthropic_base_url` /
+`live_anthropic_api_key` options (and their OpenAI twins). The agent sees one
+provider throughout. The switch listens on `127.0.0.1` only and answers only
 requests carrying the per-fork secret it put in `OPENAI_API_KEY` /
 `ANTHROPIC_API_KEY`, so nothing else on the machine can borrow the real key
 it forwards with — and inside the block those variables hold the secret, not
 the real key, so the agent's SDK never sends it anywhere. A provider client
 built *before* the block keeps the URL it was built with — build it inside,
-or pass `fork.openai_kwargs()`.
+or pass `fork.anthropic_kwargs()` (`fork.openai_kwargs()` for the OpenAI
+SDK).
 
-`fork.tool_result(name)` returns the next recorded tool step — the edit, at
-the edited step — or `None` once the harness should run the real tool;
-`fork.call_tool(name, fn, *args)` does that choice for you. A `None` says
-nothing about model calls: the server keeps a tool cursor and a model cursor
-apart, and answers `replay_live` for a tool the recording does not hold —
-a setup tool the agent calls before its first model call, say — while
-recorded model calls are still to come. Only the model endpoint's own
-`replay_live` moves the switch (and `fork.is_live`), so those calls are
-still answered from the recording, strictly matched.
+A `None` from `fork.tool_result(name)` says nothing about model calls: the
+server keeps a tool cursor and a model cursor apart, and answers
+`replay_live` for a tool the recording does not hold — a setup tool the
+agent calls before its first model call, say — while recorded model calls
+are still to come. Only the model endpoint's own `replay_live` moves the
+switch (and `fork.is_live`), so those calls are still answered from the
+recording, strictly matched.
 
 **The environment is one fork's at a time.** Starting a second fork that
 would set it while one's block is active raises `RuntimeError` before
 anything is created. Forks that overlap — nested, or one per thread for
 parallel what-ifs — take `set_env=False` and give each agent its own
-`fork.openai_kwargs()` (or `fork.env()` for a subprocess); each still finds
-the real provider, never another fork's switch:
+`fork.anthropic_kwargs()` (or `fork.env()` for a subprocess); each still
+finds the real provider, never another fork's switch:
 
 ```python
 from concurrent.futures import ThreadPoolExecutor
+from anthropic import Anthropic
 
-def what_if(forecast):
-    with traza.fork("weather-7", 1, tool_result={"forecast": forecast}, set_env=False) as fork:
-        return run_agent("What's the weather in Paris?", client=OpenAI(**fork.openai_kwargs()))
+def what_if(failure):
+    with traza.fork("dr-0917", 10, tool_result={"error": failure}, set_env=False) as fork:
+        llm = Anthropic(**fork.anthropic_kwargs())
+        return run_research(TASK, client=llm, recorded=fork.tool_result)
 
-answers = list(ThreadPoolExecutor(4).map(what_if, ["sun", "snow", "fog", "hail"]))
+briefs = list(ThreadPoolExecutor(4).map(what_if, ["fetch failed: 404", "fetch failed: 403",
+                                                  "timed out", "paywalled"]))
 ```
 
 **Spans are tagged** when the OpenTelemetry SDK is configured before the
@@ -289,19 +321,25 @@ the fork is made with `tag_threads=True` — which tags every thread's spans,
 for a process that runs nothing but the forked agent, and is allowed for one
 fork at a time. Without the SDK, `fork.span_attributes()` is the dict to
 stamp yourself, and `fork.env()` carries `TRAZA_FORK_ID`,
-`TRAZA_FORK_PARENT`, `TRAZA_FORK_STEP` and `TRAZA_FORK_RUN` for a subprocess
-agent along with the switch's URLs and key. From a shell:
+`TRAZA_FORK_PARENT`, `TRAZA_FORK_STEP`, `TRAZA_FORK_RUN` and
+`TRAZA_REPLAY_ID` for a subprocess agent along with the switch's URLs and
+key. From a shell, `traza fork` runs the agent with that environment and
+`TRAZA_URL`; its harness asks
+`POST $TRAZA_URL/v1/replays/$TRAZA_REPLAY_ID/tools/next` for the result of
+each tool it runs itself, and runs the real tool when that answers
+`409 replay_live`:
 
 ```sh
-traza fork weather-7 --at 1 --tool-result '{"forecast": "sun", "celsius": 24}' -- python agent.py
+traza fork dr-0917 --at 10 --tool-result '{"error": "fetch failed: 404"}' -- python research.py
 ```
 
 ## From TypeScript: `client.fork`
 
 ```ts
-const fork = await traza.fork("weather-7", { atStep: 1, toolResult: { forecast: "sun", celsius: 24 } });
-const openai = new OpenAI(fork.openaiOptions());   // { baseURL, apiKey, fetch }
-await runAgent(openai);
+const fork = await traza.fork("dr-0917", { atStep: 10, toolResult: { error: "fetch failed: 404" } });
+const anthropic = new Anthropic(fork.anthropicOptions());   // { baseURL, apiKey, fetch }
+const recorded = (name: string) => fork.toolResult(name);   // the edit at step 10; null past the cut
+await runResearch(anthropic, { recorded });
 fork.close();
 ```
 
@@ -310,8 +348,10 @@ Anthropic SDKs take one — so no port is opened: it sends each call to the
 replay until it answers `replay_live`, then that call and every later one to
 the real provider (`liveOpenAI` / `liveAnthropic` options, else the
 environment's base URL and key). Each fork is its own `fetch`, so any number
-can run side by side in one process. As in Python, `fork.toolResult(name)`
-answering `null` — a tool the recording lacks — moves no model call off the
+can run side by side in one process. As in Python, the harness takes tool
+results from `fork.toolResult(name)` and runs the real tool on `null`
+(`fork.callTool(name, fn)` makes that choice in one call). A `null` — past
+the cut, or a tool the recording lacks — moves no model call off the
 recording; only a model call answered `replay_live` does (`fork.isLive`).
 
 `fork.spanProcessor()` returns a duck-typed OpenTelemetry span processor
@@ -324,7 +364,7 @@ their own runs:
 import { context } from "@opentelemetry/api";
 
 provider.addSpanProcessor(fork.spanProcessor());
-await fork.run(context, () => runAgent(openai));   // context.with(fork.context(context.active()), …)
+await fork.run(context, () => runResearch(anthropic, { recorded }));   // context.with(fork.context(context.active()), …)
 ```
 
 The fork is carried under `Symbol.for("traza.fork")` (exported as
@@ -337,16 +377,20 @@ open, whatever its context — only for a process that runs nothing else.
 A recorded run is a regression test waiting to happen. Replay it strictly and
 the agent either walks the same path or says where it left it — with zero
 model calls. When a strict replay refuses a request, the refusal now carries
-**where the request first differs** from the recording:
+**where the request first differs** from the recording. Here the harness that
+refuses to fetch a URL twice is replayed strictly against `dr-0917`, and its
+first model call after the refused fetch is refused:
 
 ```json
-{"error":{"type":"replay_divergence","step":0,
-  "difference":{"message":1,"role":"user","field":"content","at_char":22,
-                "recorded":"What's the weather in Paris?","got":"What's the weather in Lyon?",
-                "recorded_messages":2,"got_messages":2},
-  "expected_digest":"8b9a07d4aac0a133c789406dfccd9477618c1049ca0255f58b262fc72fca3d8b",
-  "got_digest":"1ae84ec741143bc4906084e3b81b9edcea06fb65c14ad097fde00c8afe9bb01f",
-  "message":"this request's messages do not match recorded step 0: …"}}
+{"error":{"type":"replay_divergence","step":13,
+  "difference":{"message":9,"role":"user","field":"content","at_char":13,
+                "recorded":"[{\"content\":\"Pilot lines (2026): three cell makers ran solid-state pilot lines at 0.2 to 1 GWh a year. First-pass yields…",
+                "got":"[{\"content\":\"Already fetched https://www.example-energy.org/2026/solid-state-pilot-lines earlier in this run; reusing th…",
+                "recorded_messages":10,"got_messages":10},
+  "expected_digest":"38d64ab342a7ff12be1b446cc0209eecabbae76f5d4ec73b59a9e88a178ddd6d",
+  "got_digest":"2d02f0080506df8f483cde7735ec2240ee801fdbd82f82836201aa8a882f0cb1",
+  "message":"this request's messages do not match recorded step 13: …"},
+ "type":"error"}
 ```
 
 A replay holds only each recorded request's digest, so the recorded request
@@ -378,20 +422,23 @@ recording holds.
 from traza import Client
 from traza.testing import replay_test
 
-def test_weather_agent_follows_its_recording():
-    replay_test(Client.from_env(), "weather-7", lambda tape: run_agent("What's the weather in Paris?"))
+def test_research_agent_follows_its_recording():
+    replay_test(Client.from_env(), "dr-0917", lambda tape: run_research(TASK, recorded=tape.tool_result))
 ```
 
 `replay_test` points `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` at a strict
 replay while the agent runs, then raises `TapeMismatch` — an
-`AssertionError` — when the agent diverged, stopped early, or overran:
+`AssertionError` — when the agent diverged, stopped early, or overran. The
+agent takes its tool results from the recording too (`tape.tool_result`), so
+the pages it is shown are the recorded ones. Under the deduping harness the
+test fails so:
 
 ```text
-the agent diverged from recorded run weather-7 at step 0:
-  message 1 (user): content differs at character 22
-    recorded: "What's the weather in Paris?"
-    got:      "What's the weather in Lyon?"
-  (the recording's request has 2 messages, the agent's 2)
+the agent diverged from recorded run dr-0917 at step 13:
+  message 9 (user): content differs at character 13
+    recorded: '[{"content":"Pilot lines (2026): three cell makers ran solid-state pilot lines at 0.2 to 1 GWh a year. First-pass yields…'
+    got:      '[{"content":"Already fetched https://www.example-energy.org/2026/solid-state-pilot-lines earlier in this run; reusing th…'
+  (the recording's request has 10 messages, the agent's 10)
 ```
 
 The package also registers **pytest-traza** (a `pytest11` entry point; with
@@ -400,9 +447,9 @@ the source tree alone, `-p traza.pytest_plugin`):
 ```python
 import pytest
 
-@pytest.mark.traza_tape("weather-7")
+@pytest.mark.traza_tape("dr-0917")
 def test_follows_the_recording(traza_tape):
-    run_agent("What's the weather in Paris?")   # every model call answered from the run
+    run_research(TASK, recorded=traza_tape.tool_result)   # every model call answered from the run
 ```
 
 A marked test runs against a strict replay of the run and fails with the
@@ -422,9 +469,11 @@ pytest; the package itself still depends on nothing.
 ```ts
 import { Client, replayTest } from "@trazadb/sdk";
 
-test("the weather agent follows its recording", async () => {
-  await replayTest(new Client(url), "weather-7", async (replay) => {
-    await runAgent(new OpenAI({ baseURL: replay.openaiBaseUrl, apiKey: "traza" }));
+test("the research agent follows its recording", async () => {
+  await replayTest(new Client(url), "dr-0917", async (replay) => {
+    await runResearch(new Anthropic({ baseURL: replay.anthropicBaseUrl, apiKey: "traza" }), {
+      recorded: (name) => replay.nextTool(name),
+    });
   });
 });
 ```
@@ -453,7 +502,7 @@ or `"false"`. `"True"` — Python's `str(True)` — marks nothing either way.
 the same every time:
 
 ```json
-{"runs":[{"run":"weather-7","tenant":"","source":"annotation","tagged_at_ns":1792298442062521000}],
+{"runs":[{"run":"dr-0917","tenant":"","source":"annotation","tagged_at_ns":1792386745895029000}],
  "spans_examined":0,"annotations_examined":1,"truncated":false}
 ```
 

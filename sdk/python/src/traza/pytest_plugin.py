@@ -7,9 +7,9 @@ reproduce::
 
     import pytest
 
-    @pytest.mark.traza_tape("weather-7")
-    def test_weather_agent_follows_its_recording():
-        run_agent("What's the weather in Paris?")   # every model call answered from the run
+    @pytest.mark.traza_tape("dr-0917")
+    def test_research_agent_follows_its_recording(traza_tape):
+        run_research(TASK, recorded=traza_tape.tool_result)   # every model call answered from the run
 
 For the test's duration ``OPENAI_BASE_URL``, ``ANTHROPIC_BASE_URL`` and their
 API keys point at a strict replay of the run, so an agent that builds its

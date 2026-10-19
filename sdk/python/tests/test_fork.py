@@ -25,6 +25,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 try:
     import resource
@@ -728,6 +729,25 @@ class GoldenRunsAndTheCommand(unittest.TestCase):
         self.assertIn("served 2 recorded model call(s)", err)
         code, out, _ = run_cli("forks", "golden-by-tag", "--url", self.server.url)
         self.assertEqual(code, 0)
+
+    def test_traza_fork_tells_the_agent_where_its_tool_results_are(self):
+        # The harness asks the server for the tool results, the edit among
+        # them, so the agent needs the server's URL as well as the switch's.
+        harness = textwrap.dedent(
+            """
+            import json, os, urllib.request
+            request = urllib.request.Request(
+                os.environ["TRAZA_URL"] + "/v1/replays/" + os.environ["TRAZA_REPLAY_ID"] + "/tools/next",
+                data=b"{}", method="POST", headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(request, timeout=10) as answer:
+                step = json.loads(answer.read())
+            raise SystemExit(0 if step["edited"] and step["result"] == "sunny" else 3)
+            """)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("TRAZA_URL", None)
+            code, _, err = run_cli("fork", "golden-by-tag", "--url", self.server.url, "--at", "1",
+                                   "--tool-result", '"sunny"', "--no-live", "--", sys.executable, "-c", harness)
+        self.assertEqual(code, 0, err)
 
 
 class PytestPlugin(unittest.TestCase):

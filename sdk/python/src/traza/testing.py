@@ -8,8 +8,8 @@ path or says where it left it::
     from traza import Client
     from traza.testing import replay_test
 
-    def test_weather_agent_still_asks_for_the_tool():
-        replay_test(Client.from_env(), "weather-7", lambda tape: run_agent("Paris"))
+    def test_research_agent_follows_its_recording():
+        replay_test(Client.from_env(), "dr-0917", lambda tape: run_research(TASK, recorded=tape.tool_result))
 
 A tape test fails when the agent's request at some step differs from the
 recorded one (the failure names the message, field and character where it

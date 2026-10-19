@@ -206,8 +206,8 @@ golden runs; in short:
   `openaiOptions()` / `anthropicOptions()` carry a switching `fetch` for the
   provider SDKs, and whose `spanProcessor()` tags the spans started in the
   fork's OpenTelemetry context (`fork.run(context, fn)`) until `close()`.
-  `tool_result(name)` /
-  `toolResult(name)` returns the edited or recorded tool step, or
+  The agent's harness takes its tool results from `tool_result(name)` /
+  `toolResult(name)`, which returns the edited or recorded tool step, or
   `None` / `null` once the real tool should run — which moves no model call
   off the recording: only the model endpoint's own `replay_live` switches
   model calls to the provider.
@@ -220,9 +220,9 @@ golden runs; in short:
 
   ```sh
   traza test -- python agent.py --task "{input}"   # every golden run; JUnit XML on stdout
-  traza golden add weather-7                        # mark a run golden
-  traza forks weather-7                             # its branches and where they parted
-  traza fork weather-7 --at 1 --response "Sunny." -- python agent.py
+  traza golden add dr-0917                          # mark a run golden
+  traza forks dr-0917                               # its branches and where they parted
+  traza fork dr-0917 --at 10 --tool-result '{"error": "fetch failed: 404"}' -- python research.py
   traza forward --upstream https://api.trazadb.com  # plain HTTP on 127.0.0.1:8089, TLS upstream
   ```
 
@@ -234,7 +234,10 @@ golden runs; in short:
   passed, 1 when one failed (or there was nothing to test, unless
   `--allow-empty`, or the golden listing was incomplete, unless
   `--allow-partial`), 2 for a usage error, a refused key, or a server that
-  could not be asked.
+  could not be asked. `traza fork` exits with the agent's status. It runs
+  the agent with the fork's environment, `TRAZA_URL` and `TRAZA_REPLAY_ID`
+  among it, and the agent's harness takes its tool results, the edit among
+  them, from `POST $TRAZA_URL/v1/replays/$TRAZA_REPLAY_ID/tools/next`.
 - **`traza forward`** (Python) lets the tools that speak plain HTTP only —
   `traza-server import --watch`, `traza-server blame`, the MCP bridge —
   reach a server over TLS: it listens on loopback only and forwards each

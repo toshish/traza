@@ -1080,11 +1080,11 @@ The run's tape.
 | `max_steps` | integer | Steps to return. Default and maximum 20,000 |
 
 ```sh
-curl 'http://localhost:8080/v1/tapes/weather-7?max_steps=1'
+curl 'http://localhost:8080/v1/tapes/dr-0917?max_steps=2'
 ```
 
 ```json
-{"run":"weather-7","spans_examined":4,"steps":[{"duration_ns":390000000,"fingerprint":"llm:gpt-6.1-sol#8b9a07d4aac0a133","index":0,"kind":"llm","model":"gpt-6.1-sol","name":"openai.chat","parent_span_id":"wf","request":[{"content":"You are a weather assistant.","role":"system"},{"content":"What's the weather in Paris?","role":"user"}],"request_digest":"8b9a07d4aac0a133c789406dfccd9477618c1049ca0255f58b262fc72fca3d8b","response":[{"finish_reason":"tool_calls","role":"assistant","tool_calls":[{"arguments":{"city":"Paris"},"id":"call_w1","name":"get_weather"}]}],"response_digest":"bc0a9a93dfc45c687262d0e46fceb83a1c7c92d362ccb045210310872c51d35f","service":"weather-agent","span_id":"llm-1","start_ns":1791964800010000000,"status":"ok","tokens":{"cache_read":null,"cache_write":null,"context":82,"input":82,"output":17},"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],"tenant":null,"truncated":true}
+{"run":"dr-0917","spans_examined":18,"steps":[{"agent":"research-coordinator","duration_ns":58335000000,"fingerprint":"agent:research-coordinator","index":0,"kind":"agent","name":"invoke_agent research-coordinator","parent_span_id":null,"service":"research-coordinator","span_id":"bcf07cce50a1f52c","start_ns":1792375699060000000,"status":"ok","tokens":{"cache_read":null,"cache_write":null,"context":null,"input":null,"output":null},"trace_id":"a41876d7175d7379e2c57700a0f32aca"},{"agent":"research-coordinator","cost_usd":0.051276,"duration_ns":3600000000,"fingerprint":"llm:claude-opus-5-5#ea97869dbfadddfc","index":1,"kind":"llm","model":"claude-opus-5-5","name":"chat claude-opus-5-5","parent_span_id":"bcf07cce50a1f52c","request":[{"content":"You are a research coordinator. Delegate web searches to the web-researcher subagent, read the sources it finds with WebFetch, then write a one-page brief that cites every source by URL.","role":"system"},{"content":"Write a one-page brief on solid-state battery readiness for EVs in 2027, with sources.","role":"user"}],"request_digest":"ea97869dbfadddfc08be3a151877b8a2e29b6dfb7f39f1fe43e2621484244b50","response":[{"finish_reason":"tool_use","role":"assistant","tool_calls":[{"arguments":{"description":"Battery sources","prompt":"Find 2026 primary sources on solid-state battery pilot production, yields and cost per kWh.","subagent_type":"web-researcher"},"id":"toolu_3f1122f4c8b6b74dc8ee54","name":"Agent"}]}],"response_digest":"54d13d575a267c22e2ea90d26527de3fed2cca599910b5fa55da7bea41db5818","service":"research-coordinator","span_id":"a1c7b039a39c0950","start_ns":1792375699065000000,"status":"ok","tokens":{"cache_read":0,"cache_write":9840,"context":9844,"input":4,"output":103},"trace_id":"a41876d7175d7379e2c57700a0f32aca"}],"tenant":null,"truncated":true}
 ```
 
 | Field | Type | Description |
@@ -1110,11 +1110,11 @@ curl 'http://localhost:8080/v1/tapes/weather-7?max_steps=1'
 Snapshots a run's tape into a replay that serves its model answers back.
 
 ```sh
-curl -X POST http://localhost:8080/v1/replays -d '{"run":"weather-7","mode":"loose"}'
+curl -X POST http://localhost:8080/v1/replays -d '{"run":"dr-0917","mode":"loose"}'
 ```
 
 ```json
-{"base_urls":{"anthropic":"/v1/replays/rp_70235b53074a150e1cca9771c76a88bf/anthropic","openai":"/v1/replays/rp_70235b53074a150e1cca9771c76a88bf/openai/v1"},"expires_at_ns":1792065849919268000,"id":"rp_70235b53074a150e1cca9771c76a88bf","llm_steps":2,"mode":"loose","run":"weather-7","steps":3,"unreadable_tool_steps":[]}
+{"base_urls":{"anthropic":"/v1/replays/rp_26620995e5d2c2ba2eda48648074b05b/anthropic","openai":"/v1/replays/rp_26620995e5d2c2ba2eda48648074b05b/openai/v1"},"expires_at_ns":1792390379842274000,"id":"rp_26620995e5d2c2ba2eda48648074b05b","llm_steps":9,"mode":"loose","run":"dr-0917","steps":18,"unreadable_tool_steps":[]}
 ```
 
 | Body field | Type | Description |
@@ -1160,7 +1160,7 @@ then counts the steps read, not the run's.
 What a replay has served.
 
 ```json
-{"calls":[{"at_ns":1792062255964194000,"matched":true,"step":0}],"diverged":null,"exhausted_calls":0,"expires_at_ns":1792065849919268000,"id":"rp_70235b53074a150e1cca9771c76a88bf","mode":"loose","remaining":1,"run":"weather-7","served":1,"unreadable_tool_steps":[]}
+{"calls":[{"at_ns":1792386779895337250,"matched":true,"step":1}],"diverged":null,"exhausted_calls":0,"expires_at_ns":1792390379842274000,"id":"rp_26620995e5d2c2ba2eda48648074b05b","mode":"loose","remaining":8,"run":"dr-0917","served":1,"unreadable_tool_steps":[]}
 ```
 
 `served` and `remaining` count model steps. `calls` lists each model call
@@ -1226,20 +1226,20 @@ recording holding several assistant messages is served as one message. With
 `message_delta`, `message_stop`.
 
 ```sh
-curl -X POST http://localhost:8080/v1/replays/rp_70235b53074a150e1cca9771c76a88bf/anthropic/v1/messages \
+curl -X POST http://localhost:8080/v1/replays/rp_26620995e5d2c2ba2eda48648074b05b/anthropic/v1/messages \
   -H 'x-api-key: TOKEN' -H 'anthropic-version: 2023-06-01' \
-  -d '{"model":"claude-x","max_tokens":256,"system":"You are a weather assistant.","messages":[{"role":"user","content":"What'"'"'s the weather in Paris?"}]}'
+  -d '{"model":"claude-opus-5-5","max_tokens":8192,"system":"You are a research coordinator. Delegate web searches to the web-researcher subagent, read the sources it finds with WebFetch, then write a one-page brief that cites every source by URL.","messages":[{"role":"user","content":"Write a one-page brief on solid-state battery readiness for EVs in 2027, with sources."}]}'
 ```
 
 ```json
-{"content":[{"id":"call_w1","input":{"city":"Paris"},"name":"get_weather","type":"tool_use"}],"id":"msg_traza70235b53074as0","model":"gpt-6.1-sol","role":"assistant","stop_reason":"tool_use","stop_sequence":null,"type":"message","usage":{"input_tokens":82,"output_tokens":17}}
+{"content":[{"id":"toolu_3f1122f4c8b6b74dc8ee54","input":{"description":"Battery sources","prompt":"Find 2026 primary sources on solid-state battery pilot production, yields and cost per kWh.","subagent_type":"web-researcher"},"name":"Agent","type":"tool_use"}],"id":"msg_traza26620995e5d2s1","model":"claude-opus-5-5","role":"assistant","stop_reason":"tool_use","stop_sequence":null,"type":"message","usage":{"cache_creation_input_tokens":9840,"cache_read_input_tokens":0,"input_tokens":4,"output_tokens":103}}
 ```
 
 Errors take Anthropic's shape, `{"type":"error","error":{"type",…}}`, with the
 same statuses and types as the OpenAI route:
 
 ```json
-{"error":{"message":"all 2 recorded model calls have been served","served":2,"type":"replay_exhausted"},"type":"error"}
+{"error":{"message":"all 9 recorded model calls have been served","served":9,"type":"replay_exhausted"},"type":"error"}
 ```
 
 ### `POST /v1/replays/{id}/tools/next`
@@ -1250,7 +1250,7 @@ tools. Body `{"tool": "<name>"}` takes the next one with that name; an empty
 body or `{}` takes the next of any name.
 
 ```json
-{"arguments":{"city":"Paris"},"result":{"celsius":12,"forecast":"rain"},"step":1,"tool":"get_weather"}
+{"arguments":{"prompt":"List the 2026 figures on pilot lines, yields, cost per kWh and sample cells.","url":"https://www.example-energy.org/2026/solid-state-pilot-lines"},"result":"Pilot lines (2026): three cell makers ran solid-state pilot lines at 0.2 to 1 GWh a year. First-pass yields were reported between 60% and 75%.","step":8,"tool":"WebFetch"}
 ```
 
 A fork's edited result is served the same way, with `"edited": true`.
@@ -1274,11 +1274,11 @@ Two runs aligned step by step. Parameters: `a` and `b` (required run ids),
 `tenant`.
 
 ```sh
-curl 'http://localhost:8080/v1/diff?a=weather-7&b=weather-8'
+curl 'http://localhost:8080/v1/diff?a=dr-0917&b=dr-0917-dedupe'
 ```
 
 ```json
-{"a":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-7","steps":3,"tokens":233,"truncated":false},"aligned":[{"a":0,"b":0,"fingerprint_a":"llm:gpt-6.1-sol#8b9a07d4aac0a133","fingerprint_b":"llm:gpt-6.1-sol#1ae84ec741143bc4","op":"changed","why":"input"},{"a":1,"b":1,"fingerprint_a":"tool:get_weather#6e1e312d537bc71b","fingerprint_b":"tool:get_weather#ac8cc520a3295a36","op":"changed","why":"input"},{"a":2,"b":2,"fingerprint_a":"llm:gpt-6.1-sol#6db28425e9e18cdb","fingerprint_b":"llm:gpt-6.1-sol#592c7b1d345f6104","op":"changed","why":"input"}],"b":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-8","steps":3,"tokens":233,"truncated":false},"delta":{"cost_usd":0.0,"duration_ns":0,"errors":0,"steps":0,"tokens":0},"first_divergence":{"a":0,"b":0,"explanation":"step 0 of a and step 0 of b (llm:gpt-6.1-sol) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b","kind":"input"},"truncated":false}
+{"a":{"cost_usd":0.27121787500000005,"duration_ns":58335000000,"errors":0,"outcome":"success","run":"dr-0917","steps":18,"tokens":3341,"truncated":false},"aligned":[{"a":0,"b":0,"fingerprint_a":"agent:research-coordinator","fingerprint_b":"agent:research-coordinator","op":"same"},{"a":1,"b":1,"fingerprint_a":"llm:claude-opus-5-5#ea97869dbfadddfc","fingerprint_b":"llm:claude-opus-5-5#ea97869dbfadddfc","op":"same"},{"a":2,"b":2,"fingerprint_a":"tool:Agent#b8a25c5ef91fd1e8","fingerprint_b":"tool:Agent#b8a25c5ef91fd1e8","op":"same"},{"a":3,"b":3,"fingerprint_a":"agent:web-researcher","fingerprint_b":"agent:web-researcher","op":"same"},{"a":4,"b":4,"fingerprint_a":"llm:claude-haiku-5-5#629f8c5aa2e5db83","fingerprint_b":"llm:claude-haiku-5-5#629f8c5aa2e5db83","op":"same"},{"a":5,"b":5,"fingerprint_a":"tool:WebSearch#77934dd2a4e0f5da","fingerprint_b":"tool:WebSearch#77934dd2a4e0f5da","op":"same"},{"a":6,"b":6,"fingerprint_a":"llm:claude-haiku-5-5#ba2f659d75ad3abd","fingerprint_b":"llm:claude-haiku-5-5#ba2f659d75ad3abd","op":"same"},{"a":7,"b":7,"fingerprint_a":"llm:claude-opus-5-5#eb7e0390cccc8fa3","fingerprint_b":"llm:claude-opus-5-5#eb7e0390cccc8fa3","op":"same"},{"a":8,"b":8,"fingerprint_a":"tool:WebFetch#4d0747980d9ec482","fingerprint_b":"tool:WebFetch#4d0747980d9ec482","op":"same"},{"a":9,"b":9,"fingerprint_a":"llm:claude-opus-5-5#c651b83e8117ae6a","fingerprint_b":"llm:claude-opus-5-5#c651b83e8117ae6a","op":"same"},{"a":10,"b":10,"fingerprint_a":"tool:WebFetch#9bd78904d70ddce1","fingerprint_b":"tool:WebFetch#9bd78904d70ddce1","op":"same"},{"a":11,"b":11,"fingerprint_a":"llm:claude-opus-5-5#a3220904e522c49f","fingerprint_b":"llm:claude-opus-5-5#a3220904e522c49f","op":"same"},{"a":12,"b":12,"fingerprint_a":"tool:WebFetch#4d0747980d9ec482","fingerprint_b":"tool:WebFetch#4d0747980d9ec482","op":"changed","why":"decision"},{"a":13,"b":13,"fingerprint_a":"llm:claude-opus-5-5#38d64ab342a7ff12","fingerprint_b":"llm:claude-opus-5-5#2d02f0080506df8f","op":"changed","why":"input"},{"a":14,"b":14,"fingerprint_a":"tool:WebFetch#8e9833ed4fb157ae","fingerprint_b":"tool:WebFetch#8e9833ed4fb157ae","op":"same"},{"a":15,"b":15,"fingerprint_a":"llm:claude-opus-5-5#5955c288ffbd662a","fingerprint_b":"llm:claude-opus-5-5#a5db4b2e5928b433","op":"changed","why":"input"},{"a":16,"b":null,"fingerprint_a":"tool:WebFetch#9bd78904d70ddce1","fingerprint_b":null,"op":"delete","why":"structure"},{"a":17,"b":null,"fingerprint_a":"llm:claude-opus-5-5#93bc8c819bb7abc8","fingerprint_b":null,"op":"delete","why":"structure"}],"b":{"cost_usd":0.202954675,"duration_ns":51257000000,"errors":0,"outcome":"success","run":"dr-0917-dedupe","steps":16,"tokens":3236,"truncated":false},"delta":{"cost_usd":-0.06826320000000005,"duration_ns":-7078000000,"errors":0,"steps":-2,"tokens":-105},"first_divergence":{"a":12,"b":12,"explanation":"step 12 of a and step 12 of b (tool:WebFetch) received the same input and produced a different output: response e450b5a73db1 in a, 750af04196bb in b","kind":"decision"},"truncated":false}
 ```
 
 | Field | Type | Description |
@@ -1316,11 +1316,11 @@ Earlier runs whose recorded text contains every word of `q`.
 | `tenant` | string | Tenant scope |
 
 ```sh
-curl 'http://localhost:8080/v1/recall?q=weather+Paris&limit=1'
+curl 'http://localhost:8080/v1/recall?q=solid-state+battery&limit=1'
 ```
 
 ```json
-{"runs":[{"cost_usd":0.0,"last_end_ns":1791964801000000000,"outcome":"success","outcome_source":"derived","run":"weather-7","score":3,"skeleton":["llm:gpt-6.1-sol","tool:get_weather","llm:gpt-6.1-sol"],"skeleton_truncated":false,"steps":3,"tenant":"","truncated":false}],"truncated":false}
+{"runs":[{"cost_usd":0.27121787500000005,"last_end_ns":1792375757395000000,"outcome":"success","outcome_source":"derived","run":"dr-0917","score":11,"skeleton":["agent:research-coordinator","llm:claude-opus-5-5","tool:Agent","agent:web-researcher","llm:claude-haiku-5-5","tool:WebSearch","llm:claude-haiku-5-5","llm:claude-opus-5-5","tool:WebFetch","llm:claude-opus-5-5","tool:WebFetch","llm:claude-opus-5-5","tool:WebFetch","llm:claude-opus-5-5","tool:WebFetch","llm:claude-opus-5-5","tool:WebFetch","llm:claude-opus-5-5"],"skeleton_truncated":false,"steps":18,"tenant":"","truncated":false}],"truncated":false}
 ```
 
 Ranking: outcome first (successes first under `any`), then `score` — the
@@ -1892,11 +1892,11 @@ fork's own tenant. See the [fork guide](fork.md#finding-a-runs-forks).
 | `tenant` | string | Tenant scope |
 
 ```sh
-curl 'http://localhost:8080/v1/forks?run=weather-7'
+curl 'http://localhost:8080/v1/forks?run=dr-0917'
 ```
 
 ```json
-{"forks":[{"cost_usd":0.0,"delta":{"cost_usd":0.0,"duration_ns":0,"errors":0,"steps":0,"tokens":0},"diffed":true,"diverged_before_cut":false,"errors":0,"first_divergence":{"a":1,"b":1,"explanation":"step 1 of a and step 1 of b (tool:get_weather) received the same input and produced a different output: response 25ac26944464 in a, 05b04b8ed40a in b","kind":"decision"},"first_start_ns":1791964860000000000,"fork_id":"fk_b6956c347b2ab03ff5b1fc530c36754d","fork_step":1,"last_end_ns":1791964861000000000,"outcome":"success","run":"fk_b6956c347b2ab03ff5b1fc530c36754d","steps":3,"tagged_spans":4,"tenant":"","truncated":false}],"merged_into_parent":0,"parent":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-7","steps":3,"tokens":233,"truncated":false},"run":"weather-7","spans_examined":4,"truncated":false}
+{"forks":[{"cost_usd":0.202954675,"delta":{"cost_usd":-0.06826320000000005,"duration_ns":-7078000000,"errors":0,"steps":-2,"tokens":-105},"diffed":true,"diverged_before_cut":false,"errors":0,"first_divergence":{"a":12,"b":12,"explanation":"step 12 of a and step 12 of b (tool:WebFetch) received the same input and produced a different output: response e450b5a73db1 in a, 750af04196bb in b","kind":"decision"},"first_start_ns":1792381327733000000,"fork_id":"fk_a9277a1d7df0130387db2879c908035b","fork_step":12,"last_end_ns":1792381378990000000,"outcome":"success","run":"dr-0917-dedupe","steps":16,"tagged_spans":16,"tenant":"","truncated":false}],"merged_into_parent":0,"parent":{"cost_usd":0.27121787500000005,"duration_ns":58335000000,"errors":0,"outcome":"success","run":"dr-0917","steps":18,"tokens":3341,"truncated":false},"run":"dr-0917","spans_examined":16,"truncated":false}
 ```
 
 | Field | Type | Description |
@@ -1935,7 +1935,7 @@ a value by one rule: the boolean, or exactly the string `"true"` /
 | `tenant` | string | Tenant scope |
 
 ```json
-{"annotations_examined":1,"runs":[{"run":"weather-7","source":"annotation","tagged_at_ns":1792298442062521000,"tenant":""}],"spans_examined":0,"truncated":false}
+{"annotations_examined":1,"runs":[{"run":"dr-0917","source":"annotation","tagged_at_ns":1792386745895029000,"tenant":""}],"spans_examined":0,"truncated":false}
 ```
 
 `source` is `attribute` or `annotation` — what marked the run; `tagged_at_ns`

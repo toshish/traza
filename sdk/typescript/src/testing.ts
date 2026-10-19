@@ -5,9 +5,11 @@
  * import { test } from "vitest";            // or jest, or node:test
  * import { Client, replayTest } from "@trazadb/sdk";
  *
- * test("the weather agent still asks for the tool", async () => {
- *   await replayTest(new Client(url), "weather-7", async (replay) => {
- *     await runAgent(new OpenAI({ baseURL: replay.openaiBaseUrl, apiKey: "traza" }));
+ * test("the research agent follows its recording", async () => {
+ *   await replayTest(new Client(url), "dr-0917", async (replay) => {
+ *     await runResearch(new Anthropic({ baseURL: replay.anthropicBaseUrl, apiKey: "traza" }), {
+ *       recorded: (name) => replay.nextTool(name),
+ *     });
  *   });
  * });
  * ```

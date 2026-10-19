@@ -166,8 +166,8 @@ a screen always opens that screen.
 trace to a run, from a run to its diff, and from a diff step to its tape carry
 `?tenant=<t>`, and `?tenant=` (empty) for the default tenant. The empty value
 matters: on the tape, diff and replay routes, naming no tenant is the operator
-view across every tenant, so a default-tenant `weather-7` opened without it
-would read every tenant's `weather-7` interleaved. The Sessions list links each
+view across every tenant, so a default-tenant `dr-0917` opened without it
+would read every tenant's `dr-0917` interleaved. The Sessions list links each
 session with its tenant for the same reason. A run opened without one (from
 the command palette, or a typed link) is read the way the server reads it:
 a tenant-bound credential sees its own tenant, and an operator sees a note

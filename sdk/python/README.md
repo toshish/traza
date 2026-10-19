@@ -208,35 +208,51 @@ SDK at it and every model call is answered from the recording — your code,
 prompts and control flow run for real; no request goes to a provider.
 
 ```python
-import json
-from openai import OpenAI
+from anthropic import Anthropic
 from traza import Client
 
-TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {
-    "type": "object", "properties": {"city": {"type": "string"}}}}}]
+COORDINATOR = ("You are a research coordinator. Delegate web searches to the web-researcher subagent, read the "
+               "sources it finds with WebFetch, then write a one-page brief that cites every source by URL.")
+WORKER = ("You are web-researcher. Search the web and reply with the most relevant primary sources, one line "
+          "each, with their URLs.")
+TASK = "Write a one-page brief on solid-state battery readiness for EVs in 2027, with sources."
+AGENT = {"name": "Agent", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}}}
+WEB_SEARCH = {"name": "WebSearch", "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}}}
+WEB_FETCH = {"name": "WebFetch", "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}}}
 
 traza = Client.from_env()
-replay = traza.replay("weather-7")       # strict by default
-llm = OpenAI(base_url=replay.openai_base_url, api_key=traza.token or "traza-open")
+replay = traza.replay("dr-0917")       # strict by default
+llm = Anthropic(base_url=replay.anthropic_base_url, api_key=traza.token or "traza-open")
 
-messages = [{"role": "system", "content": "You are a weather assistant."},
-            {"role": "user", "content": "What's the weather in Paris?"}]
-while True:
-    answer = llm.chat.completions.create(model="gpt-6.1-sol", messages=messages, tools=TOOLS)
-    message = answer.choices[0].message
-    messages.append(message.model_dump(exclude_none=True))
-    if not message.tool_calls:
-        break
-    for call in message.tool_calls:
-        recorded = replay.next_tool(call.function.name)   # the recorded result, not a live call
-        messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(recorded.result)})
 
-print(message.content)        # It's raining in Paris, 12°C. Take an umbrella.
-print(replay.status())        # served=2, remaining=0, diverged=None, …
+def run(model, system, task, tools):
+    messages = [{"role": "user", "content": task}]
+    while True:
+        answer = llm.messages.create(model=model, max_tokens=8192, system=system, messages=messages, tools=tools)
+        messages.append({"role": "assistant", "content": answer.content})
+        calls = [block for block in answer.content if block.type == "tool_use"]
+        if not calls:
+            return answer.content[0].text
+        results = []
+        for call in calls:
+            if call.name == "Agent":     # the sub-agent's calls are on the tape too
+                result = run("claude-haiku-5-5", WORKER, call.input["prompt"], [WEB_SEARCH])
+            else:                        # the recorded result, not a live search or fetch
+                result = replay.next_tool(call.name).result
+            results.append({"type": "tool_result", "tool_use_id": call.id, "content": result})
+        messages.append({"role": "user", "content": results})
+
+
+print(run("claude-opus-5-5", COORDINATOR, TASK, [AGENT, WEB_FETCH]))   # Solid-state batteries in 2027: pilot scale, not production. …
+print(replay.status())        # served=9, remaining=0, diverged=None, …
 ```
 
-That loop was run as written against a recorded OpenLLMetry run, with
-`openai` 2.33 and, through `replay.anthropic_base_url`, `anthropic` 0.97.
+That loop was run as written, with `anthropic` 0.97, against `dr-0917`: the
+research run the [replay guide](../../docs/guide/replay.md) uses, a
+coordinator on `claude-opus-5-5` and a `web-researcher` sub-agent on
+`claude-haiku-5-5`, recorded as OpenTelemetry GenAI spans. All nine model
+calls, the sub-agent's two included, were answered from the recording. An
+agent on the OpenAI SDK takes `replay.openai_base_url` instead.
 
 - `replay.env(api_key=None)` gives `OPENAI_BASE_URL`, `OPENAI_API_KEY`,
   `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` as absolute URLs, for an agent
@@ -250,12 +266,12 @@ That loop was run as written against a recorded OpenLLMetry run, with
   `OPENAI_BASE_URL` sends it to the real provider. If your client holds an
   operator token, mint a dedicated `ro` credential bound to the run's tenant,
   create the replay under that tenant (`Client(..., tenant="acme")`), and
-  pass the `ro` token as `api_key` (in the loop above, as the OpenAI
+  pass the `ro` token as `api_key` (in the loop above, as the Anthropic
   client's `api_key`). Any credential of the replay's tenant may consume it.
 - **Tools still run live** unless your harness takes their results from
   `next_tool()`, which returns `None` once no recorded tool step is left.
 - In strict mode a request whose messages differ from the recording is refused
-  with `409` and `x-should-retry: false`, so the OpenAI SDK raises its own
+  with `409` and `x-should-retry: false`, so the provider SDK raises its own
   `ConflictError` at once instead of retrying; `replay.status().diverged`
   names the step. `mode="loose"` serves the recorded steps in order
   regardless.
@@ -263,17 +279,21 @@ That loop was run as written against a recorded OpenLLMetry run, with
 Comparing runs, and recalling earlier ones
 -----------------------------------------
 
+`dr-0917-dedupe` is the same task run again under a harness that refuses to
+fetch a URL twice: a [fork](../../docs/guide/fork.md) of `dr-0917`.
+
 ```python
-diff = traza.diff("weather-7", "weather-8")
+diff = traza.diff("dr-0917", "dr-0917-dedupe")
 diff.first_divergence.explanation
-# 'step 0 of a and step 0 of b (llm:gpt-6.1-sol) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b'
+# 'step 12 of a and step 12 of b (tool:WebFetch) received the same input and produced a different output: response e450b5a73db1 in a, 750af04196bb in b'
 for step in diff.aligned:
     print(step.op, step.why, step.fingerprint_a, step.fingerprint_b)
-diff.delta.cost_usd, diff.delta.steps        # b minus a
+diff.delta.cost_usd, diff.delta.steps        # b minus a: (-0.06826320000000005, -2)
 
-for run in traza.recall("weather Paris", outcome="any", limit=5):
+for run in traza.recall("solid-state battery", outcome="any", limit=5):
     print(run.run, run.outcome, run.score, " -> ".join(run.skeleton))
-# weather-7 success 3 llm:gpt-6.1-sol -> tool:get_weather -> llm:gpt-6.1-sol
+# dr-0917 success 11 agent:research-coordinator -> llm:claude-opus-5-5 -> tool:Agent -> …
+# dr-0917-dedupe success 10 agent:research-coordinator -> llm:claude-opus-5-5 -> tool:Agent -> …
 ```
 
 `tape(run, resolve=False)` returns the run's steps with their inputs, outputs,
@@ -400,5 +420,8 @@ The suite starts two real servers on ephemeral ports — one open, one with
 `TRAZA_TOKENS` — and runs every method against their responses, including a
 fuse stop raising `FuseTripped`, a replay consumed over the OpenAI and
 Anthropic routes with plain `urllib`, a quota refusal, and an evidence pack's
-digest. Redirects and unreadable answers, which the real server never sends,
+digest. `tests/test_research.py` records `dr-0917` and runs this README's
+replay loop against it, with a few lines of `urllib` standing in for the
+Anthropic SDK, and checks the outputs shown here and in the guides. Redirects
+and unreadable answers, which the real server never sends,
 come from a canned-answer stub (`tests/_stub.py`). It takes a few seconds.

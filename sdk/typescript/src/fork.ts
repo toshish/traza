@@ -7,11 +7,21 @@
  * recording never took:
  *
  * ```ts
- * const fork = await traza.fork("weather-7", { atStep: 2, response: "It is sunny in Paris." });
- * const openai = new OpenAI(fork.openaiOptions());   // baseURL, apiKey and the switching fetch
- * await runAgent(openai);                            // steps 0-1 replayed, 2 edited, then live
+ * const fork = await traza.fork("dr-0917", { atStep: 10, toolResult: { error: "fetch failed: 404" } });
+ * const anthropic = new Anthropic(fork.anthropicOptions()); // baseURL, apiKey and the switching fetch
+ * const recorded = (name: string) => fork.toolResult(name); // the edit at step 10; null past the cut
+ * await runResearch(anthropic, { recorded });               // steps 0-9 replayed, 10 edited, then live
  * fork.close();
  * ```
+ *
+ * Before it runs a tool of its own (the search, a fetch), the harness asks
+ * `recorded` for that tool's result. It uses the step's `result` when one
+ * comes back — the edit, at step 10 — and runs the real tool on `null`, as
+ * it does past the cut. The `Agent` tool still runs the sub-agent, whose
+ * model calls are on the tape.
+ * {@link Fork.callTool} makes that choice in one call. The switch carries
+ * model calls only, so an edited tool result reaches the agent through its
+ * harness or not at all.
  *
  * The switch is the `fetch` the fork hands the SDK: it sends each call to
  * the Traza replay until the replay answers `409 replay_live`, then sends
@@ -36,7 +46,7 @@
  * ```ts
  * import { context } from "@opentelemetry/api";
  * provider.addSpanProcessor(fork.spanProcessor());
- * await fork.run(context, () => runAgent(openai));
+ * await fork.run(context, () => runResearch(anthropic, { recorded }));
  * ```
  *
  * @module
