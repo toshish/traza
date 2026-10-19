@@ -209,9 +209,10 @@ def post_history(api):
             for position, (kind, name) in enumerate(HISTORY_PATHS[path]):
                 t1 = clock + RNG.uniform(0.3, 1.2)
                 if kind == "llm":
+                    tokens_in = 600 + 40 * position
                     attrs = {"gen_ai.operation.name": "chat", "gen_ai.request.model": name,
-                             "gen_ai.usage.input_tokens": 600 + 40 * position, "gen_ai.usage.output_tokens": 90,
-                             "llm.cost_usd": 0.0021}
+                             "gen_ai.usage.input_tokens": tokens_in, "gen_ai.usage.output_tokens": 90,
+                             "llm.cost_usd": round(tokens_in * 2e-6 + 90 * 1e-5, 6)}
                     status = "ok"
                 else:
                     attrs = {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name,
