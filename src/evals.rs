@@ -533,6 +533,14 @@ pub(crate) fn collect_payload_refs_from(value: &Value, refs: &mut HashSet<String
 /// example bodies nest them wherever the promoted span had them. Redaction
 /// markers (`"erased": true`) are not references, same rule as span
 /// collection.
+///
+/// A `$payload` key whose value is not a well-formed reference is collected
+/// too, and deliberately: a version POST checks every collected reference
+/// against the store, and "not a reference" must fail that check the same
+/// way "not in the store" does. Dropping it here would let an example carry
+/// arbitrary text under the key unexamined. What keeps such a string off the
+/// filesystem is [`crate::payload::reference_path`], which is the only way
+/// a reference becomes a path.
 fn collect_refs(value: &Value, refs: &mut HashSet<String>) {
     match value {
         Value::Object(map) => {
