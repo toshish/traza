@@ -237,17 +237,26 @@ copy can proceed at its own pace.
 `path` is a directory to copy — Traza never writes outside its own data
 directory. Copy it, then release the pin.
 
-Errors: `409` if a pin by that label already exists or the label is not a
-single non-hidden path component; `500` with a `problems` array if the pin does
-not verify; `503` if the checkpoint or linking failed.
+`{label}` names one directory directly under `pins/` and nothing else: it
+must be a single non-hidden path component — not empty, no `/` or `\`, no
+leading `.`. The rule is the same on every backup route.
+
+Errors: `400` if the label is not a single non-hidden path component; `409`
+if a pin by that label already exists; `500` with a `problems` array if the
+pin does not verify; `503` if the checkpoint or linking failed.
 
 ### `POST /v1/backups/{label}/release`
 
-Removes a pin, freeing the disk its unshared bytes were holding. Idempotent.
+Removes a pin, freeing the disk its unshared bytes were holding. Idempotent:
+releasing a label that names no pin answers the same `200`.
 
 ```json
 {"released":true,"backup":"nightly"}
 ```
+
+Errors: `400` if the label is not a single non-hidden path component. A
+label such as `..` is refused, never resolved — nothing outside `pins/` is
+reachable through this route.
 
 ### `GET /v1/verify`
 
@@ -1232,7 +1241,10 @@ and a writer that stringifies numbers should hear about it early.
 
 Returns the raw bytes of an offloaded payload. `{reference}` is the full
 `sha256/<hex>` value from a span's `$payload` field, percent-decoded from the
-path — the `/` between `sha256` and the hex digest is part of it.
+path — the `/` between `sha256` and the hex digest is part of it. A reference
+is exactly `sha256/` followed by 64 lowercase hexadecimal digits; anything
+else names no payload and answers `404`, the same as a reference to bytes the
+store does not hold.
 
 ```sh
 curl http://localhost:8080/v1/payloads/sha256/29927e273accc68286005017f7fa6e4f27bddb4db3083ff8b8d4c3667905b7fa

@@ -40,9 +40,10 @@
 //! and a digest walk skips the reserved subdirectories so a pinned segment is
 //! never mistaken for a live one.
 
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -396,9 +397,40 @@ pub(crate) fn digest_engine(engine: &Path, prior: &[ManifestFile]) -> Result<Vec
     Ok(files)
 }
 
+/// What verification reports for a manifest entry [`manifest_file`] refuses.
+const NOT_A_STORE_PATH: &str = "not a path inside the store";
+
+/// The file a manifest entry names under `base`, or `None` when the entry is
+/// not a plain relative path that stays inside it.
+///
+/// A manifest records paths relative to the directory it describes, with `/`
+/// separators: `segment-….seg`, `payloads/ab/<hash>.bin`. The engine writes
+/// those. But a manifest is also READ — from a backup directory someone
+/// hands to `--restore` — and verification only asks whether the named bytes
+/// match their recorded length and digest. So an entry `../x` that told the
+/// truth about `x` verified, and the install then copied `backup/../x` to
+/// `store/../x`: a file from beside the backup, written beside the store.
+///
+/// Every component must therefore be exactly one ordinary name. That refuses
+/// `..` and `.`, an empty component (a leading, doubled or trailing `/`), and
+/// an absolute path, which `join` would otherwise let REPLACE the base. This
+/// is the only way a manifest path becomes a filesystem path.
+pub(crate) fn manifest_file(base: &Path, relative: &str) -> Option<PathBuf> {
+    let mut path = base.to_path_buf();
+    for name in relative.split('/') {
+        let mut parts = Path::new(name).components();
+        match (parts.next(), parts.next()) {
+            (Some(Component::Normal(part)), None) if part == OsStr::new(name) => path.push(part),
+            _ => return None,
+        }
+    }
+    Some(path)
+}
+
 /// Re-reads `manifest` against the files under `engine`, checking existence,
 /// length, and digest. Returns every discrepancy rather than the first, so an
-/// operator sees the whole damage report in one pass.
+/// operator sees the whole damage report in one pass. An entry that names a
+/// path outside `engine` is itself a discrepancy and is never opened.
 ///
 /// The annotation log is verified over its manifested *prefix*: the file is
 /// append-only, so bytes past the recorded length are appends since the
@@ -406,7 +438,10 @@ pub(crate) fn digest_engine(engine: &Path, prior: &[ManifestFile]) -> Result<Vec
 pub(crate) fn verify_against(engine: &Path, manifest: &Manifest) -> Result<Vec<String>> {
     let mut problems = Vec::new();
     for file in &manifest.files {
-        let path = engine.join(file.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let Some(path) = manifest_file(engine, &file.path) else {
+            problems.push(format!("{}: {NOT_A_STORE_PATH}", file.path));
+            continue;
+        };
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -524,9 +559,18 @@ pub(crate) fn install_staged(root: &Path, staged: &Path) -> Result<u64> {
     // idempotent: nothing here is live until CURRENT moves.
     remove_working_set(root)?;
     for file in &manifest.files {
-        let relative = file.path.replace('/', std::path::MAIN_SEPARATOR_STR);
-        let source = staged.join(&relative);
-        let target = root.join(&relative);
+        // Verification above already refused a manifest naming anything
+        // outside the backup; resolving through the same check here means
+        // the copy cannot leave either directory whatever verified.
+        let (Some(source), Some(target)) = (
+            manifest_file(staged, &file.path),
+            manifest_file(root, &file.path),
+        ) else {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {NOT_A_STORE_PATH}", file.path),
+            )));
+        };
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -625,6 +669,69 @@ mod tests {
             std::env::temp_dir().join(format!("traza-gen-{label}-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&dir).expect("dir");
         dir
+    }
+
+    #[test]
+    fn a_manifest_path_resolves_only_inside_its_directory() {
+        let base = Path::new("/store");
+        // What the engine writes.
+        assert_eq!(
+            manifest_file(base, "segment-00000000000000000001.seg"),
+            Some(base.join("segment-00000000000000000001.seg"))
+        );
+        assert_eq!(
+            manifest_file(base, "payloads/ab/abcd.bin"),
+            Some(base.join("payloads").join("ab").join("abcd.bin"))
+        );
+        // What it must never follow: up, nowhere, or somewhere absolute —
+        // `Path::join` lets an absolute path REPLACE the base outright.
+        for escaping in [
+            "../planted.txt",
+            "payloads/../../planted.txt",
+            "payloads/ab/../../../planted.txt",
+            "..",
+            ".",
+            "./segment-00000000000000000001.seg",
+            "/etc/passwd",
+            "",
+            "payloads//abcd.bin",
+            "payloads/ab/",
+        ] {
+            assert_eq!(
+                manifest_file(base, escaping),
+                None,
+                "{escaping:?} is not a path inside the store"
+            );
+        }
+    }
+
+    #[test]
+    fn verification_reports_an_escaping_entry_instead_of_opening_it() {
+        let root = temp_root("escape");
+        let engine = root.join("engine");
+        fs::create_dir_all(&engine).expect("dir");
+        // A real file beside the directory, described truthfully: without
+        // the path check there is nothing here for verification to object to.
+        let planted = b"beside the store";
+        fs::write(root.join("planted.txt"), planted).expect("plant");
+        let manifest = Manifest {
+            generation: 1,
+            created_unix_ns: 0,
+            folded_through: FoldedThrough::NONE,
+            files: vec![ManifestFile {
+                path: "../planted.txt".to_owned(),
+                bytes: planted.len() as u64,
+                sha256: payload::sha256_hex(planted),
+                modified_unix_ns: 0,
+            }],
+            segment_format: None,
+        };
+        let problems = verify_against(&engine, &manifest).expect("verifies");
+        assert_eq!(
+            problems,
+            vec![format!("../planted.txt: {NOT_A_STORE_PATH}")],
+            "an entry that leaves the directory is a problem, whatever it says about the bytes"
+        );
     }
 
     #[test]
