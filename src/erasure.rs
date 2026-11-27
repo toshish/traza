@@ -796,14 +796,10 @@ impl Mask {
                 return true;
             }
         }
-        if !annotation.session_id.is_empty()
+        !annotation.session_id.is_empty()
             && self
                 .sessions
                 .contains(&(annotation.tenant.clone(), annotation.session_id.clone()))
-        {
-            return true;
-        }
-        false
     }
 
     /// Whether a pending TENANT erasure covers this tenant — the eval write
