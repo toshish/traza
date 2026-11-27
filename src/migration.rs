@@ -663,7 +663,14 @@ fn migrate_pin(pin: &Path, config: &Config) -> Result<()> {
         if generation::is_append_only(&file.path) {
             continue;
         }
-        let path = pin.join(file.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let path = generation::manifest_file(pin, &file.path).ok_or_else(|| {
+            refuse(format!(
+                "cannot migrate pin {}: its manifest names {:?}, which is not a \
+                 path inside the pin. Release the pin, then reopen",
+                pin.display(),
+                file.path
+            ))
+        })?;
         let metadata = fs::metadata(&path).map_err(|error| {
             refuse(format!(
                 "cannot migrate pin {}: manifested file {} is unreadable: \
