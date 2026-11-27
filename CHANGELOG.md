@@ -5,15 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.25.1] - 2026-11-27
 
-Three places took a name from outside the engine and joined it onto a
-directory without checking it. Two of them deleted files: one request could
-remove the whole data directory. All three are closed at the point where the
-name becomes a path, and every finding was reproduced red before its fix.
-**Upgrade if a server is reachable by anything you do not fully trust — on
-releases through 0.26.0-preview.1 an ordinary read-write token is enough for
-the first one.**
+A security release for the stable line. Three places took a name from
+outside the engine and joined it onto a directory without checking it. Two
+of them deleted files: one request could remove the whole data directory.
+All three are closed at the point where the name becomes a path, and every
+finding was reproduced red before its fix. **Upgrade if a server is
+reachable by anything you do not fully trust — on 0.25.0 and earlier, and
+on 0.26.0-preview.1, an ordinary read-write token is enough for the first
+one.**
+
+The release also carries two test-timing calibrations and one clippy fix
+from `main`, so that its own gate passes on the current toolchain. None of
+the three changes behaviour.
 
 ### Security
 
