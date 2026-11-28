@@ -41,6 +41,19 @@ use crate::analytics::{LlmAggregateRow, LlmGroupBy, SessionOrder};
 use crate::annotations::Annotation;
 use crate::{semconv, Error, Span, SpanCursor, SpanFilter, SpanSort, Store};
 
+// get_run_tape, compare_runs, recall_runs and list_forks live beside this file.
+mod replay_tools;
+// v0.28's tools live beside this file too: foresee_run (the Fate Map),
+// list_live_runs and run_topology (steering), blame_line (Agent Blame),
+// xray_step (the context X-Ray), what_changed (the change radar) and
+// find_behavior (TQL trajectory search and detectors).
+mod blame_tools;
+mod fate_tools;
+mod radar_tools;
+mod steer_tools;
+mod tql_tools;
+mod xray_tools;
+
 /// The MCP endpoint path served by `traza-server`.
 pub const ENDPOINT: &str = "/v1/mcp";
 
@@ -53,8 +66,8 @@ pub const PROTOCOL_VERSION: &str = "2025-11-25";
 /// Negotiation follows the specification: a recognized request is echoed back
 /// unchanged, and anything else is answered with [`PROTOCOL_VERSION`] so the
 /// client can decide whether to continue or disconnect. Older revisions are
-/// refused rather than half-served — `structuredContent`, which two tools
-/// return, does not exist before `2025-06-18`.
+/// refused rather than half-served — `structuredContent`, which every tool
+/// declaring an `outputSchema` returns, does not exist before `2025-06-18`.
 pub const SUPPORTED_VERSIONS: [&str; 2] = ["2025-11-25", "2025-06-18"];
 
 /// Opens the block that stored telemetry is rendered inside.
@@ -141,7 +154,7 @@ const MAX_PROMOTED_EXAMPLES: usize = 50;
 /// derived from "the last span that finished" is only meaningful once nothing
 /// more is coming. Inside this window the answer is `unknown`, which is the
 /// honest reading: a run still going has not succeeded yet.
-const SESSION_IDLE_NS: u64 = 900_000_000_000;
+pub(crate) const SESSION_IDLE_NS: u64 = 900_000_000_000;
 
 /// Byte ceilings on what one call may return.
 ///
@@ -592,6 +605,45 @@ impl<'a> Server<'a> {
                 Nature::Read,
             ),
         ];
+        // Listed only where it can answer: under --no-fuses every fuse
+        // surface is off, and a tool that can only fail is noise in a
+        // model's context.
+        if self.store.fuses_enabled() {
+            tools.push(
+                tool(
+                    "check_run_guard",
+                    "Check a run's guard verdict",
+                    "Whether an agent run may take its next step: continue, warn (approaching \
+                     a limit) or stop (a limit was crossed, or an operator stopped it), with \
+                     the reasons, the policy, and the run's usage against its limits. A run \
+                     id is a session id, or trace:<trace_id> for a run without one. \
+                     Read-only: a stop can only be cleared by an operator over HTTP, never \
+                     from here.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "run_id": {"type": "string", "description": "The run to check."},
+                            "tenant": {
+                                "type": "string",
+                                "description": "The run's tenant, for an unbound credential. \
+                                                Default: the default tenant.",
+                            },
+                        },
+                        "required": ["run_id"],
+                        "additionalProperties": false,
+                    }),
+                    Nature::Read,
+                )
+                .with_output_schema(guard_output_schema()),
+            );
+        }
+        tools.extend(replay_tools::definitions());
+        tools.extend(fate_tools::definitions());
+        tools.extend(steer_tools::definitions(self.store.fuses_enabled()));
+        tools.extend(blame_tools::definitions());
+        tools.extend(xray_tools::definitions());
+        tools.extend(radar_tools::definitions());
+        tools.extend(tql_tools::definitions());
         if self.annotation_tool_available(access) {
             tools.push(tool(
                 "record_annotation",
@@ -702,6 +754,30 @@ impl<'a> Server<'a> {
             "slowest_spans" => self.slowest_spans(arguments, context.clone()),
             "analyze_cost" => self.analyze_cost(arguments, context.clone()),
             "get_payload" => self.get_payload(arguments, &context),
+            "check_run_guard" if self.store.fuses_enabled() => {
+                self.check_run_guard(arguments, &context)
+            }
+            "check_run_guard" => {
+                return RpcError::invalid_params(
+                    "check_run_guard is disabled; the server was started with --no-fuses",
+                )
+                .into_response(id)
+            }
+            name if replay_tools::handles(name) => {
+                replay_tools::call(self, name, arguments, &context)
+            }
+            name if fate_tools::handles(name) => fate_tools::call(self, name, arguments, &context),
+            name if steer_tools::handles(name) => {
+                steer_tools::call(self, name, arguments, &context)
+            }
+            name if blame_tools::handles(name) => {
+                blame_tools::call(self, name, arguments, &context)
+            }
+            name if xray_tools::handles(name) => xray_tools::call(self, arguments, &context),
+            name if radar_tools::handles(name) => {
+                radar_tools::call(self, name, arguments, &context)
+            }
+            name if tql_tools::handles(name) => tql_tools::call(self, arguments, &context),
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
             }
@@ -1824,6 +1900,147 @@ impl<'a> Server<'a> {
         }
     }
 
+    fn check_run_guard(&self, arguments: &Map<String, Value>, context: &Context) -> ToolResult {
+        known_keys(arguments, &["run_id", "tenant"], "check_run_guard")?;
+        let run = required_str(arguments, "run_id")?;
+        let tenant = match (context.scope(), optional_string(arguments, "tenant")?) {
+            (Some(bound), Some(named)) if named != bound => {
+                return Err(ToolError(
+                    "This credential is bound to a different tenant; omit 'tenant'.".to_owned(),
+                ))
+            }
+            (Some(bound), _) => bound.to_owned(),
+            (None, named) => named.unwrap_or_default(),
+        };
+        let doc = self.store.fuse_verdict(&tenant, run)?;
+        let usage = &doc.usage;
+        let head = format!(
+            "Run guard: {}. {} ({} LLM, {} tool), {}, ${:.4}, {}, error streak {}, {}.",
+            doc.verdict.as_str().to_ascii_uppercase(),
+            count(usage.steps, "step"),
+            usage.llm_calls,
+            usage.tool_calls,
+            count(usage.tokens, "token"),
+            usage.cost_usd,
+            count(usage.errors, "error"),
+            usage.error_streak,
+            duration_human(usage.duration_ns),
+        );
+        // The run id, the reasons (which quote step fingerprints, and so tool
+        // and model names) and the policy name all came from callers of this
+        // store, so they render inside the telemetry frame.
+        let mut rows = vec![
+            format!(
+                "run {} (tenant {})",
+                sanitize(&doc.run),
+                if doc.tenant.is_empty() {
+                    "default".to_owned()
+                } else {
+                    sanitize(&doc.tenant)
+                }
+            ),
+            format!("policy {}", sanitize(&doc.policy)),
+        ];
+        rows.extend(
+            doc.reasons
+                .iter()
+                .map(|reason| format!("reason: {}", sanitize(reason))),
+        );
+        if let Some(top) = &usage.top_repeat {
+            rows.push(format!(
+                "top repeat: {} x{} (trace={} span={})",
+                sanitize(&top.fingerprint),
+                top.count,
+                sanitize(&top.example.trace_id),
+                sanitize(&top.example.span_id),
+            ));
+        }
+        if let (Some(at), Some(by)) = (doc.tripped_at_ns, doc.tripped_by) {
+            let by = match by {
+                crate::guard::TrippedBy::Policy => "a policy limit",
+                crate::guard::TrippedBy::Manual => "an operator",
+            };
+            rows.push(format!("stopped by {by} at {}", rfc3339(at)));
+        }
+        let mut notes = vec![match doc.verdict {
+            crate::guard::Verdict::Stop => {
+                "The run is stopped: do not start another step. Spans arrive when steps end, \
+                 so the step that crossed a limit has already happened — the stop applies to \
+                 the next one. Only an operator can clear it, over HTTP with a write \
+                 credential (POST /v1/fuses/runs/{run}/reset); this surface cannot."
+            }
+            crate::guard::Verdict::Warn => {
+                "The run is approaching a limit (or reached one under a warn-only policy). \
+                 It may continue."
+            }
+            crate::guard::Verdict::Continue => "No limit is near. The run may continue.",
+        }
+        .to_owned()];
+        if doc.source == crate::guard::Source::Rebuilt {
+            notes.push("Usage was rebuilt from the run's stored spans for this answer.".to_owned());
+        }
+        let text = clamp_report(&head, &rows, &notes, self.limits.max_result_bytes);
+        let mut structured = serde_json::to_value(&doc).unwrap_or_else(|_| json!({}));
+        // Producer and caller text in the structured half is made JSON-safe,
+        // as foresee_run does for the same foresight: the reasons, and the
+        // foresight's explanation (which quotes tool names) and next tool.
+        if let Some(object) = structured.as_object_mut() {
+            if let Some(reasons) = object.get_mut("reasons").and_then(Value::as_array_mut) {
+                for reason in reasons.iter_mut() {
+                    if let Value::String(text) = reason {
+                        *text = json_safe(text);
+                    }
+                }
+            }
+            if let Some(foresight) = object.get_mut("foresight").and_then(Value::as_object_mut) {
+                for key in ["explanation", "next_tool"] {
+                    if let Some(Value::String(text)) = foresight.get_mut(key) {
+                        *text = json_safe(text);
+                    }
+                }
+            }
+        }
+        let mut result = json!({
+            "content": [{"type": "text", "text": text}],
+            "structuredContent": structured.clone(),
+            "isError": false,
+        });
+        // The structured half travels whatever the ceiling, because the tool
+        // advertises a schema for it; what can give way inside it is the
+        // free text — reasons and the fingerprint — and the evidence list.
+        if serialized_len(&result) > self.limits.max_result_bytes {
+            if let Some(object) = structured.as_object_mut() {
+                object.insert("evidence".to_owned(), json!([]));
+                if let Some(reasons) = object.get_mut("reasons").and_then(Value::as_array_mut) {
+                    for reason in reasons.iter_mut() {
+                        if let Some(text) = reason.as_str() {
+                            *reason = json!(truncate_bytes(text, 120));
+                        }
+                    }
+                }
+                if let Some(top) = object
+                    .get_mut("usage")
+                    .and_then(|usage| usage.get_mut("top_repeat"))
+                    .and_then(Value::as_object_mut)
+                {
+                    if let Some(text) = top.get("fingerprint").and_then(Value::as_str) {
+                        let short = truncate_bytes(text, 80);
+                        top.insert("fingerprint".to_owned(), json!(short));
+                    }
+                }
+                if let Some(foresight) = object.get_mut("foresight").and_then(Value::as_object_mut)
+                {
+                    if let Some(text) = foresight.get("explanation").and_then(Value::as_str) {
+                        let short = truncate_bytes(text, 120);
+                        foresight.insert("explanation".to_owned(), json!(short));
+                    }
+                }
+            }
+            result["structuredContent"] = structured;
+        }
+        Ok(result)
+    }
+
     fn record_annotation(&self, arguments: &Map<String, Value>, context: Context) -> ToolResult {
         // Checked before the generic unknown-argument refusal, which would
         // otherwise shadow it: "no argument named source" is true but useless
@@ -2350,7 +2567,7 @@ fn search_properties(paging: bool) -> Value {
         },
         "attributes": {
             "type": "object",
-            "description": "Exact matches, e.g. {\"gen_ai.request.model\": \"gpt-4o\"}. \
+            "description": "Exact matches, e.g. {\"gen_ai.request.model\": \"gpt-6.1-sol\"}. \
                             Scalars match whether stored as number or string.",
         },
         "exclude_attributes": {
@@ -2730,6 +2947,60 @@ fn cost_output_schema() -> Value {
     })
 }
 
+/// `check_run_guard`'s structured result: the HTTP verdict document.
+fn guard_output_schema() -> Value {
+    let span_ref = json!({
+        "type": "object",
+        "properties": {"trace_id": {"type": "string"}, "span_id": {"type": "string"}},
+        "required": ["trace_id", "span_id"],
+    });
+    json!({
+        "type": "object",
+        "properties": {
+            "run": {"type": "string"},
+            "tenant": {"type": "string"},
+            "verdict": {"type": "string", "enum": ["continue", "warn", "stop"]},
+            "reasons": {"type": "array", "items": {"type": "string"}},
+            "policy": {"type": "string"},
+            "usage": {
+                "type": "object",
+                "properties": {
+                    "steps": {"type": "integer"},
+                    "llm_calls": {"type": "integer"},
+                    "tool_calls": {"type": "integer"},
+                    "tokens": {"type": "integer"},
+                    "cost_usd": {"type": "number"},
+                    "errors": {"type": "integer"},
+                    "error_streak": {"type": "integer"},
+                    "duration_ns": {"type": "integer"},
+                    "top_repeat": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "fingerprint": {"type": "string"},
+                            "count": {"type": "integer"},
+                            "example": span_ref.clone(),
+                        },
+                    },
+                },
+                "required": ["steps", "cost_usd", "tokens"],
+            },
+            "limits": {"type": "object"},
+            "grant": {"type": ["object", "null"]},
+            "tripped_at_ns": {"type": ["integer", "null"]},
+            "tripped_by": {"type": ["string", "null"], "enum": ["policy", "manual", null]},
+            "evidence": {"type": "array", "items": span_ref},
+            "source": {"type": "string", "enum": ["live", "rebuilt"]},
+            "foresight": {
+                "type": "object",
+                "description": "Present when the policy sets min_success_odds: what runs that \
+                                took this run's path did (verdict, p_success, ci95, support), \
+                                and whether that raised the policy's action.",
+            },
+        },
+        "required": ["run", "verdict", "reasons", "policy", "usage", "source"],
+    })
+}
+
 /// The fixed resources.
 ///
 /// Deliberately few and stable. Resources are for content a client can
@@ -2914,17 +3185,17 @@ threshold lives behind a `$payload` reference that `get_payload` resolves.
 
 const SEMANTICS_GUIDE: &str = r#"# LLM attribute conventions Traza recognizes
 
-Traza folds two vocabularies into one set of facts: the OpenLLMetry / OpenTelemetry
-GenAI conventions, and Traza's own shorthand. Instrumented applications need no
-attribute renaming.
+Traza folds three vocabularies into one set of facts: the OpenLLMetry / OpenTelemetry
+GenAI conventions, Traza's own shorthand, and the OpenInference keys (ranked last).
+Instrumented applications need no attribute renaming.
 
 | Fact | Keys, in precedence order |
 |---|---|
-| Model | `gen_ai.response.model` → `gen_ai.request.model` → `llm.model` |
-| Provider | `gen_ai.provider.name` → `gen_ai.system` (deprecated) |
-| Prompt tokens | `gen_ai.usage.input_tokens` → `gen_ai.usage.prompt_tokens` → `llm.prompt_tokens` |
-| Completion tokens | `gen_ai.usage.output_tokens` → `gen_ai.usage.completion_tokens` → `llm.completion_tokens` |
-| Total tokens | `llm.usage.total_tokens` → `gen_ai.usage.total_tokens` → `llm.total_tokens` |
+| Model | `gen_ai.response.model` → `gen_ai.request.model` → `llm.model` → `llm.model_name` |
+| Provider | `gen_ai.provider.name` → `gen_ai.system` (deprecated) → `llm.provider` → `llm.system` |
+| Prompt tokens | `gen_ai.usage.input_tokens` → `gen_ai.usage.prompt_tokens` → `llm.prompt_tokens` → `llm.token_count.prompt` |
+| Completion tokens | `gen_ai.usage.output_tokens` → `gen_ai.usage.completion_tokens` → `llm.completion_tokens` → `llm.token_count.completion` |
+| Total tokens | `llm.usage.total_tokens` → `gen_ai.usage.total_tokens` → `llm.total_tokens` → `llm.token_count.total` |
 | Cost (USD) | `llm.cost_usd` → `gen_ai.usage.cost` |
 | Session | `session.id` → `gen_ai.conversation.id` → `traceloop.association.properties.session_id` → `traceloop.association.properties.chat_id` |
 
@@ -3031,6 +3302,36 @@ fn budgeted_structured_result(
     extra: &[(&str, Value)],
     max_bytes: usize,
 ) -> Value {
+    budgeted_structured_result_narrowing(
+        head,
+        rows,
+        notes,
+        key,
+        structured_rows,
+        extra,
+        max_bytes,
+        (
+            "Narrow with 'since' or a smaller 'limit'.",
+            NARROW_WITH_FILTERS,
+        ),
+    )
+}
+
+/// [`budgeted_structured_result`] for a tool whose arguments narrow it some
+/// other way. `narrow` is the advice a truncation note ends with: the first
+/// when rows are trimmed from both halves, the second when the text alone is
+/// clamped. A truncation note must name an argument the tool actually takes.
+#[allow(clippy::too_many_arguments)]
+fn budgeted_structured_result_narrowing(
+    head: &str,
+    rows: &[String],
+    notes: &[String],
+    key: &str,
+    structured_rows: &[Value],
+    extra: &[(&str, Value)],
+    max_bytes: usize,
+    narrow: (&str, &str),
+) -> Value {
     debug_assert_eq!(rows.len(), structured_rows.len());
     let assemble = |kept: usize, notes: &[String]| -> Value {
         let mut structured = Map::new();
@@ -3044,7 +3345,7 @@ fn budgeted_structured_result(
         json!({
             "content": [{
                 "type": "text",
-                "text": clamp_report(head, &rows[..kept], notes, max_bytes),
+                "text": clamp_report_narrowing(head, &rows[..kept], notes, max_bytes, narrow.1),
             }],
             "structuredContent": Value::Object(structured),
             "isError": false,
@@ -3056,10 +3357,10 @@ fn budgeted_structured_result(
         if kept < rows.len() {
             trimmed.push(format!(
                 "Truncated: {} of {} shown, because the whole result — text and structured \
-                 content together — would exceed this server's --mcp-max-result-bytes. \
-                 Narrow with 'since' or a smaller 'limit'.",
+                 content together — would exceed this server's --mcp-max-result-bytes. {}",
                 kept,
-                count(rows.len() as u64, "row")
+                count(rows.len() as u64, "row"),
+                narrow.0,
             ));
         }
         let candidate = assemble(kept, &trimmed);
@@ -3202,6 +3503,21 @@ fn report(head: &str, rows: &[String], notes: &[String]) -> String {
 /// partial answer as complete and reports it as fact. So the loss is always
 /// stated, along with the argument that would have avoided it.
 fn clamp_report(head: &str, rows: &[String], notes: &[String], max_bytes: usize) -> String {
+    clamp_report_narrowing(head, rows, notes, max_bytes, NARROW_WITH_FILTERS)
+}
+
+/// The truncation advice for tools that take the usual filters.
+const NARROW_WITH_FILTERS: &str = "Narrow with 'since', a 'service', or a smaller 'limit'.";
+
+/// [`clamp_report`] with the tool's own narrowing advice in the truncation
+/// note — which must name an argument the tool takes.
+fn clamp_report_narrowing(
+    head: &str,
+    rows: &[String],
+    notes: &[String],
+    max_bytes: usize,
+    narrow: &str,
+) -> String {
     let full = report(head, rows, notes);
     if full.len() <= max_bytes {
         return full;
@@ -3212,7 +3528,7 @@ fn clamp_report(head: &str, rows: &[String], notes: &[String], max_bytes: usize)
         let mut with_note = notes.to_vec();
         with_note.push(format!(
             "Truncated: {} of {} shown, because the rest would exceed this server's \
-             --mcp-max-result-bytes. Narrow with 'since', a 'service', or a smaller 'limit'.",
+             --mcp-max-result-bytes. {narrow}",
             kept,
             count(rows.len() as u64, "row")
         ));
@@ -3703,7 +4019,7 @@ fn pairs(arguments: &Map<String, Value>, field: &str) -> Result<Vec<(String, Val
     let object = value.as_object().ok_or_else(|| {
         ToolError(format!(
             "{field} must be an object of key/value pairs, e.g. \
-             {{\"gen_ai.request.model\": \"gpt-4o\"}}."
+             {{\"gen_ai.request.model\": \"gpt-6.1-sol\"}}."
         ))
     })?;
     Ok(object
@@ -3882,7 +4198,7 @@ fn parse_time(text: &str, now_ns: u64) -> Result<u64, String> {
 }
 
 /// RFC 3339, and the plain `YYYY-MM-DD` a model reaches for.
-fn parse_iso(text: &str) -> Result<u64, String> {
+pub(crate) fn parse_iso(text: &str) -> Result<u64, String> {
     // Byte-oriented throughout, and every index is bounds-checked. Every
     // meaningful character in RFC 3339 is ASCII, so working on bytes is not a
     // shortcut — it is what makes `"2026-07-27T日本語"` an error message
@@ -4042,7 +4358,7 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 /// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm,
 /// which is exact for the whole proleptic Gregorian calendar and needs no
 /// lookup tables).
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let year_of_era = year - era * 400;
@@ -4054,7 +4370,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 }
 
 /// The inverse of [`days_from_civil`].
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let days = days + 719_468;
     let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
     let day_of_era = days - era * 146_097;

@@ -572,7 +572,9 @@ impl Drop for Server {
     }
 }
 
-const TOKENS: &str = "rw:writer,ro:reader";
+// Backups need an unbound admin credential on this line; the read-write
+// token is here to show it is refused before its label is even read.
+const TOKENS: &str = "admin:operator,rw:writer,ro:reader";
 
 fn stored_span() -> Value {
     json!([{"trace_id": "t-confine", "span_id": "s1", "name": "op", "service": "svc",
@@ -587,10 +589,12 @@ fn a_crafted_release_cannot_delete_the_store_over_http() {
     assert_eq!(status, 200, "ingest");
     let (status, _) = server.request("POST", "/v1/flush", "writer", None);
     assert_eq!(status, 200, "flush");
-    let (status, body) = server.request("POST", "/v1/backups/nightly", "writer", None);
+    let (status, body) = server.request("POST", "/v1/backups/nightly", "operator", None);
     assert_eq!(status, 201, "a backup is taken first: {body}");
 
-    // An ordinary read-write token — the one an application's exporter holds.
+    // An ordinary read-write token — the one an application's exporter holds
+    // — is refused by scope; the admin who may release a pin is refused by
+    // the label. Either way the store stays where it is.
     for target in [
         "/v1/backups/../release",
         "/v1/backups/./release",
@@ -599,6 +603,11 @@ fn a_crafted_release_cannot_delete_the_store_over_http() {
         "/v1/backups/nightly/../release",
     ] {
         let (status, body) = server.request("POST", target, "writer", None);
+        assert_eq!(
+            status, 403,
+            "POST {target} needs an admin, got {status}: {body}"
+        );
+        let (status, body) = server.request("POST", target, "operator", None);
         assert!(
             dir.join("CURRENT").is_file(),
             "POST {target} removed the store's CURRENT"
@@ -626,13 +635,13 @@ fn a_crafted_release_cannot_delete_the_store_over_http() {
     );
 
     // The real backup still releases, and an unknown label is still a no-op.
-    let (status, body) = server.request("POST", "/v1/backups/nightly/release", "writer", None);
+    let (status, body) = server.request("POST", "/v1/backups/nightly/release", "operator", None);
     assert_eq!(status, 200, "release: {body}");
     assert!(
         !dir.join("pins/nightly").exists(),
         "the named backup is gone"
     );
-    let (status, _) = server.request("POST", "/v1/backups/never-made/release", "writer", None);
+    let (status, _) = server.request("POST", "/v1/backups/never-made/release", "operator", None);
     assert_eq!(status, 200, "releasing an unknown backup stays idempotent");
 }
 
@@ -652,7 +661,7 @@ fn a_malformed_backup_label_is_the_callers_error_on_create_too() {
         "/v1/backups/a/b",
         "/v1/backups/",
     ] {
-        let (status, body) = server.request("POST", target, "writer", None);
+        let (status, body) = server.request("POST", target, "operator", None);
         assert_eq!(
             status, 400,
             "POST {target} names no backup, got {status}: {body}"
@@ -663,8 +672,8 @@ fn a_malformed_backup_label_is_the_callers_error_on_create_too() {
         "and none of them left a pin behind"
     );
     // A taken label is still a conflict, which is a different answer.
-    let (status, _) = server.request("POST", "/v1/backups/nightly", "writer", None);
+    let (status, _) = server.request("POST", "/v1/backups/nightly", "operator", None);
     assert_eq!(status, 201, "a plain label is accepted");
-    let (status, body) = server.request("POST", "/v1/backups/nightly", "writer", None);
+    let (status, body) = server.request("POST", "/v1/backups/nightly", "operator", None);
     assert_eq!(status, 409, "a label already in use is a conflict: {body}");
 }

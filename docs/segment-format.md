@@ -456,9 +456,12 @@ retired motivation); the full v6-era record lives in that file's git history:
   of `pinned-context`'s, and 7.4% of `generic`'s. The double-store grows
   with exactly the workload this store exists for.
 - **Compressing the records region is worth a multiple, not a percentage.**
-  The [projection in storage-comparison](storage-comparison.md#what-compression-bought-next-to-the-projection-that-motivated-it)
-  — labeled a projection there and here — puts block-wise `zstd -3` at a
-  6.30x/11.59x/9.27x segment shrink across the three corpora. v7 uses LZ4,
+  The projection storage-comparison published at the time — labeled a
+  projection there and here — puts block-wise `zstd -3` at a
+  6.30x/11.59x/9.27x segment shrink across the three corpora. (It lives in
+  that file's history before `94e7f86`; the page now records
+  [where v7's and v8's savings came from](storage-comparison.md#where-the-savings-come-from).)
+  v7 uses LZ4,
   which trades ratio for speed and safety of implementation, and cuts
   blocks at 128 KiB where the projection was computed at 64 KiB — so those
   numbers are an optimistic reference measured under different knobs, not a
@@ -791,14 +794,16 @@ content — are stored uncompressed. The reader parses them at open and probes
 them per query: posting lists are probed by digest and intersected, content
 rows are read by exact byte range, the offset table is the scan path.
 Compressing them would put a decode in front of every probe, and it would
-buy little — the argument
-[storage-comparison](storage-comparison.md#what-compression-bought-next-to-the-projection-that-motivated-it)
-makes: past compressed records, the work is in the indexes, not the payload.
+buy little — the argument storage-comparison made at the time (before
+`94e7f86`): past compressed records, the work is in the indexes, not the
+payload.
 After v7 the indexes are roughly half of segment bytes — measured at 43–55%
 by corpus, the complement of the records shares in
 [storage.md's records-region table](benchmarks/storage.md#records-region-measurements);
 the projection's tables had put them at 55–75%, an overestimate — and
-shrinking *them* is future index-format work, not a codec knob.
+shrinking *them* is future index-format work, not a codec knob. That work is
+v8's; storage-comparison now records
+[where its savings come from](storage-comparison.md#where-the-savings-come-from).
 
 The WAL and the rollup sidecars also stay raw, deliberately: erasure
 verification runs byte-level occurrence scans over both (see

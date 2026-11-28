@@ -67,6 +67,22 @@ with a plain `Instant` — see [benchmarking](../internals/benchmarking.md).
 | `traza_supersede_probes_total` | counter | Exact primary-key probes into newer segments while resolving last-write-wins: the reads the key-hash prefilter could not rule out. Healthy is roughly one probe per superseded version actually held. **A number tracking matches × segments means the prefilter has stopped working** and every query is re-reading the store to prove keys were never replaced |
 | `traza_rollup_builds_total` | counter | Segment rollups rebuilt by decoding the segment, because neither the in-memory cache nor the on-disk sidecar could answer. Each rebuild writes the sidecar back, so a sidecar-less store pays this once per segment. **A counter that keeps climbing on a steady corpus means the heal is not landing** — check the data directory is writable and the sidecars are surviving beside their segments |
 
+### Per-tenant counters
+
+One series per tenant that has usage counters, labelled `tenant` (`""` is the
+default tenant). They are the [`GET /v1/usage`](../guide/http-api.md#get-v1usage)
+lifetime counters, persisted in `usage.json`, so they do **not** reset on a
+restart — though a crash can lose the increments since the last write
+(normally five seconds' worth, plus however long that write took), so after
+one a series may step back by that much. The label set
+grows with the number of tenants; on a store with very many tenants, these two
+families dominate the scrape.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `traza_tenant_spans_ingested_total{tenant}` | counter | Spans admitted for the tenant |
+| `traza_quota_rejected_total{tenant}` | counter | The tenant's spans refused by a monthly quota or an ingest pause (`429`). Admission-cap refusals (`400`) are not counted |
+
 ### Engine stages
 
 Each is timed **per batch**, not per span, so the instrumentation sits far below
@@ -154,7 +170,7 @@ trace lookup differ by orders of magnitude. The classes are:
 | `search` | `GET /v1/spans` |
 | `lookup` | `GET /v1/traces/…`, `/v1/sessions/…`, `/v1/payloads/…`, `/v1/annotations` |
 | `stats` | `GET /v1/stats*`, `GET /v1/sessions` |
-| `stream` | `GET /v1/tail`, `GET /v1/export` |
+| `stream` | `GET /v1/tail`, `GET /v1/export`, `GET /v1/fuses/events` (a long-poll) |
 | `mcp` | `POST /v1/mcp` |
 | `other` | dashboard assets, `/v1/metrics`, `/v1/flush` |
 
@@ -176,6 +192,26 @@ what an agent is costing this server.
 above carries percentiles under the accuracy bound stated at the top of this
 page. [`GET /v1/metrics.json`](../guide/http-api.md#get-v1metricsjson) returns
 all of it as JSON, including that bound.
+
+### Run fuses
+
+Present unless the server runs with `--no-fuses`. See [run fuses](../guide/guard.md).
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `traza_fuse_trips_total` | counter | Stops since this process started: every policy stop observed live, and every kill-switch trip. A stop a rebuild recomputes after a restart is not counted again |
+| `traza_fuse_warnings_total` | counter | Warn announcements: a run entering `warn`, and a `warn` policy's limit then being reached — each once per run until it returns to `continue` or is reset |
+| `traza_fuse_live_runs` | gauge | Live runs held in memory, bounded by `--fuse-max-runs`. Stopped runs parked out of the live set by eviction are not counted |
+
+### Fate Map
+
+See [foresight](../guide/foresight.md).
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `traza_fate_builds_total{result="ok"}` | counter | Fate Map builds that finished, on a request path or in the background warmer |
+| `traza_fate_builds_total{result="failed"}` | counter | Builds that failed — almost always a deadline. A rising count with predictive fuses in use means some tenant's maps outrun `--fate-build-seconds`: its window is being halved, and its fuses say so in their foresight |
+| `traza_fate_cached_builds` | gauge | Builds cached now: at most `--fate-tenant-maps` tenant maps plus 8 others |
 
 ## `GET /v1/stats`
 
@@ -277,7 +313,8 @@ decomposition and how it moved are in
 `traza-server` writes to stderr, sparingly: the listening address, the
 durability contract, the dashboard directory (or every path searched), and
 failures from the background maintenance thread (`segment compaction failed:`,
-`expiry compaction failed:`, `export failed after N rows:`). There is no
+`expiry compaction failed:`, `export failed after N rows:`) and from the usage
+writer (`usage persistence failed:`). There is no
 request log — if you need one, the reverse proxy in front is the right place.
 
 Maintenance failures are worth surfacing. They do not stop the server, and a

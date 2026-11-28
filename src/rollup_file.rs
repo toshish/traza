@@ -55,8 +55,8 @@
 //! eleven fixed-width counter fields — the last four being the derived cost
 //! share and the metered/derived/unpriced call counts that say where a total
 //! came from. A session entry adds the first/last timestamps, the trace-id
-//! set, and an index into [`crate::semconv::SESSION_KEYS`] (`u32::MAX` for
-//! none).
+//! set, an index into [`crate::semconv::SESSION_KEYS`] (`u32::MAX` for
+//! none), and the count of spans marking a user prompt.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -82,7 +82,11 @@ const MAGIC: [u8; 8] = *b"TRAZAROL";
 /// *dollars* alone cannot answer where a cost came from — a zero-rate model
 /// and an unpriced one both contribute nothing — so provenance is stored
 /// rather than reconstructed.
-const FORMAT_VERSION: u16 = 5;
+///
+/// v6: session entries carry the count of spans marking a user prompt
+/// ([`crate::analytics::marks_a_turn`]), so a session's turns survive a
+/// reopen. v5 sidecars are rejected and rebuilt from their segments.
+const FORMAT_VERSION: u16 = 6;
 
 /// Version of the analytics semantics the counters were computed under.
 ///
@@ -369,6 +373,7 @@ fn encode(binding: Binding, rollup: &SegmentRollup) -> Vec<u8> {
             put_str(&mut out, trace);
         }
         put_u32(&mut out, session_key_id(session.session_key));
+        put_u64(&mut out, session.turns);
     }
 
     let mut hashes: Vec<u64> = rollup.key_hashes.iter().copied().collect();
@@ -468,6 +473,7 @@ fn decode(bytes: &[u8], expected: Binding) -> Option<SegmentRollup> {
             traces.insert(cursor.string()?);
         }
         let session_key = session_key_name(cursor.u32()?)?;
+        let turns = cursor.u64()?;
         rollup.sessions.insert(
             (tenant, id),
             SessionCounters {
@@ -475,6 +481,7 @@ fn decode(bytes: &[u8], expected: Binding) -> Option<SegmentRollup> {
                 first_start_ns,
                 last_end_ns,
                 traces,
+                turns,
                 session_key,
             },
         );

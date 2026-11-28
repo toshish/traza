@@ -1,5 +1,6 @@
 import React from 'react';
 import { api } from '../lib/api.js';
+import { publicBase } from '../lib/base.js';
 import { useRead, useKeys, useStored, navigate } from '../lib/route.js';
 import {
   RANGES,
@@ -226,8 +227,8 @@ export function TracesScreen({ go, params }) {
           all predicates are ANDed · <code style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>≠</code>{' '}
           keeps spans that never recorded the key
         </span>
-        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
-          <Chip onClick={() => navigator.clipboard?.writeText(toCurl(applied, globalThis.location?.origin || ''))}>
+        <span style={{ marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          <Chip onClick={() => navigator.clipboard?.writeText(toCurl(applied, publicBase()))}>
             Copy as curl
           </Chip>
           <Chip tone="primary" onClick={() => apply(query)}>Search</Chip>
@@ -284,7 +285,7 @@ export function TracesScreen({ go, params }) {
             {fmtWindowLabel(timeWindow.sinceNs, timeWindow.untilNs)}
           </span> selected
         </span>
-        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+        <span style={{ marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
           {RANGES.map((r) => <Chip key={r.id} mono
             active={applied.range === r.id}
             onClick={() => { const next = { ...query, range: r.id }; setQuery(next); apply(next); }}>{r.label}</Chip>)}
@@ -301,7 +302,7 @@ export function TracesScreen({ go, params }) {
 
     <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '0 2px', flexWrap: 'wrap' }}>
       <QueryCost cost={search.data?.cost} shown={totalSpans || rows.length} />
-      <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+      <span style={{ marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
         <Chip onClick={() => go(['store'], toHash(applied))}>Export NDJSON</Chip>
         <Chip onClick={() => go(['datasets'], toHash(applied))}>Make a dataset</Chip>
       </span>

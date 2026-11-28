@@ -1,0 +1,1 @@
+{"atoms":2,"captures":["f"],"fields":["file"],"instructions":24,"max_steps":null,"min_steps":5,"query":"edit[file=@f] (..> edit[file=@f]){4,} within 10","within":{"steps":10}}

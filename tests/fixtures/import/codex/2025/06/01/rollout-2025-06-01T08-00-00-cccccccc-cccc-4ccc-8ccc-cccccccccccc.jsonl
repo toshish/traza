@@ -1,0 +1,6 @@
+{"id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "timestamp": "2025-06-01T08:00:00.000Z", "instructions": null, "git": {"branch": "dev"}}
+{"record_type": "state"}
+{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "List the files"}]}
+{"type": "function_call", "name": "shell", "arguments": "{\"command\": [\"bash\", \"-lc\", \"ls\"]}", "call_id": "call_9"}
+{"type": "function_call_output", "call_id": "call_9", "output": "{\"output\": \"README.md\\nsrc\\n\", \"metadata\": {\"exit_code\": 0}}"}
+{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "README.md and src."}]}

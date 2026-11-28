@@ -30,16 +30,38 @@ not just servers: the `seed --data-dir` tool and any process embedding the
 engine as a library count too.
 
 The lock records its owner's PID. If the owner dies without cleaning up —
-SIGKILL, OOM, power loss — the lock is **stale** and the next open reclaims it
-automatically. A lock naming a live process still rejects the open, and an
-unreadable lock file is treated as live: a false negative merely keeps the
+SIGKILL, OOM, power loss, and for the server any stop at all, since it has no
+graceful shutdown — the lock is **stale** and the next open reclaims it
+automatically.
+A lock is stale when the PID it names is not a running process — checked
+through `/proc` on Linux, which is why this works in the `FROM scratch`
+release image that has no `kill` binary, and with `kill -0` elsewhere — or
+when it names the opening process itself and that process does not already
+hold the directory. A lock naming another live process still rejects the open,
+as does a second open of the same directory from within one process. A lock
+whose owner cannot be checked (an unreadable file, or neither `/proc` nor
+`kill` available) is treated as live: a false negative merely keeps the
 conservative rejection, which never corrupts data.
+
+**Containers.** The release image's entrypoint makes the server PID 1 in its
+container, on every start. As PID 1 with no signal handler it ignores the
+SIGTERM that `docker stop` and `docker restart` send, so they end it with
+SIGKILL once the grace period expires and the lock stays behind, naming PID 1 —
+the PID the restarted server has again. That is the "names the opening process
+itself" case above: the restarted server reclaims the lock and opens normally,
+with no manual cleanup. Recreating the container on the same volume works the
+same way.
 
 Practical consequences:
 
 - Do not run two servers against one directory, and do not put a data directory
   on shared storage that two hosts can mount at once. The PID check is
   meaningless across hosts.
+- It is just as meaningless across containers, even on one host: each has its
+  own PID namespace, so two containers mounting one volume at the same time
+  are both PID 1, and the second reclaims the first's live lock. Have the
+  orchestrator stop the old container before it starts the new one — in
+  Kubernetes, `strategy: Recreate` rather than a rolling update.
 - To bulk-load with `seed --data-dir`, stop the server first; or leave it
   running and use `seed --url` to go through the API instead.
 - Scaling today is vertical; multi-node replication is not shipped behaviour.
@@ -55,6 +77,9 @@ data/
   segment-00000000000000000000.seg      immutable sorted segments
   segment-00000000000000000001.seg
   annotations.jsonl                     append-only annotation log
+  credentials.jsonl                     runtime credentials, as digests (outside backups)
+  limits.json                           per-tenant limits (outside backups)
+  usage.json                            per-tenant usage counters (outside backups)
   payloads/
     29/29927e…fa.bin                    content-addressed offloaded payloads
     66/660f56…51.bin
@@ -88,12 +113,13 @@ The default bind is `127.0.0.1`. Binding anywhere else without authentication
 is **refused at startup**:
 
 ```
-traza-server: refusing unauthenticated non-loopback bind 0.0.0.0; configure TRAZA_TOKENS or pass --allow-unauthenticated-non-loopback explicitly
+traza-server: refusing unauthenticated non-loopback bind 0.0.0.0; configure TRAZA_TOKENS, create a runtime credential (POST /v1/admin/credentials on a loopback start), or pass --allow-unauthenticated-non-loopback explicitly
 ```
 
-Configure `TRAZA_TOKENS`, or pass the explicit escape hatch if the network is
-genuinely trusted. See
-[administration](administration.md#authentication).
+Configure `TRAZA_TOKENS`, mint a runtime credential on a loopback start first
+(the data directory's credential log then counts as configured
+authentication), or pass the explicit escape hatch if the network is genuinely
+trusted. See [administration](administration.md#authentication).
 
 `--port 0` binds an ephemeral port and announces the real one on stderr, which
 is how the test suite discovers it.
@@ -155,6 +181,15 @@ The dashboard shell is served *before* the authentication gate — it is static
 build output carrying no data — while every `/v1` call it makes stays gated.
 Path traversal outside the build root is refused against the canonicalized
 root.
+
+**Behind a path prefix.** A proxy that mounts the store under a path
+(`https://host/x/org/project/` forwarding to the server's `/`) must also tell
+the page, or its `/v1/...` requests reach the proxy's own root. The built
+`index.html` carries `<meta name="traza-api-base" content="">`; set its
+`content` to the prefix (`/x/org/project`), by rewriting the tag as the proxy
+serves the page or by editing the built file, and every request the dashboard
+makes, and every snippet it offers, uses it. See
+[the trace browser](../guide/trace-browser.md#behind-a-path-prefix).
 
 ## Running as a service
 

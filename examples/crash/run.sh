@@ -23,7 +23,9 @@ here=$root/examples/crash
 cd "$root"
 
 server=./target/release/traza-server
-ingest="python3 $here/ingest.py"
+# A function, not a command kept in a string: expanding the string would
+# split "$here" wherever the checkout's path has a space.
+ingest() { python3 "$here/ingest.py" "$@"; }
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/traza-crash-demo.XXXXXX")
 port=${TRAZA_DEMO_PORT:-8125}
 total=${TRAZA_CRASH_SPANS:-60000}
@@ -134,7 +136,10 @@ mkfifo "$tmp/progress"
 # Opened read-write so the open cannot block: a plain read-side open would
 # wedge this shell forever if the client died before opening its write end.
 exec 3<>"$tmp/progress"
-$ingest stream "http://127.0.0.1:$port" "$total" "$batch" "$tmp/progress" "$tmp/client.json" &
+# python3 itself, not ingest(): a function sent to the background runs in a
+# subshell and $! names the subshell, so cleanup's kill would stop it and
+# leave the client streaming.
+python3 "$here/ingest.py" stream "http://127.0.0.1:$port" "$total" "$batch" "$tmp/progress" "$tmp/client.json" &
 client=$!
 # Because fd 3 holds the FIFO open, the client's death alone never delivers
 # EOF — a watchdog posts a sentinel the moment it exits, however it exits.
@@ -177,12 +182,12 @@ fi
 while kill -0 "$pid" 2>/dev/null; do sleep 0.05; done
 [ -n "$killed" ] || fail "the client finished before the kill threshold was reached"
 
-acked=$($ingest field "$tmp/client.json" acknowledged)
-last_span=$($ingest field "$tmp/client.json" last_span_id)
-last_trace=$($ingest field "$tmp/client.json" last_trace_id)
-stopped=$($ingest field "$tmp/client.json" stopped)
-inflight=$($ingest field "$tmp/client.json" inflight_size)
-first_unacked=$($ingest field "$tmp/client.json" first_unacked_seq)
+acked=$(ingest field "$tmp/client.json" acknowledged)
+last_span=$(ingest field "$tmp/client.json" last_span_id)
+last_trace=$(ingest field "$tmp/client.json" last_trace_id)
+stopped=$(ingest field "$tmp/client.json" stopped)
+inflight=$(ingest field "$tmp/client.json" inflight_size)
+first_unacked=$(ingest field "$tmp/client.json" first_unacked_seq)
 
 printf '  the kill fired after the client reported %s spans acknowledged; it kept sending and hit:\n' "$kill_at"
 printf '    %s\n' "$stopped"
@@ -197,19 +202,19 @@ bold "▸ restart on the same directory"
 dim "  recovery replays the write-ahead log before the first new write is accepted."
 start_server "$tmp/server-2.log" --data-dir "$data"
 printf '  %s\n' "$(grep 'durability=wal' "$tmp/server-2.log" | head -1)"
-curl -sS "http://127.0.0.1:$port/v1/stats" | $ingest stats
+curl -sS "http://127.0.0.1:$port/v1/stats" | ingest stats
 
 # ------------------------------------------------------------ the receipts
 
 bold "▸ the receipts"
 dim "  every crash-test span is streamed back out and counted client-side;"
 dim "  the export's own trailer cross-checks the count."
-recovered=$(curl -s --raw "http://127.0.0.1:$port/v1/export?service=crash-test" | $ingest export-count)
+recovered=$(curl -s --raw "http://127.0.0.1:$port/v1/export?service=crash-test" | ingest export-count)
 printf '\n  acknowledged before the kill: %s. present after recovery: %s.\n' "$acked" "$recovered"
 [ "$recovered" -ge "$acked" ] || fail "recovered $recovered spans but $acked were acknowledged"
 
 curl -sS "http://127.0.0.1:$port/v1/traces/$last_trace" >"$tmp/trace.json"
-$ingest has-span "$tmp/trace.json" "$last_span" ||
+ingest has-span "$tmp/trace.json" "$last_span" ||
   fail "the last acknowledged span $last_span is missing from trace $last_trace"
 printf '  the last acknowledged span (%s) is present in trace %s.\n' "$last_span" "$last_trace"
 
@@ -230,11 +235,11 @@ dim "  every digest before reporting success. The server keeps serving throughou
 curl -sS -X POST "http://127.0.0.1:$port/v1/backups/crash-demo" >"$tmp/backup.json"
 sed 's/^/  /' "$tmp/backup.json"
 printf '\n'
-[ "$($ingest field "$tmp/backup.json" verified)" = "true" ] || fail "the backup did not verify"
-pin=$($ingest field "$tmp/backup.json" path)
+[ "$(ingest field "$tmp/backup.json" verified)" = "true" ] || fail "the backup did not verify"
+pin=$(ingest field "$tmp/backup.json" path)
 cp -a "$pin" "$backup"
 curl -sS -X POST "http://127.0.0.1:$port/v1/backups/crash-demo/release" >"$tmp/release.json"
-[ "$($ingest field "$tmp/release.json" released)" = "true" ] || fail "the pin did not release"
+[ "$(ingest field "$tmp/release.json" released)" = "true" ] || fail "the pin did not release"
 dim "  pin copied out with cp -a and released — the copy owns its bytes now."
 
 # -------------------------------------------------------- one flipped byte
@@ -242,11 +247,11 @@ dim "  pin copied out with cp -a and released — the copy owns its bytes now."
 bold "▸ one flipped byte"
 dim "  a single byte in the middle of the largest segment, corrupted in place,"
 dim "  with the server still running."
-damage=$($ingest corrupt "$data")
+damage=$(ingest corrupt "$data")
 printf '  %s\n' "$damage"
 segfile=${damage%% *}
 curl -sS "http://127.0.0.1:$port/v1/verify" >"$tmp/verify-damaged.json"
-$ingest verify "$tmp/verify-damaged.json" damaged "$segfile" ||
+ingest verify "$tmp/verify-damaged.json" damaged "$segfile" ||
   fail "GET /v1/verify did not name the damaged file $segfile"
 
 # ---------------------------------------------------------------- restore
@@ -261,8 +266,8 @@ mkdir -p "$restored"
 start_server "$tmp/server-3.log" --data-dir "$restored" --restore "$backup"
 printf '  %s\n' "$(grep 'restored generation' "$tmp/server-3.log" | head -1)"
 curl -sS "http://127.0.0.1:$port/v1/verify" >"$tmp/verify-restored.json"
-$ingest verify "$tmp/verify-restored.json" intact || fail "the restored store failed verification"
-recount=$(curl -s --raw "http://127.0.0.1:$port/v1/export?service=crash-test" | $ingest export-count)
+ingest verify "$tmp/verify-restored.json" intact || fail "the restored store failed verification"
+recount=$(curl -s --raw "http://127.0.0.1:$port/v1/export?service=crash-test" | ingest export-count)
 [ "$recount" -eq "$recovered" ] || fail "restored store holds $recount spans, expected $recovered"
 printf '\n  present after restore: %s — exactly what the store held when it was pinned.\n' "$recount"
 

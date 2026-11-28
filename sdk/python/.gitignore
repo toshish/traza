@@ -1,0 +1,4 @@
+# Output of `pip install .` or `python -m build`.
+build/
+dist/
+*.egg-info/

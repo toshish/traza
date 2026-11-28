@@ -22,7 +22,9 @@ cd "$root"
 
 server=./target/release/traza-server
 seed=./target/release/seed
-render="python3 $here/render.py"
+# A function, not a command kept in a string: expanding the string would
+# split "$here" wherever the checkout's path has a space.
+render() { python3 "$here/render.py" "$@"; }
 data=$(mktemp -d "${TMPDIR:-/tmp}/traza-vanish.XXXXXX")
 port=${TRAZA_DEMO_PORT:-8128}
 scale=${TRAZA_VANISH_SCALE:-2}
@@ -125,14 +127,14 @@ echo "  zenith: ${out#seed: }"
 # The session that will be erased: the widest-spread acme conversation.
 code=$(get "$acme_tok" "/v1/sessions?limit=200" "$data/sessions.json")
 need "$code" 200 "listing acme sessions"
-picked=$($render pick-session "$data/sessions.json")
+picked=$(render pick-session "$data/sessions.json")
 set -- $picked
 sid=$1
 
 echo
 echo "the subject-to-be: acme session '$sid' — plus a support annotation"
 echo "and an exported transcript, so the erasure has every domain to reach:"
-$render enrich "$port" "$acme_tok" "$zenith_tok" "$sid" "$data/shared_ref" "$data/blob_bytes"
+render enrich "$port" "$acme_tok" "$zenith_tok" "$sid" "$data/shared_ref" "$data/blob_bytes"
 shared_ref=$(cat "$data/shared_ref")
 blob_bytes=$(cat "$data/blob_bytes")
 
@@ -144,14 +146,14 @@ dim "  the fences below are printed verbatim, straight off the wire."
 
 code=$(get "$acme_tok" "/v1/spans?limit=1" "$data/first.json")
 need "$code" 200 "reading acme's first span"
-shared_trace=$($render pick-trace "$data/first.json")
+shared_trace=$(render pick-trace "$data/first.json")
 echo
 echo "  shared trace id: $shared_trace"
 code=$(get "$acme_tok" "/v1/traces/$shared_trace" "$data/trace_acme.json")
 need "$code" 200 "acme reading its copy"
 code=$(get "$zenith_tok" "/v1/traces/$shared_trace" "$data/trace_zenith.json")
 need "$code" 200 "zenith reading its copy"
-$render trace-copies "$data/trace_acme.json" "$data/trace_zenith.json"
+render trace-copies "$data/trace_acme.json" "$data/trace_zenith.json"
 
 echo
 echo "  acme token naming zenith in a query — refused, and it says why:"
@@ -187,7 +189,7 @@ dim "  fold over a pinned snapshot, not a cached estimate."
 echo
 code=$(get "$admin_tok" "/v1/tenants" "$data/tenants.json")
 need "$code" 200 "tenant accounting"
-$render tenants "$data/tenants.json" "$blob_bytes"
+render tenants "$data/tenants.json" "$blob_bytes"
 
 # -------------------------------------------------------------- 3 · the pin
 
@@ -198,7 +200,7 @@ dim "  the erasure. That is the point of a pin, and beat 7 will catch it."
 echo
 code=$(post "$admin_tok" "/v1/backups/pre-erasure" "$data/pin.json")
 need "$code" 201 "pinning the pre-erasure backup"
-$render pin "$data/pin.json"
+render pin "$data/pin.json"
 
 # ---------------------------------------------------------- 4 · the request
 
@@ -215,7 +217,7 @@ echo "  before: acme session '$sid' holds $pre_count spans"
 echo
 code=$(get "$admin_tok" "/v1/metrics" "$data/metrics_before.txt")
 need "$code" 200 "metrics before"
-$render erase-race "$port" "$admin_tok" "$acme_tok" "$sid" "$pre_count" \
+render erase-race "$port" "$admin_tok" "$acme_tok" "$sid" "$pre_count" \
   "$shared_ref" "$data/stash.json" "$data/vanish.env"
 . "$data/vanish.env"
 code=$(get "$admin_tok" "/v1/metrics" "$data/metrics_after.txt")
@@ -229,17 +231,17 @@ dim "  acme's is gone. Deletion cannot bleed across the primary key."
 echo
 code=$(get "$zenith_tok" "/v1/sessions/$sid" "$data/zenith_session.json")
 need "$code" 200 "zenith reading the shared session id"
-$render session-assert "$data/zenith_session.json" "$pre_count"
+render session-assert "$data/zenith_session.json" "$pre_count"
 code=$(get "$zenith_tok" "/v1/traces/$covered_trace" "$data/zenith_trace.json")
 need "$code" 200 "zenith reading the covered trace id"
-echo "  zenith's copy of covered trace $covered_trace: $($render trace-count "$data/zenith_trace.json") span(s), still readable [200]"
+echo "  zenith's copy of covered trace $covered_trace: $(render trace-count "$data/zenith_trace.json") span(s), still readable [200]"
 echo
 code=$(get "$acme_tok" "/v1/sessions/$sid" "$data/acme_session.json")
 printf '  acme'\''s same session id: %s  [%s]\n' "$(cat "$data/acme_session.json")" "$code"
 need "$code" 404 "acme's session must be gone"
 code=$(get "$acme_tok" "/v1/spans?session=$sid" "$data/acme_spans.json")
 need "$code" 200 "acme searching the erased session"
-$render gone "$data/acme_spans.json"
+render gone "$data/acme_spans.json"
 
 # --------------------------------------------------------- 6 · replay-proof
 
@@ -248,7 +250,7 @@ dim "  A client with a retry queue replays a covered span while the erasure is"
 dim "  pending: acknowledged, deliberately not stored, and counted. The response"
 dim "  below was captured during beat 4's pending window."
 echo
-$render replay "$data/stash.json" "$data/metrics_before.txt" "$data/metrics_after.txt" \
+render replay "$data/stash.json" "$data/metrics_before.txt" "$data/metrics_after.txt" \
   traza_erasure_spans_suppressed_total
 echo
 code=$(get "$acme_tok" "/v1/traces/$covered_trace" "$data/replay_read.json")
@@ -264,7 +266,7 @@ dim "  record claims."
 echo
 code=$(get "$admin_tok" "/v1/erasures/$eid/verify" "$data/receipt1.json")
 need "$code" 200 "first verification"
-$render receipt "$data/receipt1.json" pinned pre-erasure
+render receipt "$data/receipt1.json" pinned pre-erasure
 echo
 echo "  The receipt refused to say \"gone\": the pre-erasure pin still holds the"
 echo "  bytes in its hard-link farm, and the receipt names it instead of hiding"
@@ -272,10 +274,10 @@ echo "  it. Release the pin, verify again:"
 echo
 code=$(post "$admin_tok" "/v1/backups/pre-erasure/release" "$data/release.json")
 need "$code" 200 "releasing the pin"
-$render release "$data/release.json"
+render release "$data/release.json"
 code=$(get "$admin_tok" "/v1/erasures/$eid/verify" "$data/receipt2.json")
 need "$code" 200 "second verification"
-$render receipt "$data/receipt2.json" final pre-erasure
+render receipt "$data/receipt2.json" final pre-erasure
 
 # ------------------------------------------------------------- 8 · epilogue
 

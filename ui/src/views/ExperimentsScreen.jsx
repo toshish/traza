@@ -95,7 +95,7 @@ export function ExperimentsScreen() {
       {['gen_ai.request.model', 'service', 'name'].map((f) => (
         <Chip key={f} mono active={field === f} onClick={() => { setField(f); setA(''); setB(''); }}>{f}</Chip>
       ))}
-      <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+      <span style={{ marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
         {RANGES.map((r) => <Chip key={r.id} mono active={range === r.id} onClick={() => setRange(r.id)}>{r.label}</Chip>)}
       </span>
     </div>

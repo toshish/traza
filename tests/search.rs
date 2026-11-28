@@ -391,7 +391,13 @@ fn a_sort_over_too_many_matches_is_refused_rather_than_answered_wrongly() {
             json!({}),
         ));
     }
-    store.ingest_batch(batch).expect("ingest");
+    // In chunks: one ingest call is capped at max_batch_spans (100,000 by
+    // default), below this ceiling.
+    while !batch.is_empty() {
+        let rest = batch.split_off(batch.len().min(traza::caps::DEFAULT_MAX_BATCH_SPANS));
+        store.ingest_batch(batch).expect("ingest");
+        batch = rest;
+    }
 
     let result = store.query(&SpanFilter {
         sort: Some(SpanSort::DurationDesc),

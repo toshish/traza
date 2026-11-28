@@ -106,10 +106,8 @@ fn test_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// Reads exactly one response: headers, then `Content-Length` bytes. Anything
-/// left in the stream stays there — which is the point, since a server that
-/// over- or under-delivers would corrupt the NEXT read on this connection.
-fn read_response(stream: &mut impl Read) -> (String, String) {
+/// Reads one response head, byte by byte so nothing past it is consumed.
+fn read_response_head(stream: &mut impl Read) -> String {
     let mut head = Vec::new();
     let mut byte = [0_u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -121,7 +119,14 @@ fn read_response(stream: &mut impl Read) -> (String, String) {
         assert_ne!(read, 0, "connection closed mid-header: {head:?}");
         head.push(byte[0]);
     }
-    let head = String::from_utf8(head).expect("utf-8 headers");
+    String::from_utf8(head).expect("utf-8 headers")
+}
+
+/// Reads exactly one response: headers, then `Content-Length` bytes. Anything
+/// left in the stream stays there — which is the point, since a server that
+/// over- or under-delivers would corrupt the NEXT read on this connection.
+fn read_response(stream: &mut impl Read) -> (String, String) {
+    let head = read_response_head(stream);
     let length: usize = head
         .lines()
         .find_map(|line| {
@@ -513,4 +518,181 @@ fn metrics_report_the_stages_the_benchmark_reads() {
     ] {
         assert!(body.contains(name), "missing {name} in:\n{body}");
     }
+}
+
+/// Asserts the next response on `stream` is `/v1/whoami`'s open-mode answer
+/// and that it keeps the connection — the request every pre-auth case below
+/// sends next, because its body cannot be mistaken for a probe's or a page's.
+fn expect_whoami(stream: &mut TcpStream, after: &str) {
+    let (head, body) = read_response(stream);
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "whoami after {after}: {head}{body}"
+    );
+    assert!(
+        head.to_ascii_lowercase().contains("connection: keep-alive"),
+        "whoami after {after}: {head}"
+    );
+    let parsed: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("whoami after {after} is not JSON ({error}): {body}"));
+    assert_eq!(parsed["auth"], "open", "whoami after {after}: {body}");
+}
+
+/// Sends `GET /v1/whoami` and checks its answer; see [`expect_whoami`].
+fn expect_whoami_after_request(stream: &mut TcpStream, after: &str) {
+    stream
+        .write_all(b"GET /v1/whoami HTTP/1.1\r\nHost: x\r\n\r\n")
+        .expect("write");
+    expect_whoami(stream, after);
+}
+
+/// Ends a connection with a request that asks for close, then proves nothing
+/// else was queued behind it: a request answered twice shows up here as
+/// trailing bytes.
+fn close_cleanly(stream: &mut TcpStream) {
+    stream
+        .write_all(b"GET /v1/whoami HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .expect("write");
+    let (head, body) = read_response(stream);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(body.contains("\"auth\":\"open\""), "{body}");
+    let rest = drain_after_close(stream);
+    assert!(
+        rest.is_empty(),
+        "responses nobody asked for: {}",
+        String::from_utf8_lossy(&rest)
+    );
+}
+
+#[test]
+fn a_pre_auth_answer_consumes_its_own_request() {
+    // The probes and the dashboard answer BEFORE the auth gate, which is also
+    // before the body read that consumes a request everywhere else. An answer
+    // that left its request in the connection's buffer would parse it again
+    // as the next one: a single probe answered over and over, and a client
+    // reusing the connection reading a stale probe body for its next request.
+    let data = test_dir("pre-auth");
+    let ui = test_dir("pre-auth-ui");
+    let ui_arg = ui.to_str().expect("utf-8 path").to_owned();
+    let server = Server::spawn(&data, &["--ui-dir", &ui_arg]);
+    let mut stream = server.connect();
+    let health = json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")});
+
+    // No build yet: the shell route answers its 404 before the gate too.
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .expect("write");
+    let (head, body) = read_response(&mut stream);
+    assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+    assert!(body.contains("no dashboard build found"), "{body}");
+    expect_whoami_after_request(&mut stream, "the missing-dashboard 404");
+
+    // The build is looked for per request, so it can appear mid-connection.
+    std::fs::write(ui.join("index.html"), "<!doctype html><title>t</title>").expect("index");
+    std::fs::write(ui.join("app.js"), "console.log(1);").expect("asset");
+
+    // One request at a time, the way a pooling client reuses a connection.
+    for (target, expected) in [
+        ("/healthz", health.to_string()),
+        ("/readyz", json!({"ready": true}).to_string()),
+        ("/dashboard", "<!doctype html><title>t</title>".to_owned()),
+        ("/app.js", "console.log(1);".to_owned()),
+    ] {
+        write!(stream, "GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").expect("write");
+        let (head, body) = read_response(&mut stream);
+        assert!(head.starts_with("HTTP/1.1 200"), "{target}: {head}");
+        assert_eq!(body, expected, "{target}");
+        expect_whoami_after_request(&mut stream, target);
+    }
+
+    // And all at once: every request written before any response is read, so
+    // several sit in the server's buffer together.
+    let mut pipelined = String::new();
+    for target in ["/healthz", "/readyz", "/", "/app.js"] {
+        pipelined.push_str(&format!(
+            "GET {target} HTTP/1.1\r\nHost: x\r\n\r\nGET /v1/whoami HTTP/1.1\r\nHost: x\r\n\r\n"
+        ));
+    }
+    stream.write_all(pipelined.as_bytes()).expect("write");
+    for (target, expected) in [
+        ("/healthz", health.to_string()),
+        ("/readyz", json!({"ready": true}).to_string()),
+        ("/", "<!doctype html><title>t</title>".to_owned()),
+        ("/app.js", "console.log(1);".to_owned()),
+    ] {
+        let (head, body) = read_response(&mut stream);
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "pipelined {target}: {head}"
+        );
+        assert_eq!(body, expected, "pipelined {target}");
+        expect_whoami(&mut stream, target);
+    }
+
+    close_cleanly(&mut stream);
+}
+
+#[test]
+fn a_pre_auth_request_with_a_body_is_consumed_whole() {
+    // A GET may declare a body, and a probe that is answered before the gate
+    // still owns those bytes. The body here is itself a complete request: a
+    // server that consumed only the head would answer it (smuggling), and one
+    // that consumed nothing would answer the probe again.
+    let dir = test_dir("pre-auth-body");
+    let server = Server::spawn(&dir, &[]);
+    let mut stream = server.connect();
+    let smuggled = "GET /readyz HTTP/1.1\r\nHost: x\r\n\r\n";
+    let probe = format!(
+        "GET /healthz HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+        smuggled.len()
+    );
+    let next = "GET /v1/whoami HTTP/1.1\r\nHost: x\r\n\r\n";
+
+    // Head, body and the next request in one segment...
+    stream
+        .write_all(format!("{probe}{smuggled}{next}").as_bytes())
+        .expect("write");
+    let (head, body) = read_response(&mut stream);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("connection: keep-alive"),
+        "a consumed body leaves nothing to close over: {head}"
+    );
+    assert!(body.contains("\"status\":\"ok\""), "{body}");
+    expect_whoami(&mut stream, "a probe with a body");
+
+    // ...and with the body arriving after the probe's head was already read,
+    // so it has to be pulled from the socket rather than the buffer, without
+    // reading past it into the request behind.
+    stream.write_all(probe.as_bytes()).expect("write");
+    stream.flush().expect("flush");
+    std::thread::sleep(Duration::from_millis(100));
+    stream
+        .write_all(format!("{smuggled}{next}").as_bytes())
+        .expect("write");
+    let (head, body) = read_response(&mut stream);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(body.contains("\"status\":\"ok\""), "{body}");
+    expect_whoami(&mut stream, "a probe whose body arrived late");
+
+    close_cleanly(&mut stream);
+}
+
+#[test]
+fn a_head_response_carries_no_body() {
+    // A HEAD response has no body whatever its Content-Length says, so a
+    // client reads only the head. Any body the server sends anyway is read as
+    // the start of the NEXT response on the connection.
+    let dir = test_dir("head");
+    let server = Server::spawn(&dir, &[]);
+    let mut stream = server.connect();
+
+    for target in ["/healthz", "/v1/whoami", "/no-such-route"] {
+        write!(stream, "HEAD {target} HTTP/1.1\r\nHost: x\r\n\r\n").expect("write");
+        let head = read_response_head(&mut stream);
+        assert!(head.starts_with("HTTP/1.1 "), "HEAD {target}: {head}");
+        expect_whoami_after_request(&mut stream, &format!("HEAD {target}"));
+    }
+
+    close_cleanly(&mut stream);
 }

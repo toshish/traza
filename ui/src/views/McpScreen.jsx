@@ -1,5 +1,6 @@
 import React from 'react';
 import { api, getToken, MCP_PROTOCOL_VERSION } from '../lib/api.js';
+import { publicBase } from '../lib/base.js';
 import { useRead } from '../lib/route.js';
 import { Card, Chip, Eyebrow, ErrorState, LiveDot, Mono, PanelHead, Skeleton } from '../components/primitives/Chrome.jsx';
 import { CodeBlock } from '../components/data/CodeBlock.jsx';
@@ -64,6 +65,10 @@ export function McpScreen({ go }) {
   }, [enabled], { skip: !enabled });
 
   const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8080';
+  // Where the API is reachable: the origin plus any path prefix the page was
+  // deployed under. The allowed-origin flag below names the ORIGIN alone,
+  // because that is what a browser sends.
+  const base = publicBase();
   // The stdio bridge speaks plain HTTP and refuses an https:// URL outright.
   // Interpolating this page's origin into it behind TLS produced a snippet
   // that looked copy-ready and could not work, so on https the bridge block
@@ -90,7 +95,7 @@ export function McpScreen({ go }) {
       <div style={{ fontSize: 13, lineHeight: '21px', color: 'var(--ink-muted)', textWrap: 'pretty' }}>
         {enabled
           ? <>An agent can read this store directly — searching spans, opening traces, grouping
-            failures and attributing cost — over <Mono color="var(--ink)">{origin}/v1/mcp</Mono>.
+            failures and attributing cost — over <Mono color="var(--ink)">{base}/v1/mcp</Mono>.
             {/* Only once the tool list has actually arrived: claiming "read-only"
                 while it is still loading is a sentence that flips under the reader. */}
             {!surface.data ? null : writable
@@ -125,7 +130,7 @@ traza-server --data-dir ./data --mcp --mcp-annotations`} />
         as a subprocess use the bundled stdio bridge, which translates framing and nothing else.
       </div>
       <CodeBlock code={`# HTTP client (Claude Code)
-claude mcp add --transport http traza ${origin}/v1/mcp${token ? ` \\
+claude mcp add --transport http traza ${base}/v1/mcp${token ? ` \\
   --header "Authorization: Bearer ${token}"` : ''}
 
 # stdio client (.mcp.json / claude_desktop_config.json)
@@ -133,7 +138,7 @@ claude mcp add --transport http traza ${origin}/v1/mcp${token ? ` \\
   "mcpServers": {
     "traza": {
       "command": "traza-server",
-      "args": ["mcp", "--url", "${secure ? 'http://TRAZA-HOST:PORT' : origin}"]${token ? `,
+      "args": ["mcp", "--url", "${secure ? 'http://TRAZA-HOST:PORT' : base}"]${token ? `,
       "env": { "TRAZA_TOKEN": "${token}" }` : ''}
     }
   }

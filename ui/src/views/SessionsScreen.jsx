@@ -3,18 +3,44 @@ import { api } from '../lib/api.js';
 import { useRead } from '../lib/route.js';
 import { RANGES, windowOf } from '../lib/query.js';
 import { fmtAgo, fmtCostProvenance, fmtDurationNs, fmtNum, fmtWindow } from '../lib/format.js';
+import { routeTenant, tenantParams } from '../lib/runs.js';
 import { Card, Chip, ErrorState, EmptyState, LoadingBar, Mono } from '../components/primitives/Chrome.jsx';
 
 // Sessions gained the time window the API always had, a sort, an efficiency
 // column, and errors that click through. The list and Analytics used to
 // disagree about "now" because only one of them had a window at all.
 
+/** A session's turns, and what was counted to get them. The server counts
+    the turn spans Traza's recorders mark, one per user prompt
+    (`turns_from: "prompts"`), and otherwise traces (`"traces"`). An imported
+    coding-agent session is one trace however many prompts it held, so
+    counting traces read every such session as one turn. A server that sends
+    no `turn_count` counted nothing else, so its traces stand. */
+function sessionTurns(session) {
+  const count = typeof session?.turn_count === 'number' ? session.turn_count : session?.trace_count || 0;
+  const title = session?.turns_from === 'prompts' ? 'Turns: user prompts'
+    : session?.turns_from === 'traces' ? 'Turns: traces — this producer marks no prompts, so each trace counts as a turn'
+      : 'Turns: traces — this server reports no prompt count, so each trace counts as a turn';
+  return { count, title, fromPrompts: session?.turns_from === 'prompts' };
+}
+
+/** Cost per turn, or `—` when nothing was priced: `0.00000` would say the
+    session was free. */
+function costPerTurn(session) {
+  const cost = fmtCostProvenance(session);
+  const { count } = sessionTurns(session);
+  return count && cost.priced ? (cost.estimated ? '~' : '') + (session.cost_usd / count).toFixed(5) : '—';
+}
+
 const SORTS = [
   { id: 'recent', label: 'most recent', of: (s) => -s.last_end_ns },
   { id: 'cost', label: 'costliest', of: (s) => -s.cost_usd },
   { id: 'errors', label: 'most errors', of: (s) => -s.error_count },
-  { id: 'turns', label: 'longest', of: (s) => -s.trace_count },
-  { id: 'efficiency', label: 'worst cost/turn', of: (s) => -(s.trace_count ? s.cost_usd / s.trace_count : 0) },
+  { id: 'turns', label: 'longest', of: (s) => -sessionTurns(s).count },
+  { id: 'efficiency', label: 'worst cost/turn', of: (s) => {
+    const { count } = sessionTurns(s);
+    return -(count ? s.cost_usd / count : 0);
+  } },
 ];
 
 export function SessionsScreen({ go }) {
@@ -63,9 +89,14 @@ export function SessionsScreen({ go }) {
       </div>
       {rows.map((session) => {
         const cost = fmtCostProvenance(session);
-        return <div key={session.session_id}
-        onClick={() => go(['sessions', session.session_id])} role="link" tabIndex={0}
-        onKeyDown={(e) => { if (e.key === 'Enter') go(['sessions', session.session_id]); }}
+        const turns = sessionTurns(session);
+        // A row omits `tenant` for the default tenant. The link names it
+        // either way, so the session — and the run it opens — is read in
+        // its own tenant rather than merged with another's of the same id.
+        const open = () => go(['sessions', session.session_id], tenantParams(session.tenant || ''));
+        return <div key={(session.tenant || '') + '\u0000' + session.session_id}
+        onClick={open} role="link" tabIndex={0}
+        onKeyDown={(e) => { if (e.key === 'Enter') open(); }}
         style={{
           display: 'grid', gridTemplateColumns: '1fr 76px 74px 84px 92px 92px 100px 72px 64px',
           alignItems: 'center', borderBottom: '1px solid var(--hairline)',
@@ -80,14 +111,12 @@ export function SessionsScreen({ go }) {
             {fmtWindow(session.first_start_ns, session.last_end_ns)}
           </div>
         </div>
-        <Num>{fmtNum(session.trace_count)}</Num>
+        <Num title={turns.title}>{fmtNum(turns.count)}</Num>
         <Num muted>{fmtNum(session.span_count)}</Num>
         <Num muted>{fmtNum(session.llm_calls)}</Num>
         <Num>{fmtNum(session.total_tokens)}</Num>
         <Num accent={!cost.estimated} muted={cost.estimated} title={cost.title}>{cost.text}</Num>
-        <Num muted>{session.trace_count
-          ? (cost.estimated ? '~' : '') + (session.cost_usd / session.trace_count).toFixed(5)
-          : '—'}</Num>
+        <Num muted>{costPerTurn(session)}</Num>
         <Num tone={session.error_count ? 'var(--error)' : 'var(--ink-faint)'}>{session.error_count}</Num>
         <Num muted>{fmtAgo(session.last_end_ns)}</Num>
       </div>;
@@ -99,8 +128,9 @@ export function SessionsScreen({ go }) {
   </div>;
 }
 
-export function SessionScreen({ sessionId, go }) {
-  const detail = useRead((signal) => api.session(sessionId, signal), [sessionId]);
+export function SessionScreen({ sessionId, go, params }) {
+  const tenant = routeTenant(params);
+  const detail = useRead((signal) => api.session(sessionId, tenantParams(tenant), signal), [sessionId, tenant]);
   const data = detail.data;
 
   if (detail.error) {
@@ -112,7 +142,12 @@ export function SessionScreen({ sessionId, go }) {
   if (!data) return <LoadingBar active />;
 
   const traces = data.traces || [];
+  const turns = sessionTurns(data);
   const maxCost = Math.max(...traces.map((t) => t.cost_usd || 0), 0);
+  // The run's tenant: the one this session was read in, else the one its
+  // spans agree on. Read without a tenant, an empty answer means the default
+  // tenant OR spans that disagree, so it names nothing.
+  const runScope = tenantParams(tenant !== undefined ? tenant : data.tenant || undefined);
 
   return <div style={{ display: 'grid', gap: 12, maxWidth: 1560 }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -121,25 +156,26 @@ export function SessionScreen({ sessionId, go }) {
         {fmtWindow(data.first_start_ns, data.last_end_ns)}
         {data.session_attribute && data.session_attribute !== 'session.id' ? ` · via ${data.session_attribute}` : ''}
       </span>
-      <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+      <span style={{ marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
         <Chip onClick={() => navigator.clipboard?.writeText(sessionId)}>copy id</Chip>
+        <Chip onClick={() => go(['run', sessionId], runScope)}
+          title="The session as a run: its steps in order, a replay, a diff">Run</Chip>
         <Chip onClick={() => go(['conversation', 'sessions', sessionId])}>Conversation</Chip>
         <Chip onClick={() => go(['traces'], { q: `session|=|${sessionId}` })}>Search its spans</Chip>
       </span>
     </div>
 
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: 12 }}>
+    <div className="tz-reflow" style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: 12 }}>
       {[
-        ['turns', fmtNum(data.trace_count)],
+        ['turns', fmtNum(turns.count), turns.title],
         ['spans', fmtNum(data.span_count)],
         ['LLM calls', fmtNum(data.llm_calls)],
         ['tokens', fmtNum(data.total_tokens)],
         ['cost USD', fmtCostProvenance(data).text],
-        ['cost / turn', data.trace_count
-          ? (fmtCostProvenance(data).estimated ? '~' : '') + (data.cost_usd / data.trace_count).toFixed(5)
-          : '—'],
+        // Nothing priced is no figure, per turn as in total.
+        ['cost / turn', costPerTurn(data)],
         ['errors', fmtNum(data.error_count)],
-      ].map(([label, value]) => <Card key={label} pad="12px 14px">
+      ].map(([label, value, title]) => <Card key={label} pad="12px 14px" title={title}>
         <div style={{ fontSize: 12, color: 'var(--ink-muted)', marginBottom: 5 }}>{label}</div>
         <div style={{
           fontFamily: 'var(--font-mono)', fontSize: 18, lineHeight: '26px', fontWeight: 500,
@@ -154,8 +190,10 @@ export function SessionScreen({ sessionId, go }) {
         display: 'grid', gridTemplateColumns: '1fr 132px 86px 76px 94px 92px 76px',
         background: 'var(--bg-sunken)', borderBottom: '1px solid var(--hairline)',
       }}>
-        {['turn', 'cost', 'window', 'spans', 'tokens', 'cost USD', 'errors'].map((label, i) => (
-          <div key={label} style={{
+        {/* Each row is a trace. Where the turns were prompts, a row is not a
+            turn, and its header does not say it is. */}
+        {[turns.fromPrompts ? 'trace' : 'turn', 'cost', 'window', 'spans', 'tokens', 'cost USD', 'errors'].map((label, i) => (
+          <div key={label} role="columnheader" style={{
             padding: '6px 10px', fontSize: 12, fontWeight: 500, color: 'var(--ink-muted)',
             textAlign: i === 0 || i === 1 ? 'left' : 'right', whiteSpace: 'nowrap',
           }}>{label}</div>

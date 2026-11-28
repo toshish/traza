@@ -26,8 +26,8 @@ JSON-RPC message per request. Clients that speak HTTP connect straight to it.
 claude mcp add --transport http traza http://localhost:8080/v1/mcp
 ```
 
-With `TRAZA_TOKENS` set, pass the bearer token the same way you would to any
-other route:
+Once any credential exists — `TRAZA_TOKENS`, or one minted at runtime — pass
+the bearer token the same way you would to any other route:
 
 ```sh
 claude mcp add --transport http traza http://localhost:8080/v1/mcp \
@@ -99,9 +99,11 @@ surface unless you deliberately enabled `record_annotation`. An `rw` token in
 an agent's configuration buys nothing and widens what a mistake can do.
 
 **The bridge speaks plain HTTP and refuses an `https://` URL.** Behind TLS
-termination, point it at the server's plaintext address on the host itself —
-or use the HTTP client form above, which handles `https://` directly and needs
-no bridge at all.
+termination, point it at the server's plaintext address on the host itself,
+or at the Python SDK's
+[`traza forward`](../../sdk/python/README.md#reaching-a-server-over-tls-traza-forward)
+on loopback — or use the HTTP client form above, which handles `https://`
+directly and needs no bridge at all.
 
 The dashboard's **MCP** screen generates both snippets against the origin you
 are actually on, and shows the live tool list, so it is correct behind any
@@ -114,10 +116,11 @@ over `curl`.
 
 ## The tools
 
-Twelve tools: ten reads and two gated writers. They are shaped like the
+Twenty-four tools: twenty-two reads and two gated writers. They are shaped like the
 questions somebody asks at 2am, not like the route index — two routes may serve
 one tool, and one route may serve two. Most of them describe what is in the
-store; `diagnose_session` is the one that answers a question about it.
+store; `diagnose_session` and `compare_runs` are the ones that answer a
+question about it.
 
 | Tool | The question it answers |
 |---|---|
@@ -131,6 +134,18 @@ store; `diagnose_session` is the one that answers a question about it.
 | `slowest_spans` | What is slow? |
 | `analyze_cost` | Where did the tokens and the money go? |
 | `get_payload` | Show me the full prompt behind this reference |
+| `check_run_guard` | May this run take its next step? |
+| `get_run_tape` | What did this run do, step by step? |
+| `compare_runs` | **Where did this run part from that one, and why?** |
+| `recall_runs` | Has this been done before, and how did it go? |
+| `foresee_run` | **How have runs like this one ended — and what did the ones that succeeded do next?** |
+| `list_live_runs` | Which agent runs are working right now, and what is each doing? |
+| `run_topology` | **How did this run's agents hand work around, and where did they ping-pong?** |
+| `blame_line` | **Which agent step wrote this line of code, and why?** |
+| `xray_step` | **What exactly did the model see at this step — and why did its cache break?** |
+| `what_changed` | **What changed in this agent, and did it make things worse?** |
+| `find_behavior` | **Which runs did *this*?** — a behaviour pattern, or a named detector |
+| `list_forks` | Which branches of this run were tried, and how did each go? |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -139,13 +154,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the ten readers | `true` | — | — | `false` |
+| the twenty-two readers | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises ten read tools as though each might delete something and
+omits them advertises twenty-two read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -164,7 +179,7 @@ whole failure mode — which is why it is also named in the server's
 `instructions`, where a host puts it in front of the model once rather than per
 call.
 
-Four tools are worth knowing the reasoning behind:
+The reasoning behind these is worth knowing:
 
 - **`diagnose_session` instead of reading a trace and judging its shape.** It
   examines every span of a run and reports the outcome, the step the failure is
@@ -187,6 +202,159 @@ Four tools are worth knowing the reasoning behind:
 - **`get_payload` is separate from the search tools on purpose.** Pulling a
   large third-party document into a context window should be a decision, not a
   side effect of a search matching a span.
+- **`get_run_tape`, `compare_runs` and `recall_runs` read runs, not spans.** A
+  run is a session id or `trace:<trace_id>`; its steps are its model calls,
+  tool calls and agent invocations in order. `get_run_tape` renders them with
+  short input and output previews; `compare_runs` aligns two runs and names
+  the first divergence — different input, a different decision on the same
+  input, a different model or parameters, or a step only one run has — with
+  both runs' cost, tokens, errors and outcome in structured content;
+  `recall_runs` finds earlier runs whose text contains every word of a query,
+  successful ones first, each with a skeleton of the steps it took. They are
+  the [replay guide](replay.md)'s tapes, diffs and recall. There is
+  deliberately no tool that creates a replay: a replay serves model answers to
+  an agent harness, and letting the model under test create one would let
+  stored telemetry choose which recording its next run is fed.
+- **`xray_step` reads one model call's context window.** It is the
+  [context X-Ray](xray.md): the context split into chunks with estimated
+  tokens and the step that introduced each, stale tool results, repeated
+  content, what the conversation's previous call had that this one lost (a
+  lost system or user chunk is called out as an instruction) or carries
+  edited, and the call's cache verdict naming the first divergent chunk and the
+  volatile token in it. It takes `trace_id` and `span_id` — `get_run_tape`
+  lists both for every step — or `run_id` and `step`, a tape index (the run is
+  read once, under one query deadline; with a credential that sees every
+  tenant, a run present in more than one is refused), and is text only. The
+  headline carries counts in Traza's own words, and counts as lost
+  instructions only losses checked against every possible edit — the rest are
+  counted as possibly edited. The model, the run, every preview and role, and
+  the cache explanation (which quotes recorded text) render inside the
+  telemetry block. Past the result ceiling rows are cut from the end, the
+  chunk list first, and the note says whether the summary rows survived; the
+  stale threshold is the server's `--xray-stale-steps`.
+- **`what_changed` before reading individual runs when an agent that used to
+  work is failing.** It runs the [change radar](radar.md) over the agent's
+  runs (default: the last 30 days) and returns a ranked timeline of change
+  points: a system prompt edit (with the edited text), tools added or
+  removed, a different requested or returned model, new sampling parameters,
+  a new service or SDK version, or a `behavior` change, where the agent's
+  paths shifted with no configuration change at all. Each change reports how
+  error rate, success rate, cost and steps moved across it, with p-values and
+  a verdict, regressions first. It also names example runs on each side,
+  which you can open with `get_run_tape` or compare with `compare_runs`. It
+  takes `agent`, `environment`, `since`, `until`, `limit` (changes per
+  agent, default 5, at most 20) and, for an unbound credential, `tenant` (a
+  bound credential naming another tenant is refused). Each change says
+  whether a quality or an efficiency metric decided its verdict
+  (`decided_by`), and quality regressions rank first. With `run_id`, it also
+  places that run on
+  its agent's timeline: its configuration, and the change points it ran
+  downstream of (for example, "this failed run used the system prompt
+  introduced by Tuesday's regression"). It returns `structuredContent` with
+  each agent's summary, current configuration and top changes, plus `run`
+  when one was named. A run id two tenants share needs `tenant`; a run the
+  `agent` or `environment` filter excludes is refused by name rather than
+  reported missing. Agent names,
+  values, prompt text, tool names and run ids render inside the telemetry
+  block.
+- **`list_forks` reads the branches a harness already made** of a run
+  ([forks](fork.md)): the most recent first, each with the step it was cut
+  at, how it ended, its cost, and where it first parted from the parent —
+  the step, the kind of difference and the differ's explanation, all inside
+  the untrusted block. It takes `run_id` and an optional `limit` (default 20,
+  at most 50), reads the same listing as
+  [`GET /v1/forks`](http-api.md#get-v1forks) under the caller's tenant, and
+  says when a fork was not compared (the query budget ran out first, or the
+  parent has no spans in its tenant). There is no tool that creates a fork,
+  for the reason there is none that creates a replay.
+
+**`foresee_run` reads a run against its agent's [Fate Map](foresight.md).** It
+takes `run_id`, an optional `tenant` (for an unbound credential; a bound one
+naming another tenant is refused) and an optional `min_support` (default 30),
+and answers what [`GET /v1/fate/runs/{run}`](http-api.md#get-v1faterunsrun)
+answers: the run's behaviour path so far, the share of the agent's completed
+runs that took the same path and succeeded — with its 95% interval and how
+many runs that is — a verdict (`on_track`, `at_risk`, `likely_failure`,
+`novel`, `insufficient_history`), where the run left the known paths, and what
+earlier runs did next from here and how that went for them. A run still
+going is compared with every run that repeated its last step at least as
+often (it may yet repeat it), and the text says so; an option that is the
+same step again reads "again". The headline is
+only numbers and verdict words the server computed; the run id, the agent and
+every token of the path — tool and model names from the telemetry — and the
+explanation that quotes them render inside the telemetry block, and are made
+JSON-safe in `structuredContent`. It is a read: it builds the agent's map if
+none is cached (under the query deadline), and changes nothing. Nothing in it
+comes from a model — it is counting over stored runs — and it says so. Under
+a tight `--mcp-max-result-bytes` the structured half is cut, detail first —
+`next`, `recommended_next`, the node and divergence, the explanation, then
+the path from its end — until it fits beside the headline, and the result
+says so (`truncated: true`, and the headline names what was left out); the
+run id, tenant, agent, verdict and numbers are never cut, so a run whose
+identifiers alone overflow the ceiling (a run id of a kilobyte under a
+one-kilobyte ceiling) is refused with a tool error that quotes none of them.
+
+**`blame_line` answers "why does this code look like this?"** before an
+agent changes it. It takes `path` (a file path or a suffix such as
+`src/cart.rs`), `line` (the exact text; indentation does not matter), an
+optional `project` (the repository's absolute root — an agent's own working
+directory — or a list of roots, `<dir>/*` standing for every checkout directly
+under `<dir>`, so a relative `path` must name exactly `<root>/<path>`; without
+it every project in the store is searched, and a common line can be answered
+from an unrelated repository) and an optional `limit` (default 5, at most 50),
+and returns the earliest recorded tool steps whose edit added that line —
+Claude Code `Edit`/`MultiEdit`/`Write`, Codex patches and file changes,
+Anthropic's text-editor tool — each with its run, step, model, tool, file, the
+project it was made in and the prompt the agent was following. A failed edit
+(status `error`) is never an answer; an edit whose result was never recorded
+is listed after every applied one, as having tried to write the line. It is the
+same search as [`GET /v1/blame`](http-api.md#get-v1blame); see the
+[recorders guide](recorders.md#agent-blame) for what counts as introducing a
+line. Paths, tool and model names, run ids and prompts render inside the
+telemetry block: a prompt is the producer's text, never an instruction to the
+caller.
+
+**`check_run_guard` reads a run's [fuse](guard.md) verdict** — `continue`,
+`warn` or `stop` — with its reasons, policy, limits and usage: the same
+document as [`GET /v1/fuses/runs/{run}`](http-api.md#get-v1fusesrunsrun), as
+`structuredContent` under an `outputSchema`, and summarized as text. It takes
+`run_id` (a session id, or `trace:<trace_id>`) and, for an unbound credential,
+an optional `tenant`; a bound credential naming another tenant is refused. The
+run id, the reasons — which quote step fingerprints, and so tool and model
+names from the telemetry — and the policy name render inside the telemetry
+block. It is read-only: nothing on this surface can trip or reset a run, so a
+stopped agent cannot talk its way past its own fuse. It answers what is
+recorded, which is the pre-call check without an estimate; an agent wanting
+to price its next step uses
+[`POST /v1/fuses/check`](http-api.md#post-v1fusescheck). When the run's policy
+sets a [predictive limit](foresight.md#predictive-fuses), the verdict carries
+the run's `foresight` too, and a foresight stop reads as any other reason;
+in `structuredContent` the reasons and the foresight's explanation and next
+tool are made JSON-safe, as `foresee_run` makes the same text. On a server
+started with `--no-fuses` it is not listed, nor is `list_live_runs` —
+twenty reads, then — and a call naming either is refused.
+
+**`list_live_runs` and `run_topology` are [steering](steer.md)'s reads.**
+`list_live_runs` is [`GET /v1/runs/live`](http-api.md#get-v1runslive): the
+runs active now, most recently changed first, each with its agent, the step
+it is on (a step a pre-call check named and no span has recorded yet is
+marked pending), its usage, verdict, [foresight](steer.md#foresight-on-live-runs)
+— a verdict and success rate the server counted from earlier runs, never a
+model's prediction — and waiting nudges, as text and as `structuredContent`. It takes `limit` (default 20, at most 200) and, for an
+unbound credential, `tenant`. `run_topology` is
+[`GET /v1/runs/{run}/topology`](http-api.md#get-v1runsruntopology) rendered:
+the run's agents, which delegated to which, the ping-pong pairs (control
+returning to an agent straight from the one it handed off to, counted per
+direction) and the turns in order; when a list was cut, the headline says
+so (`more than 256 agents`, and which lists show only their largest
+entries) rather than reporting the cut count as the run's. Agent names, run
+ids, tenant names, tool names and reasons are telemetry and render inside
+the telemetry block — the run and its tenant as the block's first row — and
+the headline holds only the server's own words and counts. **There is no nudge tool**, in either direction: an agent hears
+nudges through its pre-call check — a nudge read here would be consumed, or
+not, depending on which surface asked first — and queueing one is an
+operator's act, not one stored telemetry should be able to talk a model
+into.
 
 **The eval entities are not on this surface.** Datasets, versions, examples,
 experiments, runs and scores are served over HTTP only — no tool reads them,
@@ -200,6 +368,53 @@ neither field — it takes `trace_id`, `span_id`, `name`, `value` and `comment`,
 and refuses anything else. Scoring an experiment means
 `POST /v1/annotations` with `experiment_id` and `example_id` set. The bundled
 dashboard has the same limit.
+
+### `find_behavior`
+
+**Which runs did *this*?** `find_behavior` runs a [TQL](tql.md) pattern — a
+regex whose letters are steps — over the most recent runs, or one of the
+[detectors](tql.md#the-detector-library): `test_tampering`,
+`hallucinated_tool`, `give_up_loop`, `edit_thrash`, `ping_pong`,
+`context_blowup`, `retry_without_change`, `tool_error_streak`,
+`unverified_finish`. It is the same search as
+[`GET /v1/trajectories/search`](http-api.md#get-v1trajectoriessearch).
+
+| Argument | Means |
+|---|---|
+| `query` | a TQL pattern, e.g. `test[error] ..> edit[file~"test"] ..> test[not error]` |
+| `detector` | a detector's name, instead of `query` |
+| `since`, `until` | the window (default: the last 30 days), in the forms [below](#arguments) |
+| `agent` | only runs of this agent |
+| `outcome` | `any` (default), `success`, `failure`, `abandoned`, `unknown` |
+| `limit` | runs to return, default 10, at most 50 |
+| `cursor` | an earlier call's `next_cursor`, to continue with the runs it did not check (keep the query; leave `since`/`until` out) |
+
+With neither `query` nor `detector` it lists the library — each detector's
+title, summary and pattern — so an agent can read a pattern and adapt it;
+with both it is refused. Each match renders as one row inside the telemetry
+block: the run id, how it ended, its agent, the occurrence count, the matched
+steps (`#3 tool:Edit`, numbered as in `get_run_tape`) and captured values —
+all of which are producer data. `structuredContent` carries the matches as
+the HTTP route shapes them, every string made JSON-safe. A query that does not
+parse is a tool error with the query and a caret under the column, which a
+model can fix and retry from.
+
+One deliberate difference from the other tools' deadline rule: the scan reads
+runs newest first, so where the compute budget runs out it returns what it
+found, with a headline that says `STOPPED EARLY`, how many candidate runs
+were left unchecked — those runs all come after every run it did check — and
+the `cursor` to call again with to continue (`next_cursor` in structured
+content); following it lists each run once, even among runs that tie on
+time. The same `cursor` is offered when the window held more runs than are
+considered. It is digits, hex and dots, so it stands outside the telemetry
+block. When a scanned run that is not listed had more partial matches than
+the matcher tracks, the headline says `UNCERTAIN` and how many such runs
+there were (`runs_inexact`), and the "No scanned run matches" note is
+withheld: an occurrence there may have been missed. Captured values are cut
+to 120 characters in the text and to 1 KiB in `structuredContent`
+(`captures_truncated` says so); spans whose run id does not read back to them
+are left out and counted in the headline. Enumerating the window is still
+all-or-nothing.
 
 ### Arguments
 
@@ -256,11 +471,12 @@ honest caveat: the budget anchors per engine operation, not per tool call,
 so a tool composed of several folds — `describe_store` runs half a dozen —
 can spend several budgets end to end.
 
-`analyze_cost` and `list_sessions` additionally return `structuredContent`
-against a declared `outputSchema`, because their rows are small, genuinely
-tabular, and the thing a client is most likely to chart. Everything else is
-text only — for span data the compact rendering is strictly better, and sending
-both doubles the bytes for identical information.
+`list_sessions`, `diagnose_session`, `analyze_cost`, `check_run_guard`,
+`compare_runs`, `recall_runs`, `foresee_run`, `what_changed` and `find_behavior` additionally return `structuredContent` against a declared
+`outputSchema`, because their answers are small, genuinely tabular or
+record-shaped, and the thing a client is most likely to chart or act on.
+Everything else is text only — for span data the compact rendering is strictly
+better, and sending both doubles the bytes for identical information.
 
 Both halves are budgeted together, and trimmed in lockstep: the ceiling bounds
 the tool result a client receives, not one field of it. Rows come off both at
@@ -354,8 +570,8 @@ adds no new credential concept.
 
 | Server configuration | MCP surface |
 |---|---|
-| No `TRAZA_TOKENS`, loopback bind | Open, exactly like `/v1/spans` today |
-| No `TRAZA_TOKENS`, non-loopback | Refused at startup, unchanged |
+| No credential at all (no `TRAZA_TOKENS`, no runtime credential), loopback bind | Open, exactly like `/v1/spans` today |
+| No credential at all, non-loopback | Refused at startup, unchanged |
 | `ro` token | Every read tool |
 | `rw` token | Read tools, plus `record_annotation` when `--mcp-annotations` is set |
 
@@ -371,9 +587,10 @@ shown a tool it will be refused on calls it, reads the refusal as transient,
 and retries.
 
 **A tenant-bound credential is bound over MCP exactly as over HTTP.** The
-`@tenant` binding in `TRAZA_TOKENS` travels with the authenticated principal
-into every tool call: a bound token's searches, trace and session lookups,
-aggregates, and payload fetches see only its own tenant's data. The binding
+binding — `@tenant` in `TRAZA_TOKENS`, or `tenant` on a minted credential —
+travels with the authenticated principal into every tool call: a bound
+token's searches, trace and session lookups, aggregates, and payload fetches
+see only its own tenant's data. The binding
 rides the same query construction the HTTP routes use — one choke point, not
 per-tool care — so there is no tool that forgets it.
 
@@ -449,7 +666,8 @@ bounding is what a data source can honestly offer.
   specification's negotiation rule, and the client decides whether to continue.
   An `MCP-Protocol-Version` header naming an unsupported revision is a `400`.
   Older revisions are refused rather than half-served: `structuredContent`,
-  which two tools return, does not exist before `2025-06-18`.
+  which every tool declaring an `outputSchema` returns, does not exist before
+  `2025-06-18`.
 - **Origin is validated against an allowlist the operator controls.** A
   request carrying an `Origin` that is neither a loopback page nor named by
   `--mcp-allowed-origin` is refused with `403`. Native MCP clients send no

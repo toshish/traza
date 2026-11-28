@@ -91,7 +91,7 @@ export function ServerScreen() {
       </div>
     </Card>
 
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+    <div className="tz-reflow-1" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
       <Card>
         <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 10 }}>
           <Eyebrow>ingest</Eyebrow>
@@ -175,7 +175,7 @@ export function ServerScreen() {
       })}
     </Card>
 
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+    <div className="tz-reflow-1" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
       <Card>
         <Eyebrow style={{ marginBottom: 10 }}>Time-range pruning</Eyebrow>
         <div style={{ fontSize: 13, lineHeight: '20px', color: 'var(--ink)', marginBottom: 10, textWrap: 'pretty' }}>

@@ -20,10 +20,12 @@ function idActions(text) {
     // the search screen and would silently swallow the id.
     { id: 'open-trace', label: `Open trace ${trimmed}`, hint: 'trace', go: ['trace', trimmed] },
     { id: 'open-session', label: `Open session ${trimmed}`, hint: 'session', go: ['sessions', trimmed] },
+    // A run id is a session id or `trace:<id>`; either opens the tape.
+    { id: 'open-run', label: `Open run ${trimmed}`, hint: 'run', go: ['run', trimmed] },
   ];
 }
 
-export function CommandPalette({ open, onClose, onNavigate, recents = [] }) {
+export function CommandPalette({ open, onClose, onNavigate, recents = [], nav = NAV }) {
   const [text, setText] = React.useState('');
   const [cursor, setCursor] = React.useState(0);
   const inputRef = React.useRef(null);
@@ -44,11 +46,13 @@ export function CommandPalette({ open, onClose, onNavigate, recents = [] }) {
     };
   }, [open]);
 
+  // The screens this credential is offered — the same list the rail shows,
+  // so the palette cannot open an operator screen the rail hid.
   const screens = React.useMemo(
-    () => NAV.flatMap((group) => group.items.map((item) => ({
+    () => nav.flatMap((group) => group.items.map((item) => ({
       id: 'go-' + item.id, label: item.label, hint: group.label, go: [item.id],
     }))),
-    [],
+    [nav],
   );
 
   const results = React.useMemo(() => {
@@ -134,7 +138,7 @@ export function CommandPalette({ open, onClose, onNavigate, recents = [] }) {
       }}>
         <span><Kbd>↑</Kbd> <Kbd>↓</Kbd> move</span>
         <span><Kbd>↵</Kbd> open</span>
-        <span style={{ marginLeft: 'auto' }}>paste a trace or session id to jump straight to it</span>
+        <span className="tz-hide-narrow" style={{ marginLeft: 'auto' }}>paste a trace, session or run id to jump straight to it</span>
       </div>
     </div>
   </div>;

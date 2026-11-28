@@ -605,7 +605,7 @@ pub fn approximate_bytes(span: &Span) -> usize {
 }
 
 /// Heap held by one JSON value, recursively.
-fn value_bytes(value: &Value) -> usize {
+pub(crate) fn value_bytes(value: &Value) -> usize {
     // Every element of an array and every entry of a map costs a whole `Value`
     // slot regardless of what it holds, plus the container's own bookkeeping.
     //

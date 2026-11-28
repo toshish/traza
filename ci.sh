@@ -40,28 +40,92 @@ python3 scripts/test-rust-notices.py
 python3 scripts/test-smoke-object-cli.py
 python3 scripts/generate-rust-notices.py --check
 python3 scripts/test-object-s3.py
+# The demos' agents refuse redirects, and the section below runs every demo
+# against the binary just built, from a path with a space in it.
+python3 scripts/test-demos.py
 
 # ---------------------------------------------------------------- examples
 # The demos are documentation people run, so each is a gate rather than a
 # sample: they drive the real binary over the real endpoints and assert their
 # own claims, and a change that breaks a surface they show should not merge
-# green. Each runs at its documented smoke setting; the whole tour stays
-# under a minute.
+# green. Each runs at its documented smoke setting; guard, replay, prove,
+# foresight and coding-agents have no scale knob and run as they are, in
+# seconds each; mission-control runs its checks at double pace and stops once
+# they pass.
+#
+# They run through a symlink to this checkout whose path has a space in it:
+# a checkout can live under such a path, and a script that splits its own
+# path on spaces works from any path without one, so CI would never see it
+# break otherwise. guard, replay, prove, foresight, coding-agents and
+# mission-control run the binary TRAZA_BIN names, so it is set here, never
+# inherited: an older install exported in the caller's shell must not stand in
+# for the one just built. foresight writes its corpus with the seed
+# TRAZA_SEED_BIN names, so that is set too, to the seed the release build above
+# also built: an exported older seed would write a corpus the change under test
+# never touched.
 if command -v python3 >/dev/null 2>&1; then
-  TRAZA_DEMO_PORT=${TRAZA_DEMO_PORT:-8123} ./examples/mcp-demo/run.sh >/dev/null
+  demo_dir=$(mktemp -d "${TMPDIR:-/tmp}/traza-ci.XXXXXX")
+  demos="$demo_dir/traza checkout"
+  trap 'rm -f "$demos"; rmdir "$demo_dir"' EXIT
+  ln -s "$PWD" "$demos"
+  built="$demos/target/release/traza-server"
+  TRAZA_DEMO_PORT=${TRAZA_DEMO_PORT:-8123} "$demos/examples/mcp-demo/run.sh" >/dev/null
   echo "ci: mcp demo ran"
-  TRAZA_SWARM_SECONDS=8 ./examples/swarm/run.sh >/dev/null
+  TRAZA_SWARM_SECONDS=8 "$demos/examples/swarm/run.sh" >/dev/null
   echo "ci: swarm demo ran"
-  TRAZA_CRASH_SPANS=8000 ./examples/crash/run.sh >/dev/null
+  TRAZA_CRASH_SPANS=8000 "$demos/examples/crash/run.sh" >/dev/null
   echo "ci: crash demo ran"
-  TRAZA_NEEDLE_SPANS=60000 ./examples/needle/run.sh >/dev/null
+  TRAZA_NEEDLE_SPANS=60000 "$demos/examples/needle/run.sh" >/dev/null
   echo "ci: needle demo ran"
-  TRAZA_INCIDENT_SCALE=2 ./examples/incident/run.sh >/dev/null
+  TRAZA_INCIDENT_SCALE=2 "$demos/examples/incident/run.sh" >/dev/null
   echo "ci: incident demo ran"
-  TRAZA_VANISH_SCALE=1 ./examples/vanish/run.sh >/dev/null
+  TRAZA_VANISH_SCALE=1 "$demos/examples/vanish/run.sh" >/dev/null
   echo "ci: vanish demo ran"
+  TRAZA_BIN="$built" "$demos/examples/guard/run.sh" >/dev/null
+  echo "ci: guard demo ran"
+  TRAZA_BIN="$built" "$demos/examples/replay/run.sh" >/dev/null
+  echo "ci: replay demo ran"
+  TRAZA_BIN="$built" "$demos/examples/prove/run.sh" >/dev/null
+  echo "ci: prove demo ran"
+  TRAZA_SEED_BIN="$demos/target/release/seed" TRAZA_BIN="$built" \
+    "$demos/examples/foresight/run.sh" >/dev/null
+  echo "ci: foresight demo ran"
+  TRAZA_BIN="$built" "$demos/examples/coding-agents/run.sh" >/dev/null
+  echo "ci: coding-agents demo ran"
+  TRAZA_BIN="$built" TRAZA_LIVE_SECONDS=1 TRAZA_LIVE_TEMPO=2 "$demos/examples/mission-control/run.sh" >/dev/null
+  echo "ci: mission-control demo ran"
 else
   echo "ci: skipping the demos (python3 not found)"
+fi
+
+# ---------------------------------------------------------------- client libraries
+# sdk/python and sdk/typescript are typed clients for the agent-native routes,
+# and each suite spawns the release binary built above, so a change to a wire
+# shape a client reads fails here rather than in someone's agent. Pointed at
+# target/release on purpose, never at an exported TRAZA_SERVER_BIN: the gate
+# tests what it just built. Both suites together take seconds. The Python
+# client is standard library only, and python3 is already required above, so
+# its suite always runs; the TypeScript suite needs Node 20+ and npm, to
+# install its one dev dependency (tsc), and is skipped without them.
+# The metadata check comes first: a version bump that missed a client, or a
+# stale LICENSE or NOTICE copy, is named there rather than discovered later.
+python3 scripts/check-sdk-metadata.py
+sdk_server="$PWD/target/release/traza-server"
+TRAZA_SERVER_BIN="$sdk_server" python3 -m unittest discover -s sdk/python/tests
+echo "ci: python client tests ran"
+node_major=""
+if command -v node >/dev/null 2>&1; then
+  node_major=$(node --version | sed 's/^v//; s/\..*//')
+fi
+if [ -n "$node_major" ] && [ "$node_major" -ge 20 ] && command -v npm >/dev/null 2>&1; then
+  (
+    cd sdk/typescript
+    npm ci --no-audit --no-fund --loglevel=error
+    TRAZA_SERVER_BIN="$sdk_server" npm test --silent
+  )
+  echo "ci: typescript client tests ran"
+else
+  echo "ci: skipping the typescript client tests (Node 20+ with npm not found)"
 fi
 
 # ---------------------------------------------------------------- dashboard

@@ -166,6 +166,80 @@ together.
 A four-line placeholder. Expiration is implemented in `Store::expire_before` in
 `lib.rs`; this module reserves the unit and contains no public API.
 
+### [`src/ingest_hooks.rs`](../../src/ingest_hooks.rs)
+
+The two seams on the ingest path: `Store::admission_check`, which runs the
+admission caps and then the tenant quotas before anything about a batch is
+decided, and `Store::observe_admitted`, which feeds the run guard once a batch
+is acknowledged. A batch refused at the first never reaches the second.
+
+### [`src/ledger.rs`](../../src/ledger.rs)
+
+The ledger: `ledger.jsonl`, an append-only hash chain over every published
+generation, every published erasure (as a salted digest of its subject) and
+every external anchor, outside generations because it commits to them. Also
+chain verification, the evidence pack, and the offline `verify --ledger`.
+Documented in [the ledger guide](../guide/ledger.md).
+
+## Agent runs
+
+A run is a session id, or `trace:<trace_id>` for a trace with none
+([`semconv::run_id`](../../src/semconv.rs)). These modules read runs; none of
+them stores anything new about a span.
+
+### [`src/run.rs`](../../src/run.rs)
+
+Resolves a run id to its spans in step order under the snapshot, erasure mask
+and query deadline, and pairs step facts with priced LLM facts.
+
+### [`src/guard.rs`](../../src/guard.rs) and [`src/guard/`](../../src/guard)
+
+Run fuses: policies (`policy.rs`), the bounded live run state the ingest
+observer updates (`state.rs`), the event ring (`events.rs`), `fuses.jsonl`
+for policies, trips, resets and grants (`log.rs`), and the `/v1/fuses/*`
+routes as request → reply functions (`http.rs`). Documented in
+[the run fuses guide](../guide/guard.md).
+
+### [`src/tape.rs`](../../src/tape.rs), [`src/replay.rs`](../../src/replay.rs), [`src/diff.rs`](../../src/diff.rs), [`src/recall.rs`](../../src/recall.rs)
+
+A run read as a tape of steps; the in-memory replay registry that serves a
+tape's model answers back in OpenAI and Anthropic wire shapes; LCS alignment
+of two tapes and their first divergence; and recall of earlier runs from the
+content index. Their HTTP routes are in
+[`src/bin/traza-server/replay_routes.rs`](../../src/bin/traza-server/replay_routes.rs)
+and their MCP tools in [`src/mcp/replay_tools.rs`](../../src/mcp/replay_tools.rs).
+Documented in [the replay guide](../guide/replay.md).
+
+### v0.28: foresight, steering, recorders, X-Ray, radar, TQL, forks
+
+Each is a module with its HTTP handlers beside it (or in a route file under
+[`src/bin/traza-server/`](../../src/bin/traza-server)) and its MCP tool in
+[`src/mcp/`](../../src/mcp):
+
+- [`src/fate.rs`](../../src/fate.rs) and [`src/fate/`](../../src/fate) — the
+  Fate Map, foresight for one run, the predictive fuse limits, and the live
+  view's foresight ([foresight guide](../guide/foresight.md)).
+- [`src/steer.rs`](../../src/steer.rs), [`src/steer/`](../../src/steer) and
+  [`src/guard/live.rs`](../../src/guard/live.rs) — live runs and their stream,
+  nudges (`steer.jsonl`), run topology and handoff cycles
+  ([steer guide](../guide/steer.md)).
+- [`src/import/`](../../src/import), [`src/blame.rs`](../../src/blame.rs) and
+  [`src/zstd.rs`](../../src/zstd.rs) — the Claude Code and Codex recorders,
+  Agent Blame, and the std-only Zstandard decoder for compressed rollouts
+  ([recorders guide](../guide/recorders.md)).
+- [`src/xray.rs`](../../src/xray.rs) and [`src/xray/`](../../src/xray) — the
+  context X-Ray, delta-recorded conversations rebuilt, and the Cache Autopsy
+  ([X-Ray guide](../guide/xray.md)).
+- [`src/radar.rs`](../../src/radar.rs) and [`src/radar/`](../../src/radar) —
+  configuration fingerprints, change points and their statistics
+  ([radar guide](../guide/radar.md)).
+- [`src/tql.rs`](../../src/tql.rs) and [`src/tql/`](../../src/tql) — the TQL
+  parser, regex subset, NFA matcher, work meter and detector library
+  ([TQL guide](../guide/tql.md)).
+- [`src/fork.rs`](../../src/fork.rs) — fork listings and golden runs; replay
+  edits and live points live in [`src/replay.rs`](../../src/replay.rs)
+  ([fork guide](../guide/fork.md)).
+
 ## Ingest surfaces
 
 ### [`src/otlp.rs`](../../src/otlp.rs)
@@ -187,15 +261,46 @@ bounds-checked; malformed input yields a decode error, never a panic.
 
 ### [`src/auth.rs`](../../src/auth.rs)
 
-Bearer authentication: `TRAZA_TOKENS` parsing, `ro`/`rw` scopes, constant-time
-token comparison, and the 401/403 verdicts. `AuthConfig` implements a redacted
-`Debug` so an accidental structured log cannot disclose credentials, and parse
-errors name the defect without echoing the value.
+The authentication vocabulary — `Scope`, `Principal`, and the 401/403
+verdicts, each 403 naming the capability it lacked (`Required`) — and the
+`TRAZA_TOKENS` parser. `AuthConfig` implements a redacted `Debug` so an
+accidental structured log cannot disclose credentials, and parse errors name
+the defect without echoing the value.
+
+### [`src/credentials.rs`](../../src/credentials.rs)
+
+The credential set the server authenticates against: environment entries plus
+runtime credentials, looked up by the SHA-256 of the presented token. Runtime
+credentials persist in `credentials.jsonl` (digests only, append-only, torn
+tail healed), outside generations so backups never carry them.
+
+### [`src/limits.rs`](../../src/limits.rs), [`src/usage.rs`](../../src/usage.rs), [`src/caps.rs`](../../src/caps.rs)
+
+Per-tenant runtime limits (`limits.json`: quotas, ingest pause, TTL
+override), per-tenant usage counters and the quota check (`usage.json`), and
+the admission caps plus the one measurement pass ingest makes over a batch.
+The caps and the quota check run in `Store::admission_check`; usage is
+charged at acknowledgement.
+
+### [`src/gzip.rs`](../../src/gzip.rs)
+
+A dependency-free inflate (RFC 1951) inside gzip framing (RFC 1952) for
+`Content-Encoding: gzip` ingest bodies, with the decompressed size capped by
+the caller and every member's CRC-32 and length verified.
+
+### [`src/platform.rs`](../../src/platform.rs)
+
+The hosting state (`credentials`, `limits`, `usage`, one field on `Store`)
+and the HTTP handlers for `/v1/whoami`, `/v1/usage` and `/v1/admin/*`, as
+request → reply functions the server routes to with one call. Also `screen`,
+the head-only refusals the gate applies after authentication: cross-site
+browser requests to admin operations in open mode, and admin bodies not
+declared JSON.
 
 ### [`src/mcp.rs`](../../src/mcp.rs)
 
 The Model Context Protocol surface: JSON-RPC framing, `initialize` and version
-negotiation, the ten tool schemas and handlers, five resources and three URI
+negotiation, the tool schemas and handlers (the v0.28 tools in `src/mcp/`), five resources and three URI
 templates, four prompts, and the renderers that turn spans into something a
 context window can hold. Tool handlers call `Store` directly — never back
 through HTTP — so the module works with no listener in the process at all,

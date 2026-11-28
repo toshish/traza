@@ -159,22 +159,66 @@ export function Distribution({ buckets = [], p50Ns, p95Ns, p99Ns, height = 150, 
   </div>;
 }
 
+/** Horizontal room one ruler label needs: "999.99 ms" is nine mono
+    characters at 11px (about 60px), plus a gap so neighbours never touch. */
+const RULER_LABEL_PX = 96;
+
+/** How many intervals fit a ruler `width` pixels wide without two labels
+    overlapping — at most `wanted`, at least one. A width of zero (not laid
+    out yet, or a test DOM with no layout) keeps `wanted`. */
+export function rulerTicks(width, wanted) {
+  if (!width) return wanted;
+  return Math.max(1, Math.min(wanted, Math.floor(width / RULER_LABEL_PX)));
+}
+
 /** A time axis. Every waterfall gets one: bars positioned proportionally with
-    no ruler are a picture of a trace, not a reading of it. */
+    no ruler are a picture of a trace, not a reading of it.
+
+    The tick count follows the ruler's measured width. A fixed six ticks put
+    six labels into a narrow column, and the last two — the penultimate one
+    left-aligned at its tick, the final one right-aligned at the edge —
+    collided whenever an interval was narrower than two labels. Inner labels
+    are now centred on their ticks and the count shrinks until every label
+    has room. */
 export function TimeRuler({ startNs, endNs, ticks = 6, style }) {
+  const ref = React.useRef(null);
+  const [width, setWidth] = React.useState(0);
+  React.useEffect(() => {
+    const node = ref.current;
+    if (!node) return undefined;
+    setWidth(node.getBoundingClientRect().width);
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) setWidth(entry.contentRect.width);
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+  const count = rulerTicks(width, ticks);
   const span = Math.max(1, endNs - startNs);
-  const marks = Array.from({ length: ticks + 1 }, (_, i) => i / ticks);
-  return <div style={{ position: 'relative', height: 16, ...style }}>
-    {marks.map((fraction, i) => <div key={i} style={{
-      position: 'absolute', left: fraction * 100 + '%', top: 0, bottom: 0,
-      borderLeft: '1px solid var(--hairline)',
-    }}>
-      <span style={{
-        position: 'absolute', top: 1, left: i === ticks ? undefined : 3, right: i === ticks ? 3 : undefined,
-        fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-faint)',
-        whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums',
-      }}>{fmtDurationNs(span * fraction)}</span>
-    </div>)}
+  const marks = Array.from({ length: count + 1 }, (_, i) => i / count);
+  return <div ref={ref} style={{ position: 'relative', height: 16, ...style }}>
+    {marks.map((fraction, i) => {
+      const first = i === 0;
+      const last = i === count;
+      return <div key={i} style={{
+        position: 'absolute', left: fraction * 100 + '%', top: 0, bottom: 0,
+        borderLeft: '1px solid var(--hairline)',
+      }}>
+        <span style={{
+          position: 'absolute', top: 1,
+          left: first ? 3 : last ? undefined : 0,
+          right: last ? 3 : undefined,
+          transform: first || last ? undefined : 'translateX(-50%)',
+          // A centred label sits over its own tick line; the card's paper
+          // behind the text keeps the hairline from striking through it.
+          background: first || last ? undefined : 'var(--bg-raised)',
+          padding: first || last ? undefined : '0 2px',
+          fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-faint)',
+          whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums',
+        }}>{fmtDurationNs(span * fraction)}</span>
+      </div>;
+    })}
   </div>;
 }
 

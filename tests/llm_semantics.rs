@@ -172,7 +172,7 @@ fn documented_recipes_are_served_by_the_filter_api() {
                 "agent-web",
                 1_000_000_000,
                 3000,
-                json!({"llm.model": "gpt-5.6-sol", "llm.prompt_tokens": 120,
+                json!({"llm.model": "sim-model", "llm.prompt_tokens": 120,
                        "llm.completion_tokens": 80, "llm.total_tokens": 200,
                        "llm.temperature": 0.7, "llm.stop_reason": "stop",
                        "llm.cost_usd": 0.012})
@@ -184,7 +184,7 @@ fn documented_recipes_are_served_by_the_filter_api() {
                 "agent-web",
                 2_000_000_000,
                 400,
-                json!({"llm.model": "gpt-5.6-sol", "llm.tool_name": "web_search"})
+                json!({"llm.model": "sim-model", "llm.tool_name": "web_search"})
             ),
             llm_span(
                 "t2",
@@ -201,7 +201,7 @@ fn documented_recipes_are_served_by_the_filter_api() {
     assert_eq!(status, 200);
 
     // Recipe: all spans for one model (index-served attribute filter).
-    let (status, body) = server.request("GET", "/v1/spans?attr.llm.model=gpt-5.6-sol", None);
+    let (status, body) = server.request("GET", "/v1/spans?attr.llm.model=sim-model", None);
     assert_eq!(status, 200);
     assert_eq!(
         body["spans"].as_array().map(Vec::len),
@@ -266,7 +266,7 @@ fn conventions_flow_through_otlp() {
                 "startTimeUnixNano": "1700000000000000000",
                 "endTimeUnixNano": "1700000001500000000",
                 "attributes": [
-                    {"key": "llm.model", "value": {"stringValue": "gpt-5.6-sol"}},
+                    {"key": "llm.model", "value": {"stringValue": "sim-model"}},
                     {"key": "llm.total_tokens", "value": {"intValue": "200"}}
                 ],
                 "events": [{"name": "llm.completion",
@@ -278,11 +278,81 @@ fn conventions_flow_through_otlp() {
     );
     assert_eq!(status, 200, "OTLP LLM span: {body}");
 
-    let (status, body) = server.request("GET", "/v1/spans?attr.llm.model=gpt-5.6-sol", None);
+    let (status, body) = server.request("GET", "/v1/spans?attr.llm.model=sim-model", None);
     assert_eq!(status, 200);
     let spans = body["spans"].as_array().expect("array");
     assert_eq!(spans.len(), 1, "OTLP llm.model indexed: {body}");
     assert_eq!(spans[0]["attributes"]["llm.total_tokens"], 200);
     assert_eq!(spans[0]["events"][0]["attributes"]["content"], "hi");
+    server.kill();
+}
+
+#[test]
+fn openinference_keys_feed_the_llm_rollups() {
+    let dir = test_dir("openinference");
+    let server = Server::spawn(&dir);
+    // One OpenInference LLM span over OTLP, carrying the model, host and
+    // token counts under their OpenInference names only…
+    let (status, body) = server.request(
+        "POST",
+        "/v1/traces",
+        Some(&json!({"resourceSpans": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "phoenix-app"}}]},
+            "scopeSpans": [{"spans": [{
+                "traceId": "dddddddddddddddddddddddddddddddd",
+                "spanId": "eeeeeeeeeeeeeeee",
+                "name": "ChatCompletion",
+                "startTimeUnixNano": "1700000000000000000",
+                "endTimeUnixNano": "1700000001000000000",
+                "attributes": [
+                    {"key": "openinference.span.kind", "value": {"stringValue": "LLM"}},
+                    {"key": "llm.model_name", "value": {"stringValue": "phoenix-model"}},
+                    {"key": "llm.provider", "value": {"stringValue": "openai"}},
+                    {"key": "llm.token_count.prompt", "value": {"intValue": "30"}},
+                    {"key": "llm.token_count.completion", "value": {"intValue": "12"}},
+                    {"key": "llm.token_count.total", "value": {"intValue": "42"}}
+                ]
+            }]}]
+        }]})),
+    );
+    assert_eq!(status, 200, "OTLP OpenInference span: {body}");
+    // …and, natively, a span whose ONLY LLM evidence is its OpenInference kind.
+    let (status, body) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(&json!([{
+            "trace_id": "t-kind", "span_id": "k1", "name": "llm", "service": "kind-only",
+            "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
+            "attributes": {"openinference.span.kind": "LLM"}
+        }])),
+    );
+    assert_eq!(status, 200, "{body}");
+
+    let row = |rows: &Value, key: &str| -> Value {
+        rows.as_array()
+            .expect("rows")
+            .iter()
+            .find(|row| row["key"] == json!(key))
+            .cloned()
+            .unwrap_or_else(|| panic!("no row {key} in {rows}"))
+    };
+    let (status, body) = server.request("GET", "/v1/stats/llm?group_by=model", None);
+    assert_eq!(status, 200);
+    let model = row(&body["rows"], "phoenix-model");
+    assert_eq!(model["llm_calls"], 1, "{body}");
+    assert_eq!(model["total_tokens"], 42);
+
+    let (status, body) = server.request("GET", "/v1/stats/llm?group_by=provider", None);
+    assert_eq!(status, 200);
+    assert_eq!(row(&body["rows"], "openai")["llm_calls"], 1, "{body}");
+
+    let (status, body) = server.request("GET", "/v1/stats/llm?group_by=service", None);
+    assert_eq!(status, 200);
+    assert_eq!(
+        row(&body["rows"], "kind-only")["llm_calls"],
+        1,
+        "openinference.span.kind=LLM alone is an LLM call: {body}"
+    );
     server.kill();
 }

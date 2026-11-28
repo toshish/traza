@@ -245,12 +245,22 @@ impl Drop for Source {
 }
 
 fn source() -> Source {
+    // Every test here calls this, and the harness runs them on parallel
+    // threads of one process. The clock alone cannot keep their directories
+    // apart: on macOS it ticks in microseconds, so two tests starting in the
+    // same tick shared a directory and the second open failed `AlreadyOpen`
+    // (about one run in ten). The counter is what makes each one unique; the
+    // clock only keeps a rerun from meeting a directory a killed run left.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let directory =
-        std::env::temp_dir().join(format!("traza-transfer-{}-{unique}", std::process::id()));
+    let directory = std::env::temp_dir().join(format!(
+        "traza-transfer-{}-{sequence}-{unique}",
+        std::process::id()
+    ));
     let store = Store::open(
         &directory,
         Config {

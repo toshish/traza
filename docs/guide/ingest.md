@@ -71,6 +71,8 @@ from the batch is stored.
 | A required field is missing | `400 {"error":"missing field \`name\` at line 1 column 31"}` |
 | `trace_id` is empty | `400 {"error":"span 0: trace_id is empty"}` |
 | `span_id` is empty | `400 {"error":"span 0: span_id is empty"}` |
+| An admission cap is exceeded (too many attributes or events, an oversized key or span, too many spans) | `400` naming the cap and the span, e.g. `span 0 (trace t1, span s1): 1500 attributes exceeds the max-span-attributes cap of 1024` |
+| The tenant's monthly quota or ingest pause refuses the batch | `429` with `Retry-After`; see [quota refusals](http-api.md#quota-refusals) |
 | The store could not accept the write | `503` — retry with backoff |
 
 The index in the error message is the span's position in the batch.
@@ -93,8 +95,12 @@ Point any OpenTelemetry SDK at Traza:
 ```sh
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:8080
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf   # or http/json
-export OTEL_EXPORTER_OTLP_COMPRESSION=none
+export OTEL_EXPORTER_OTLP_COMPRESSION=gzip         # or none
 ```
+
+`Content-Encoding: gzip` is decoded on both ingest routes, with the
+decompressed body held to the same 64 MiB cap as an uncompressed one; see
+[compressed bodies](http-api.md#conventions).
 
 The route accepts an `ExportTraceServiceRequest`. `Content-Type:
 application/x-protobuf` selects the binary decoder; anything else is parsed as
@@ -149,6 +155,7 @@ with `{"partialSuccess":{}}`.
 | `startTimeUnixNano` / `endTimeUnixNano` | `start_time_ns` / `end_time_ns`. Accepted as a JSON string (OTLP JSON's u64 encoding) or a number |
 | Resource attribute `service.name` | `service` |
 | Resource attribute `traza.tenant` | The span's tenant, validated like any client-supplied one |
+| Resource attributes `service.version`, `deployment.environment.name`, `deployment.environment`, `telemetry.sdk.name`, `telemetry.sdk.version` | Copied onto every span of the resource as span attributes, beneath scope and span attributes (see below) |
 | **Every other resource attribute** | **Dropped** — see below |
 | Scope attributes | Merged beneath span attributes, which take precedence on a collision |
 | `attributes` (`AnyValue`) | Flattened to plain JSON: `intValue` becomes a number, `doubleValue` a double, `stringValue` a string |
@@ -161,12 +168,27 @@ with `{"partialSuccess":{}}`.
 A link whose id pair is empty is dropped rather than treated as fatal — a link
 to nothing is meaningless, and rejecting a whole batch for it would be worse.
 
-#### Resource attributes do not reach the span
+#### Which resource attributes reach the span
 
-Two are read — `service.name` and `traza.tenant` — and **the rest are
-discarded**. `deployment.environment`, `service.version`,
-`service.instance.id`, `host.name`, `k8s.*` and `telemetry.sdk.*` are not
-stored and cannot be filtered on. Scope attributes are different: those *are*
+`service.name` becomes the span's `service`, and `traza.tenant` becomes its
+tenant.
+
+Five more say which build produced the span: `service.version`,
+`deployment.environment.name`, `deployment.environment`, `telemetry.sdk.name`
+and `telemetry.sdk.version`. These are copied onto every span of their
+resource as ordinary span attributes, so they are stored, searchable and
+read by the [change radar](radar.md). A copied attribute sits beneath the
+scope's and the span's own attributes: a span that already carries one of
+these keys keeps its value. Only scalar values (string, number or boolean)
+are copied, and a string only up to 256 bytes. Each adds a few bytes to
+every span. The admission caps do not count these five attributes, so a span
+admitted at `--max-span-attributes` or `--max-span-bytes` before the copy is
+still admitted after it. That holds for native ingest too: a span may carry
+these five, in that shape, beyond its caps.
+
+**The rest are discarded.** `service.instance.id`, `host.name`, `k8s.*`,
+`telemetry.sdk.language` and every other resource attribute are not stored
+and cannot be filtered on. Scope attributes are different: those *are*
 merged beneath the span's own.
 
 If you need a resource attribute to be queryable, copy it onto spans — an SDK
@@ -174,8 +196,9 @@ span processor, or an OpenTelemetry Collector `transform` processor moving
 `resource.attributes[...]` to `attributes[...]`. Span attributes round-trip
 faithfully and are indexed like any other.
 
-This page previously said other resource attributes were "merged beneath span
-attributes". They never were.
+Before v0.28 this page said other resource attributes were "merged beneath
+span attributes". They never were. The five build attributes above are the
+first to reach the span, and only those five do.
 
 `span.kind` has no dedicated Traza field. If you need it queryable, carry it as
 an attribute.
@@ -183,8 +206,10 @@ an attribute.
 ### Error handling
 
 A body that does not decode — malformed protobuf, malformed JSON, a non-hex id,
-a timestamp that is not a `u64` — is a `400` with the reason. A store failure is
-a `503`. There is no partial acceptance: `partialSuccess` is always empty
+a timestamp that is not a `u64`, a damaged gzip body — is a `400` with the
+reason, and so is an exceeded admission cap. A quota or ingest-pause refusal is
+a `429` with `Retry-After`, which OTLP exporters honour by retrying later. A
+store failure is a `503`. There is no partial acceptance: `partialSuccess` is always empty
 because a batch either lands entirely or is rejected entirely.
 
 ## LLM and agent telemetry
