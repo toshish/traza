@@ -260,6 +260,14 @@ stored once. This keeps multi-megabyte prompts out of every decode that touches
 the span. See
 [payload offloading](../operations/administration.md#payload-offloading).
 
+A reference is exactly `sha256/` followed by 64 lowercase hexadecimal digits —
+the one spelling the store writes. `$payload` is a key a client can also send,
+so the store does not take its value on trust: a `$payload` holding anything
+else is kept as the attribute it is, and is never resolved to a file, never
+counted as a live reference by retention, and never listed by an erasure as a
+payload it removed. A dataset example carrying one is refused, like an example
+whose payload is not in the store.
+
 ## Filter value types
 
 Search filters compare **scalars by value, not by type.** `attr.code=200`

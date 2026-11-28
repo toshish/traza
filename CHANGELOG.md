@@ -675,6 +675,17 @@ before deploying over an existing setup.
   failure" opened the first tenant's run ids under the second tenant. They
   now carry the tenant the drawn map was read in.
 
+### Security
+
+- **The path-confinement fixes of 0.26.0-preview.2 and 0.25.1.** A backup
+  label, a payload reference and a manifest path are each checked where they
+  become a path: `POST /v1/backups/{label}/release` can no longer reach the
+  data directory, an erasure no longer follows a forged `$payload` reference
+  out of the store, only the lowercase spelling of a reference is one, and a
+  restore refuses a manifest entry that climbs out of its directory. A
+  malformed backup label answers `400` on both backup routes. See
+  [0.26.0-preview.2](#0260-preview2---2026-11-27) for each finding.
+
 ### Upgrade
 
 - **No migration.** Segments, the write-ahead log, generation manifests and
@@ -1159,6 +1170,78 @@ tighten, and the data-directory lock behaves differently in containers: read
   refuses a non-loopback bind); keep `TRAZA_TOKENS` set if you may roll back.
   Fuse policies, tenant limits and quotas likewise stop applying until 0.27.0
   runs again.
+
+## [0.26.0-preview.2] - 2026-11-27
+
+A security release for the preview line; the stable line carries the same
+fix as 0.25.1. Three places took a name from outside the engine and joined
+it onto a directory without checking it. Two of them deleted files: one
+request could remove the whole data directory. All three are closed at the
+point where the name becomes a path, and every finding was reproduced red
+before its fix. **Upgrade if a server is reachable by anything you do not
+fully trust — on 0.26.0-preview.1, and on 0.25.0 and earlier, an ordinary
+read-write token is enough for the first one.**
+
+It also changes the one line Rust 1.100's clippy flags, which had left
+`main` unmergeable since the CI runners moved to that toolchain. That
+change alters no behaviour.
+
+### Security
+
+- **A backup release can no longer delete the data directory.**
+  `POST /v1/backups/{label}` has always required the label to be a single
+  non-hidden path component. `POST /v1/backups/{label}/release` never
+  checked it, and it removes `pins/{label}` recursively — so a label of `..`
+  removed `pins/..`, which is the data directory. Any credential allowed to
+  take a backup could send it (an unbound `rw` token, or anyone at all on a
+  server running without tokens), once at least one backup had been taken. The
+  server kept answering from the files it already held open, so the loss
+  showed only at the next restart: zero records. `release_pin`, `verify_pin`
+  and `pin_generation` now resolve the label through one check, and a label
+  that is not a single plain name is refused as the caller's error.
+- **An erasure no longer follows a forged payload reference out of the
+  store.** A payload reference is a string under `$payload`, and a client
+  can send that key itself. The text after `sha256/` went into the payload
+  file's path as it stood, so a span ingested with
+  `{"$payload": "sha256/../x"}` named `x.bin` outside the data directory,
+  and erasing that span — by trace, session or tenant — unlinked it. The
+  same string in a dataset example was accepted whenever that outside file
+  existed, and erasing the dataset's tenant reached it the same way. A
+  reference
+  is now exactly `sha256/` followed by 64 lowercase hex digits, and that
+  check is the only way one becomes a path: anything else is kept as the
+  attribute it is, is not counted as a reference by retention, is not
+  recorded or reported by an erasure, and is refused in a dataset example.
+  An erasure resumed from a record written by an earlier build drops such
+  an entry instead of acting on it.
+- **The upper-case spelling of a reference is not a reference.**
+  `GET /v1/payloads/` accepted hex in either case. On a case-insensitive
+  filesystem (macOS by default) the upper-case form names the same file as
+  the canonical one while being a different string to the check that keeps
+  a payload other spans still reference — so erasing a span that carried
+  the upper-case form deleted bytes a live span still pointed at. Only the
+  lowercase spelling the store writes is accepted, on every filesystem.
+- **A restored backup cannot name files outside itself.** Restore verified
+  each manifested file's length and digest but not where its path led, so a
+  manifest entry `../x` that described `x` truthfully passed verification
+  and was copied from beside the backup to beside the store. Every
+  manifest path must now be a plain relative path inside the directory it
+  describes; one that climbs out of it, or is absolute, is reported by
+  verification as a problem and the restore is refused before anything is
+  swapped.
+
+### Changed
+
+- A malformed backup label answers `400` on both backup routes. Creating a
+  backup with one used to answer `409`, the status for a label already in
+  use; releasing with one used to answer `503` or, for a label that
+  resolved nowhere, `200`. Releasing a well-formed label that names no pin
+  is still an idempotent `200`.
+- `Store::pin_generation`, `Store::verify_pin` and `Store::release_pin`
+  return `Error::Invalid` for such a label, where `pin_generation` returned
+  `Error::Io` with `InvalidInput`.
+- `GET /v1/payloads/{reference}` answers `404` for a reference in upper-case
+  hex. No store has ever written one.
 
 ## [0.26.0-preview.1] - 2026-09-06
 

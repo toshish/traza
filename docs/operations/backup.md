@@ -129,6 +129,13 @@ one `CURRENT` rename, so a failed or interrupted restore leaves the prior store
 rather than a blend. The server then serves the restored generation normally.
 The library equivalent is [`Store::restore`](../../src/lib.rs).
 
+Verification includes where the manifest points. Every file a backup's
+manifest names must be a plain relative path inside the backup; an entry that
+climbs out of it (`../x`) or is absolute is reported as a problem and the
+restore is refused, however accurate its recorded length and digest are. A
+restore reads from the backup directory and writes into the data directory,
+and nowhere else.
+
 A restored store starts with an empty write-ahead log: its state is entirely in
 the installed files, and any prior log belonged to a different lineage.
 

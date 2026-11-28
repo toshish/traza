@@ -320,12 +320,48 @@ pub(crate) fn decode_blob(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
-pub(crate) fn payload_path(directory: &Path, hash: &str) -> PathBuf {
+/// Private on purpose: `hash` goes into the path verbatim, so it must be a
+/// digest this module computed or one [`reference_hash`] accepted. Every
+/// other module reaches a payload file through [`reference_path`].
+fn payload_path(directory: &Path, hash: &str) -> PathBuf {
     let shard = hash.get(0..2).unwrap_or("00");
     directory
         .join(PAYLOAD_DIR)
         .join(shard)
         .join(format!("{hash}.bin"))
+}
+
+/// The content hash a payload reference names, when the reference is
+/// well-formed: `sha256/` followed by exactly 64 lowercase hex digits, the
+/// one spelling [`store_payload`] ever writes.
+///
+/// A reference is not a string the engine can trust to be one. It is
+/// whatever sits under `$payload` in a span attribute or a dataset example,
+/// and a client writes those. Where this check was missing, the text after
+/// `sha256/` went into a path as it stood: `sha256/../x` named
+/// `payloads/../../x.bin`, and the erasure that removed the span carrying it
+/// unlinked that file, outside the store.
+///
+/// Upper-case hex is refused for the same reason, not a stricter one. On a
+/// case-insensitive filesystem it names the same file as the canonical
+/// spelling while being a different STRING to every check that decides
+/// whether a payload is still referenced, so erasing a span that carried the
+/// upper-case form deleted bytes a live span still pointed at.
+pub(crate) fn reference_hash(reference: &str) -> Option<&str> {
+    let hash = reference.strip_prefix("sha256/")?;
+    (hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    .then_some(hash)
+}
+
+/// Where a reference's bytes live under `directory`, or `None` for a string
+/// that is not a well-formed reference. This is the only way a reference
+/// becomes a path: nothing outside this module can build one from text it
+/// has not checked.
+pub(crate) fn reference_path(directory: &Path, reference: &str) -> Option<PathBuf> {
+    reference_hash(reference).map(|hash| payload_path(directory, hash))
 }
 
 /// Writes `content` to the content-addressed store (idempotent — an existing
@@ -394,14 +430,12 @@ pub(crate) fn offloaded_reference(content: &str) -> Value {
 /// a fallback — header sniffing in the serving path is what the migration
 /// design exists to avoid.
 pub(crate) fn load_payload(directory: &Path, reference: &str) -> Result<Option<Vec<u8>>> {
-    let Some(hash) = reference.strip_prefix("sha256/") else {
+    // A malformed reference names no payload, which reads the same as an
+    // absent one; see `reference_hash` for why the check lives in the path.
+    let Some(path) = reference_path(directory, reference) else {
         return Ok(None);
     };
-    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Ok(None);
-    }
-    // The hash is validated hex, so the path cannot traverse.
-    match fs::read(payload_path(directory, hash)) {
+    match fs::read(path) {
         Ok(bytes) => decode_blob(&bytes, reference).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
@@ -536,10 +570,110 @@ pub(crate) fn sweep_expired(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_blob, encode_blob, sha256_hex, store_payload, sweep_expired, Sha256, TouchRegistry,
+        decode_blob, encode_blob, load_payload, reference_hash, reference_path, sha256_hex,
+        store_payload, sweep_expired, Sha256, TouchRegistry,
     };
     use std::collections::HashSet;
+    use std::path::{Component, Path};
     use std::time::{Duration, Instant, SystemTime};
+
+    #[test]
+    fn only_the_spelling_the_store_writes_is_a_reference() {
+        let hash = sha256_hex(b"content");
+        let canonical = format!("sha256/{hash}");
+        assert_eq!(reference_hash(&canonical), Some(hash.as_str()));
+
+        // Each of these once reached the filesystem as part of a path. The
+        // first two walk out of `payloads/`; the upper-case one is the same
+        // file on a case-insensitive filesystem under a different name.
+        let shouted = format!("sha256/{}", hash.to_ascii_uppercase());
+        let short = format!("sha256/{}", &hash[..63]);
+        let long = format!("sha256/{hash}0");
+        let embedded = format!("sha256/../{}", &hash[..61]);
+        for forged in [
+            "sha256/../outside/victim",
+            "sha256/../../etc/passwd",
+            shouted.as_str(),
+            short.as_str(),
+            long.as_str(),
+            embedded.as_str(),
+            hash.as_str(),
+            "sha256/",
+            "",
+            "md5/d41d8cd98f00b204e9800998ecf8427e",
+        ] {
+            assert_eq!(
+                reference_hash(forged),
+                None,
+                "{forged:?} is not a reference"
+            );
+            assert_eq!(
+                reference_path(Path::new("/data"), forged),
+                None,
+                "{forged:?} must not become a path"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reference_path_stays_inside_the_payload_directory() {
+        let hash = sha256_hex(b"content");
+        let path = reference_path(Path::new("/data"), &format!("sha256/{hash}")).expect("a path");
+        assert_eq!(
+            path,
+            Path::new("/data")
+                .join("payloads")
+                .join(&hash[..2])
+                .join(format!("{hash}.bin"))
+        );
+        assert!(
+            path.components()
+                .all(|part| !matches!(part, Component::ParentDir)),
+            "no component of a payload path climbs: {path:?}"
+        );
+    }
+
+    #[test]
+    fn loading_a_malformed_reference_reads_nothing() {
+        let root = std::env::temp_dir().join(format!(
+            "traza-ref-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).expect("dir");
+        let registry = TouchRegistry::default();
+        let stored = store_payload(&data, "kept", &registry).expect("stores");
+        let reference = stored["$payload"].as_str().expect("ref").to_owned();
+        assert_eq!(
+            load_payload(&data, &reference).expect("loads"),
+            Some(b"kept".to_vec())
+        );
+
+        // A real blob beside the store, reachable through `payloads/..` by
+        // the path a forged reference spells. It must read as absent, not be
+        // decoded and returned.
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("dir");
+        std::fs::write(outside.join("secret.bin"), encode_blob(b"elsewhere")).expect("blob");
+        assert_eq!(
+            load_payload(&data, "sha256/../outside/secret").expect("no error"),
+            None,
+            "a reference that climbs out of the store reads nothing"
+        );
+        let shouted = format!(
+            "sha256/{}",
+            reference["sha256/".len()..].to_ascii_uppercase()
+        );
+        assert_eq!(
+            load_payload(&data, &shouted).expect("no error"),
+            None,
+            "only the canonical spelling loads, on every filesystem"
+        );
+    }
 
     #[test]
     fn a_forged_blob_uncompressed_length_is_refused_not_allocated() {

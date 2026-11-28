@@ -2712,10 +2712,14 @@ fn serve_request(
                 Some(label) => (label, true),
                 None => (rest, false),
             };
+            // The label is a path segment the client chose. The engine
+            // refuses one that is not a single plain name on BOTH calls, as
+            // the caller's error (400): `/v1/backups/../release` once reached
+            // `pins/..`, which is the data directory.
             if release {
                 return match engine.release_pin(label) {
                     Ok(()) => responder.json(200, json!({"released": true, "backup": label})),
-                    Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                    Err(error) => engine_error(responder, metrics, error),
                 };
             }
             match engine.pin_generation(label) {
@@ -2737,6 +2741,7 @@ fn serve_request(
                     ),
                     Err(error) => responder.json(503, json!({"error": error.to_string()})),
                 },
+                Err(traza::Error::Invalid(reason)) => responder.json(400, json!({"error": reason})),
                 Err(error) => responder.json(409, json!({"error": error.to_string()})),
             }
         }

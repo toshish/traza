@@ -4313,14 +4313,20 @@ impl Store {
         // yield, exactly as `store_payload` does for fresh writes. An
         // example whose reference is already gone is refused, not recorded
         // dangling.
+        //
+        // A string that is not a well-formed reference names no payload, so
+        // it is "gone" by construction and refused the same way. Asking the
+        // filesystem about the path it spelled instead is how an example
+        // carrying `sha256/../x` was recorded whenever `x.bin` existed
+        // OUTSIDE the store — and erasing that tenant then unlinked it.
         let verify = |reference: &str| -> Result<bool> {
+            let Some(path) = payload::reference_path(&self.directory, reference) else {
+                return Ok(false);
+            };
             if let Ok(mut touched) = self.recent_payloads.lock() {
                 touched.insert(reference.to_owned(), Instant::now());
             }
-            let Some(hash) = reference.strip_prefix("sha256/") else {
-                return Ok(false);
-            };
-            Ok(payload::payload_path(&self.directory, hash).exists())
+            Ok(path.exists())
         };
         // For a BOUND caller, precompute which of the bodies' references the
         // tenant's own SPANS hold (the eval-side half is checked inside the
@@ -6199,12 +6205,7 @@ impl Store {
     /// Backup is then: `pin`, [`verify_pin`](Self::verify_pin), copy the
     /// directory, [`release_pin`](Self::release_pin) — no server stop.
     pub fn pin_generation(&self, label: &str) -> Result<u64> {
-        if label.is_empty() || label.contains(['/', '\\']) || label.starts_with('.') {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a pin label must be a single non-hidden path component",
-            )));
-        }
+        let pin_dir = self.pin_dir(label)?;
         // One maintenance + seal-permit acquisition covers the checkpoint AND
         // the linking below: nothing may replace or add a manifested file
         // between the digest and the hard links, so the pin can never fail on
@@ -6218,7 +6219,6 @@ impl Store {
         let manifest =
             generation::load_manifest(&generation::manifest_path(&self.directory, generation))?;
 
-        let pin_dir = self.directory.join(generation::PINS_DIR).join(label);
         if pin_dir.exists() {
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -6229,9 +6229,21 @@ impl Store {
         let _ = fs::remove_dir_all(&staged);
         let build = (|| -> Result<()> {
             for file in &manifest.files {
-                let relative = file.path.replace('/', std::path::MAIN_SEPARATOR_STR);
-                let source = self.directory.join(&relative);
-                let target = staged.join(&relative);
+                // The checkpoint just wrote this manifest, so every entry
+                // resolves; going through the one resolver anyway keeps a
+                // manifest path from having two ways onto the filesystem.
+                let (Some(source), Some(target)) = (
+                    generation::manifest_file(&self.directory, &file.path),
+                    generation::manifest_file(&staged, &file.path),
+                ) else {
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "the manifest names {:?}, which is not a path inside the store",
+                            file.path
+                        ),
+                    )));
+                };
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -6266,21 +6278,49 @@ impl Store {
     }
 
     /// Where a pin's hard-link farm lives — the directory a backup copies.
+    ///
+    /// A plain path computation for a label [`Self::pin_generation`] has
+    /// already accepted: it reports where that pin is and checks nothing.
+    /// Do not build a path to act on from a label that has not been through
+    /// one of the calls below.
     pub fn pin_path(&self, label: &str) -> PathBuf {
         self.directory.join(generation::PINS_DIR).join(label)
+    }
+
+    /// The directory a pin label names, once the label is known to be ONE
+    /// plain name.
+    ///
+    /// A label arrives in a request path and is joined onto `pins/`. But
+    /// `pins/..` is the data directory and `pins/.` is every pin, so a label
+    /// that is not a single ordinary path component reaches things it does
+    /// not name. Creating a pin always checked this. Releasing one did not:
+    /// `release_pin("..")` removed the whole store, and over HTTP an ordinary
+    /// read-write token was enough to ask for it. Every call that acts on a
+    /// label resolves it here, so the rule cannot be present on one and
+    /// missing on the next.
+    fn pin_dir(&self, label: &str) -> Result<PathBuf> {
+        if label.is_empty() || label.contains(['/', '\\']) || label.starts_with('.') {
+            return Err(Error::Invalid(format!(
+                "a pin label must be a single non-hidden path component, got {label:?}"
+            )));
+        }
+        Ok(self.directory.join(generation::PINS_DIR).join(label))
     }
 
     /// Verifies a pin's files against the manifest copied into it — the check
     /// a backup runs before trusting the copy it is about to make.
     pub fn verify_pin(&self, label: &str) -> Result<Vec<String>> {
-        let pin_dir = self.pin_path(label);
+        let pin_dir = self.pin_dir(label)?;
         let manifest = generation::load_manifest(&pin_dir.join(generation::MANIFEST_NAME))?;
         generation::verify_against(&pin_dir, &manifest)
     }
 
-    /// Removes a pin, freeing the disk its unshared bytes were holding. Idempotent.
+    /// Removes a pin, freeing the disk its unshared bytes were holding.
+    /// Idempotent: releasing a label that names no pin is a no-op. A label
+    /// that is not a single plain name is refused, never resolved.
     pub fn release_pin(&self, label: &str) -> Result<()> {
-        match fs::remove_dir_all(self.directory.join(generation::PINS_DIR).join(label)) {
+        let pin_dir = self.pin_dir(label)?;
+        match fs::remove_dir_all(pin_dir) {
             Ok(()) => sync_directory(&self.directory.join(generation::PINS_DIR)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(Error::Io(error)),
@@ -6647,12 +6687,20 @@ impl Store {
                 .collect();
             doomed.sort();
             doomed.dedup();
+            // Only a well-formed reference names a payload file. The
+            // collectors no longer report anything else, but this list also
+            // carries references RECORDED earlier — a tombstone written by a
+            // prior build, an example body promoted before the check existed
+            // — and a recorded `sha256/../x` is still a path out of the
+            // store. Dropped here, it is neither unlinked nor reported in
+            // the receipt as a payload this erasure removed.
+            doomed.retain(|reference| payload::reference_hash(reference).is_some());
             if !doomed.is_empty() {
                 let erased_file = |reference: &str| -> Result<bool> {
-                    let Some(hash) = reference.strip_prefix("sha256/") else {
+                    let Some(path) = payload::reference_path(&self.directory, reference) else {
                         return Ok(false);
                     };
-                    match fs::remove_file(payload::payload_path(&self.directory, hash)) {
+                    match fs::remove_file(path) {
                         Ok(()) => Ok(true),
                         // Already absent is the erased state; resume hits this.
                         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
@@ -6706,12 +6754,8 @@ impl Store {
                 // because many removals share a shard.
                 let mut shards: Vec<PathBuf> = payloads_removed
                     .iter()
-                    .filter_map(|reference| reference.strip_prefix("sha256/"))
-                    .filter_map(|hash| {
-                        payload::payload_path(&self.directory, hash)
-                            .parent()
-                            .map(Path::to_path_buf)
-                    })
+                    .filter_map(|reference| payload::reference_path(&self.directory, reference))
+                    .filter_map(|path| path.parent().map(Path::to_path_buf))
                     .collect();
                 shards.sort();
                 shards.dedup();
@@ -6761,16 +6805,12 @@ impl Store {
             let _maintenance = self.lock_maintenance()?;
             let confirm = self.purge_subject_locked(subject)?;
             if let Some(reference) = subject.payload_reference() {
-                if let Some(hash) = reference.strip_prefix("sha256/") {
+                if let Some(path) = payload::reference_path(&self.directory, reference) {
                     // Idempotent re-delete: closes the window where an
                     // offload that loaded the mask just before `begin` wrote
                     // the subject's bytes back mid-purge.
-                    match fs::remove_file(payload::payload_path(&self.directory, hash)) {
-                        Ok(()) => sync_directory(
-                            payload::payload_path(&self.directory, hash)
-                                .parent()
-                                .unwrap_or(&self.directory),
-                        )?,
+                    match fs::remove_file(&path) {
+                        Ok(()) => sync_directory(path.parent().unwrap_or(&self.directory))?,
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                         Err(error) => return Err(Error::Io(error)),
                     }
@@ -7606,10 +7646,8 @@ impl Store {
                 false => self.live_payload_refs()?,
             };
             for reference in &accountable {
-                let exists = reference
-                    .strip_prefix("sha256/")
-                    .map(|hash| payload::payload_path(&self.directory, hash).exists())
-                    .unwrap_or(false);
+                let exists = payload::reference_path(&self.directory, reference)
+                    .is_some_and(|path| path.exists());
                 match (exists, live.contains(reference)) {
                     (false, _) => items.push(format!("{reference}: erased")),
                     (true, true) => items.push(format!(
@@ -7679,8 +7717,8 @@ impl Store {
                 // whole point of a pin and the whole reason to check.
                 let mut holds = subject
                     .payload_reference()
-                    .and_then(|reference| reference.strip_prefix("sha256/"))
-                    .is_some_and(|hash| payload::payload_path(&pin_dir, hash).exists());
+                    .and_then(|reference| payload::reference_path(&pin_dir, reference))
+                    .is_some_and(|path| path.exists());
                 if !holds {
                     for entry in fs::read_dir(&pin_dir)? {
                         let path = entry?.path();

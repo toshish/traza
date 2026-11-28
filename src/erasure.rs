@@ -201,14 +201,7 @@ impl Subject {
             Self::Session { session_id, .. } if session_id.is_empty() => {
                 Some("session_id is empty")
             }
-            Self::Payload { reference }
-                if reference.strip_prefix("sha256/").map_or(true, |hash| {
-                    hash.len() != 64
-                        || !hash
-                            .bytes()
-                            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-                }) =>
-            {
+            Self::Payload { reference } if payload::reference_hash(reference).is_none() => {
                 Some("a payload reference is sha256/<64 lowercase hex characters>")
             }
             // The default tenant is every store that never configured
@@ -348,6 +341,12 @@ pub(crate) fn redact_payload(span: &mut Span, reference: &str) -> bool {
 /// redaction markers, whose bytes a prior erasure already removed. A marker
 /// is the RECORD that content is gone; counting it as a reference would put
 /// the erased bytes back under protection.
+///
+/// Only a well-formed reference counts ([`payload::reference_hash`]). A
+/// `$payload` key holding anything else is a client's attribute that happens
+/// to use the store's key, and it names no file: listing it here is what
+/// carried `sha256/../x` from an ingested span into the set of files an
+/// erasure unlinks.
 pub(crate) fn payload_refs_of(span: &Span, into: &mut HashSet<String>) {
     for attributes in span.payload_maps() {
         for value in attributes.values() {
@@ -355,7 +354,9 @@ pub(crate) fn payload_refs_of(span: &Span, into: &mut HashSet<String>) {
                 continue;
             }
             if let Some(reference) = value.get(payload::PAYLOAD_KEY).and_then(Value::as_str) {
-                into.insert(reference.to_owned());
+                if payload::reference_hash(reference).is_some() {
+                    into.insert(reference.to_owned());
+                }
             }
         }
     }
@@ -809,14 +810,10 @@ impl Mask {
                 return true;
             }
         }
-        if !annotation.session_id.is_empty()
+        !annotation.session_id.is_empty()
             && self
                 .sessions
                 .contains(&(annotation.tenant.clone(), annotation.session_id.clone()))
-        {
-            return true;
-        }
-        false
     }
 
     /// Whether a pending TENANT erasure covers this tenant — the eval write
